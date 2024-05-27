@@ -136,7 +136,7 @@ class DiscreteOrdinates:
             if self._xs_server.num_groups > 1:
                 self._F.append(
                     [
-                        self._xs_server.chi * self._xs_server.nu_fission(mat),
+                        np.outer(self._xs_server.chi, self._xs_server.nu_fission(mat)),
                         Intg,
                         Ip[i] * bc[i],
                     ]
@@ -170,6 +170,13 @@ class DiscreteOrdinates:
         self._H = self._tensor_train(self._H)
         self._F = self._tensor_train(self._F)
         self._S = self._tensor_train(self._S)
+        '''mat_shape = (
+            self._xs_server.num_groups * self._num_ordinates * (num_nodes + 1),
+            self._xs_server.num_groups * self._num_ordinates * (num_nodes + 1),
+        )
+        print("H matrix: ", np.round(self._H.full().reshape(mat_shape),3))
+        print("S matrix: ", np.round(self._S.full().reshape(mat_shape),3))
+        print("F matrix: ", np.round(self._F.full().reshape(mat_shape),3))'''
 
     # ==============================================================================
     # Full matrix solvers
@@ -213,15 +220,15 @@ class DiscreteOrdinates:
 
         # Reshape operator tensors to 2D matrices
         mat_shape = (
-            self._num_ordinates * (num_nodes + 1),
-            self._num_ordinates * (num_nodes + 1),
+            self._xs_server.num_groups * self._num_ordinates * (num_nodes + 1),
+            self._xs_server.num_groups * self._num_ordinates * (num_nodes + 1),
         )
 
         H_inv = inv(sp.csc_matrix(self._H.full().reshape(mat_shape)))
         S = sp.csc_matrix(self._S.full().reshape(mat_shape))
         F = sp.csc_matrix(self._F.full().reshape(mat_shape))
 
-        for _ in range(self._max_iter):
+        for i in range(self._max_iter):
             psi_new = H_inv.dot((S + 1 / k_old * F).dot(psi_old))
 
             # Compute new eigenvalue and eigenvector L2 error
@@ -234,6 +241,8 @@ class DiscreteOrdinates:
             # Copy results for next iteration
             psi_old = copy.deepcopy(psi_new)
             k_old = copy.deepcopy(k_new)
+
+            #print("Iteration ", i, ",  k: ", k_old)
 
         raise RuntimeError(
             f"Maximum number of power iteration ({self._max_iter})"
@@ -291,6 +300,8 @@ class DiscreteOrdinates:
             # Copy results for next iteration
             psi_old = copy.deepcopy(psi_new)
             k_old = copy.deepcopy(k_new)
+
+            print("k: ", k_old)
 
         raise RuntimeError(
             f"Maximum number of power iteration ({self._max_iter})"

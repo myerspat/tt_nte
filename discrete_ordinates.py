@@ -136,7 +136,7 @@ class DiscreteOrdinates:
             if self._xs_server.num_groups > 1:
                 self._F.append(
                     [
-                        np.outer(self._xs_server.chi[0], self._xs_server.nu_fission(mat)),
+                        np.outer(self._xs_server.chi, self._xs_server.nu_fission(mat)),
                         Intg,
                         Ip[i] * bc[i],
                     ]
@@ -170,13 +170,13 @@ class DiscreteOrdinates:
         self._H = self._tensor_train(self._H)
         self._F = self._tensor_train(self._F)
         self._S = self._tensor_train(self._S)
-        mat_shape = (
+        '''mat_shape = (
             self._xs_server.num_groups * self._num_ordinates * (num_nodes + 1),
             self._xs_server.num_groups * self._num_ordinates * (num_nodes + 1),
         )
         print("H matrix: ", np.round(self._H.full().reshape(mat_shape),3))
         print("S matrix: ", np.round(self._S.full().reshape(mat_shape),3))
-        print("F matrix: ", np.round(self._F.full().reshape(mat_shape),3))
+        print("F matrix: ", np.round(self._F.full().reshape(mat_shape),3))'''
 
     # ==============================================================================
     # Full matrix solvers
@@ -242,7 +242,7 @@ class DiscreteOrdinates:
             psi_old = copy.deepcopy(psi_new)
             k_old = copy.deepcopy(k_new)
 
-            print("Iteration ", i, ",  k: ", k_old)
+            #print("Iteration ", i, ",  k: ", k_old)
 
         raise RuntimeError(
             f"Maximum number of power iteration ({self._max_iter})"

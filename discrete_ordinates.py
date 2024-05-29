@@ -4,13 +4,12 @@ discrete_ordinates.py
 import copy
 
 import numpy as np
-import scipy.sparse as sp
-from scipy.sparse.linalg import eigs, inv
-
 import scikit_tt.solvers.evp as evp
 import scikit_tt.solvers.sle as sle
 import scikit_tt.tensor_train as tt
+import scipy.sparse as sp
 from scikit_tt import TT
+from scipy.sparse.linalg import eigs, inv
 
 
 class DiscreteOrdinates:
@@ -21,7 +20,9 @@ class DiscreteOrdinates:
         num_ordinates,
         bc="vacuum",
         tol=1e-6,
-        max_iter=1000,
+        max_iter=100,
+        tt_fmt="tt",
+        qtt_threshold=1e-15,
     ):
         self.update_settings(
             xs_server=xs_server,
@@ -30,6 +31,8 @@ class DiscreteOrdinates:
             bc=bc,
             tol=tol,
             max_iter=max_iter,
+            tt_fmt=tt_fmt,
+            qtt_threshold=qtt_threshold,
         )
 
     def _construct_tensor_trains(self):
@@ -136,7 +139,7 @@ class DiscreteOrdinates:
             if self._xs_server.num_groups > 1:
                 self._F.append(
                     [
-                        self._xs_server.chi * self._xs_server.nu_fission(mat),
+                        np.outer(self._xs_server.chi, self._xs_server.num_fission(mat)),
                         Intg,
                         Ip[i] * bc[i],
                     ]
@@ -178,23 +181,18 @@ class DiscreteOrdinates:
         """
         Solve SN using scipy.sparse.linalg.eigs.
         """
-        # Use only first material for now
-        mat = self._geometry.materials[0]
-        num_nodes = self._geometry.mat_num_nodes(mat)
-
-        # Reshape operator tensors to 2D matrices
-        mat_shape = (
-            self._num_ordinates * (num_nodes + 1),
-            self._num_ordinates * (num_nodes + 1),
-        )
-
-        H = sp.csc_matrix(self._H.full().reshape(mat_shape))
-        S = sp.csc_matrix(self._S.full().reshape(mat_shape))
-        F = sp.csc_matrix(self._F.full().reshape(mat_shape))
+        # Get operators in CSC format
+        H = self.H("csc")
+        S = self.S("csc")
+        F = self.F("csc")
 
         k, psi = eigs(F, 1, H - S)
+        psi = np.real(psi).flatten()
 
-        return k, psi
+        if np.sum(psi) < 0:
+            psi = -psi
+
+        return np.real(k)[0], psi / np.linalg.norm(psi)
 
     def solve_matrix_power(self):
         """
@@ -211,15 +209,10 @@ class DiscreteOrdinates:
 
         err = 1.0
 
-        # Reshape operator tensors to 2D matrices
-        mat_shape = (
-            self._num_ordinates * (num_nodes + 1),
-            self._num_ordinates * (num_nodes + 1),
-        )
-
-        H_inv = inv(sp.csc_matrix(self._H.full().reshape(mat_shape)))
-        S = sp.csc_matrix(self._S.full().reshape(mat_shape))
-        F = sp.csc_matrix(self._F.full().reshape(mat_shape))
+        # Get operators in CSC format
+        H_inv = inv(self.H("csc"))
+        S = self.S("csc")
+        F = self.F("csc")
 
         for _ in range(self._max_iter):
             psi_new = H_inv.dot((S + 1 / k_old * F).dot(psi_old))
@@ -229,7 +222,7 @@ class DiscreteOrdinates:
             err = np.linalg.norm(psi_new - psi_old, ord=2)
 
             if err < self._tol:
-                return k_new, psi_new
+                return k_new, psi_new.flatten() / np.linalg.norm(psi_new.flatten())
 
             # Copy results for next iteration
             psi_old = copy.deepcopy(psi_new)
@@ -255,9 +248,14 @@ class DiscreteOrdinates:
             self._F, psi, operator_gevp=(self._H - self._S), conv_eps=self._tol
         )
 
-        return k, psi.full().flatten()
+        psi = psi.full().flatten() / psi.norm()
 
-    def solve_TT_power(self, method="als", rank=2, threshold=1e-12, max_rank=np.infty):
+        if np.sum(psi) < 0:
+            psi = -psi
+
+        return k, psi
+
+    def solve_TT_power(self, method="als", rank=4, threshold=1e-12, max_rank=np.infty):
         """
         Solve SN using power iteration with TT ALS or MALS
         """
@@ -286,7 +284,7 @@ class DiscreteOrdinates:
             err = (psi_new - psi_old).norm(p=2)
 
             if err < self._tol:
-                return k_new, psi_new.full().reshape(-1)
+                return k_new, psi_new.full().flatten() / psi_new.norm()
 
             # Copy results for next iteration
             psi_old = copy.deepcopy(psi_new)
@@ -316,13 +314,36 @@ class DiscreteOrdinates:
             return TT(elements)
 
         if isinstance(elements[0], np.ndarray):
-            return TT(elements)
+            if self._tt_fmt == "tt":
+                return TT(elements)
+            else:
+                return self.tt2qtt(TT(elements))
+
         else:
             tt = elements[0]
             for array in elements[1:]:
                 tt += array
 
             return tt
+
+    def tt2qtt(self, tt):
+        """
+        Transform TT formatted operator to QTT format.
+        """
+        # Reshape and permute dims to list of [2] * l_k
+        new_dims = []
+        for dim_size in tt.row_dims:
+            new_dims.append([2] * self._get_degree(dim_size))
+
+        # Transform operator into QTT format with threshold
+        # for SVD decomposition
+        return tt.tt2qtt(new_dims, new_dims, threshold=self._qtt_threshold)
+
+    def _get_degree(self, dim_size):
+        """
+        Get degree where the dimension size is 2 ** degree.
+        """
+        return int(np.round(np.log(dim_size) / np.log(2)))
 
     def update_settings(
         self,
@@ -332,6 +353,8 @@ class DiscreteOrdinates:
         bc=None,
         tol=None,
         max_iter=None,
+        tt_fmt=None,
+        qtt_threshold=None,
     ):
         """
         Update SN settings.
@@ -344,9 +367,16 @@ class DiscreteOrdinates:
         self._bc = self._bc if bc is None else bc
         self._tol = self._tol if tol is None else tol
         self._max_iter = self._max_iter if max_iter is None else max_iter
+        self._tt_fmt = self._tt_fmt if tt_fmt is None else tt_fmt
+        self._qtt_threshold = (
+            self._qtt_threshold if qtt_threshold is None else qtt_threshold
+        )
 
         # Assert supported boundary conditions
         assert self._bc == "vacuum" or self._bc == "reflective"
+
+        # Assert supported TT formats
+        assert self._tt_fmt == "tt" or self._tt_fmt == "qtt"
 
         # Assert dimensions are power of 2
         self._check_dim_size("ordinates", self._num_ordinates)
@@ -369,15 +399,28 @@ class DiscreteOrdinates:
         if not ((dim_size & (dim_size - 1) == 0) and dim_size != 0):
             raise RuntimeError(f"Number of {name} must be a power of 2")
 
+    def _format_tt(self, tt, fmt):
+        """
+        Formatting function to get TT, full matrix, or CSC formatted operators.
+        """
+        if fmt == "tt":
+            return tt
+        elif fmt == "full":
+            return tt.matricize()
+        elif fmt == "csc":
+            return sp.csc_matrix(tt.matricize())
+        else:
+            raise RuntimeError(f"Format requested ({fmt}) is not supported")
+
     # ==============================================================================
     # Quadrature sets
 
     @staticmethod
-    def _gauss_legendre(L):
+    def _gauss_legendre(N):
         """
         Gauss Legendre quadrature set. Only given for positive half space.
         """
-        mu, w = np.polynomial.legendre.leggauss(L)
+        mu, w = np.polynomial.legendre.leggauss(N)
         w = w[: int(mu.size / 2)] / 2
         mu = np.abs(mu[: int(mu.size / 2)])
 
@@ -388,18 +431,15 @@ class DiscreteOrdinates:
     # ==============================================================================
     # Getters
 
+    def H(self, fmt="tt"):
+        return self._format_tt(self._H, fmt)
+
+    def S(self, fmt="tt"):
+        return self._format_tt(self._S, fmt)
+
+    def F(self, fmt="tt"):
+        return self._format_tt(self._F, fmt)
+
     @property
     def num_ordinates(self):
         return self._num_ordinates
-
-    @property
-    def H(self):
-        return self._H
-
-    @property
-    def S(self):
-        return self._S
-
-    @property
-    def F(self):
-        return self._F

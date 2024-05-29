@@ -31,7 +31,7 @@ fissile_brick = Material({pu239: 1.0})
 # Cross section data
 one_group_xs = {
     "num_groups": 2,
-    "chi": np.array([[1.0]]),
+    "chi": np.array([1.0]),
     fissile_brick: {
         "nu_fission": np.array([3.24 * 0.081600]),  # 1/cm
         "scatter_gtg": np.array([[0.225216]]),  # 1/cm
@@ -41,7 +41,7 @@ one_group_xs = {
 
 two_group_xs = {
     "num_groups": 2,
-    "chi": np.array([[0.575, 0.425]]),
+    "chi": np.array([0.575, 0.425]),
     fissile_brick: {
         "nu_fission": np.array([3.10 * 0.0936, 2.93 * 0.08544]),  # 1/cm
         "scatter_gtg": np.array([[0.0792, 0.0],[0.0432, 0.23616]]),  # 1/cm
@@ -87,9 +87,7 @@ SN = DiscreteOrdinates(
 
 #solvers = 
 
-#ks = {"ISFM": [], "TT/ALS": []}
-ks = {"TT/ALS": []}
-
+ks = {"ISFM": [], "TT/ALS": []}
 exec_times = {"ISFM": [], "TT/ALS": []}
 
 expected_k = 1

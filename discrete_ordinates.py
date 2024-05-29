@@ -139,7 +139,7 @@ class DiscreteOrdinates:
             if self._xs_server.num_groups > 1:
                 self._F.append(
                     [
-                        np.outer(self._xs_server.chi, self._xs_server.num_fission(mat)),
+                        np.outer(self._xs_server.chi, self._xs_server.nu_fission(mat)),
                         Intg,
                         Ip[i] * bc[i],
                     ]

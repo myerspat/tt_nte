@@ -10,6 +10,7 @@ import scikit_tt.tensor_train as tt
 import scipy.sparse as sp
 from scikit_tt import TT
 from scipy.sparse.linalg import eigs, inv
+import LCU_solve
 
 
 class DiscreteOrdinates:
@@ -193,6 +194,54 @@ class DiscreteOrdinates:
             psi = -psi
 
         return np.real(k)[0], psi / np.linalg.norm(psi)
+    
+    def solve_matrix_quantum(self):
+        """
+        Solve SN using power iteration with quantum algorithm for solving each fixed source equation in power iteration
+        """
+        # Use only first material for now
+        mat = self._geometry.materials[0]
+        num_nodes = self._geometry.mat_num_nodes(mat)
+
+        psi_old = np.random.rand(
+            (num_nodes + 1) * self._num_ordinates * self._xs_server.num_groups
+        ).reshape((-1, 1))
+        k_old = np.random.rand(1)[0]
+
+        err = 1.0
+
+        # Get operators in CSC format
+        H_inv = inv(self.H("csc"))
+        S = self.S("csc")
+        F = self.F("csc")
+
+        for _ in range(self._max_iter):
+            mat_shape = (
+                self._xs_server.num_groups * self._num_ordinates * (num_nodes + 1),
+                self._xs_server.num_groups * self._num_ordinates * (num_nodes + 1),
+            )
+            S_expand = np.reshape(self._S.full().flatten(), mat_shape)
+            F_expand = np.reshape(self._F.full().flatten(), mat_shape)
+            H_expand = np.reshape(self._H.full().flatten(), mat_shape)
+            psi_new = LCU_solve.solve_linear_system(H_expand,np.reshape((S_expand + 1 / k_old * F_expand).dot(psi_old),(self._xs_server.num_groups * self._num_ordinates * (num_nodes + 1))))
+
+            # Compute new eigenvalue and eigenvector L2 error
+            k_new = k_old * np.sum(F.dot(psi_new)) / np.sum(F.dot(psi_old))
+            err = np.linalg.norm(psi_new - psi_old, ord=2)
+
+            print("k: ", k_new, "err: ", err)
+
+            if err < self._tol:
+                return k_new, psi_new.flatten() / np.linalg.norm(psi_new.flatten())
+
+            # Copy results for next iteration
+            psi_old = copy.deepcopy(psi_new)
+            k_old = copy.deepcopy(k_new)
+
+        raise RuntimeError(
+            f"Maximum number of power iteration ({self._max_iter})"
+            + f" without convergence to err < {self._tol}"
+        )
 
     def solve_matrix_power(self):
         """
@@ -443,3 +492,4 @@ class DiscreteOrdinates:
     @property
     def num_ordinates(self):
         return self._num_ordinates
+    

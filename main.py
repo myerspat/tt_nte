@@ -30,7 +30,7 @@ fissile_brick = Material({pu239: 1.0})
 
 # Cross section data
 one_group_xs = {
-    "num_groups": 2,
+    "num_groups": 1,
     "chi": np.array([1.0]),
     fissile_brick: {
         "nu_fission": np.array([3.24 * 0.081600]),  # 1/cm
@@ -48,7 +48,7 @@ two_group_xs = {
         "total": np.array([0.2208, 0.3360]),  # 1/cm
     },
 }
-xs_server = XSServer(two_group_xs)
+xs_server = XSServer(one_group_xs)
 
 # Slab Geometry
 #thickness = 3.707444  # cm, 1-D 1-group Pu slab critical case
@@ -72,7 +72,7 @@ print(psi)'''
 
 # Slab Geometry
 thickness = 2 * 1.795602  # cm
-num_nodes = 511
+num_nodes = 7
 geometry = Geometry({fissile_brick: {"num_nodes": num_nodes, "thickness": thickness}})
 tol = 1e-6
 
@@ -103,7 +103,7 @@ for method in ks.keys():
             xs_server=xs_server, 
             geometry=geometry, 
             num_ordinates=num_ordinates, 
-            tol=tol,
+            tol=tol
         )
     
         # Run and time matrix power iteration

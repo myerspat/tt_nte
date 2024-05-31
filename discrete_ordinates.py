@@ -18,7 +18,6 @@ class DiscreteOrdinates:
         xs_server,
         geometry,
         num_ordinates,
-        bc="vacuum",
         tol=1e-6,
         max_iter=100,
         tt_fmt="tt",
@@ -28,7 +27,6 @@ class DiscreteOrdinates:
             xs_server=xs_server,
             geometry=geometry,
             num_ordinates=num_ordinates,
-            bc=bc,
             tol=tol,
             max_iter=max_iter,
             tt_fmt=tt_fmt,
@@ -40,11 +38,9 @@ class DiscreteOrdinates:
         Construct operaotr tensor trains as described in
         LANL TT paper.
         """
-        # Use only first material for now
-        mat = self._geometry.materials[0]
-
-        dx = self._geometry.mat_dx(mat)
-        num_nodes = self._geometry.mat_num_nodes(mat)
+        num_regions = len(self._geometry.regions)
+        num_nodes = self._geometry.num_nodes
+        num_groups = self._xs_server.num_groups
 
         d = np.eye(num_nodes + 1, k=0)
         d_p = np.eye(num_nodes + 1, k=-1)
@@ -62,7 +58,17 @@ class DiscreteOrdinates:
         Ip = [1 / 2 * (d + d_p), 1 / 2 * (d + d_m)]
 
         # Differentiation matrix
-        D = [1 / dx * (d - d_p), 1 / dx * (d_m - d)]
+        dx = self._geometry.dx
+        D = [
+            1 / np.concatenate((dx[[0],], dx)) * (d - d_p),
+            1 / np.concatenate((dx, dx[[-1],])) * (d_m - d),
+        ]
+
+        # Group identity matrix
+        Ig = np.identity(self._xs_server.num_groups)
+
+        # Ordinate identity matrix
+        IL = np.identity(int(self._num_ordinates / 2))
 
         # Iterate over two half spaces
         # Because we're in 1D we have 2 direction spaces
@@ -71,108 +77,112 @@ class DiscreteOrdinates:
         self._H = []
         self._F = []
         self._S = []
+        bcs = [self._geometry.left_bc, self._geometry.right_bc]
+
         for i in range(2):
             C = np.zeros((2, 2), dtype=float)
             C[i, i] = 1.0
 
-            Ig = np.identity(self._xs_server.num_groups)
-            IL = np.identity(int(self._num_ordinates / 2))
-
             # Angular point matrix
             Qu = np.kron(C, (-1) ** (i) * np.diag(self._mu))
 
-            # Streaming
-            if self._xs_server.num_groups > 1:
-                self._H.append([Ig, Qu, D[i]])
-            else:
-                self._H.append([Qu, D[i]])
+            # Streaming operator
+            self._H.append([Ig, Qu, D[i]] if num_groups > 1 else [Qu, D[i]])
 
-            # Total interaction
-            if self._xs_server.num_groups > 1:
-                self._H.append(
-                    [
-                        np.diag(self._xs_server.total(mat)),
-                        np.kron(C, IL),
-                        Ip[i],
-                    ]
-                )
-            else:
-                self._H.append(
-                    [
-                        self._xs_server.total(mat) * np.kron(C, IL),
-                        Ip[i],
-                    ]
-                )
+            # Integral operator
+            A = np.zeros((2, 2), dtype=float)
+            A[i, :] = 1
+            Intg = np.kron(A, np.outer(np.ones(self._w.size), self._w))
 
-            if self._bc == "reflective":
-                C_ref = np.zeros((2, 2), dtype=float)
-                C_ref[i, (1 + i) % 2] = 1
-
-                D_ref = np.zeros((num_nodes + 1, num_nodes + 1))
-                D_ref[-i, -i] = 1 / dx
-
+            # Add reflection
+            if bcs[i] == "reflective":
                 Ip_ref = np.zeros((num_nodes + 1, num_nodes + 1))
                 Ip_ref[-i, -i] = 1 / 2
 
+                D_ref = np.zeros((num_nodes + 1, num_nodes + 1))
+                D_ref[-i, -i] = 1 / dx[0,] if i == 0 else 1 / dx[-1,]
+
+                C_ref = np.zeros((2, 2), dtype=float)
+                C_ref[i, (i + 1) % 2] = 1
+
                 Qu_ref = np.kron(C_ref, -np.diag(self._mu))
 
-                if self._xs_server.num_groups > 1:
-                    self._H.append([Ig, Qu_ref, D_ref])
-                    self._H.append(
-                        [
-                            np.diag(self._xs_server.total(mat)),
-                            np.kron(C_ref, -IL),
-                            Ip_ref,
-                        ]
-                    )
-                else:
-                    self._H.append([Qu_ref, D_ref])
-                    self._H.append(
-                        [self._xs_server.total(mat) * np.kron(C_ref, -IL), Ip_ref]
-                    )
+                # Streaming operator (reflective)
+                self._H.append(
+                    [Ig, Qu_ref, D_ref] if num_groups > 1 else [Qu_ref, D_ref]
+                )
 
-            # Integral operator matrix
-            C[i, :] = 1
-            Intg = np.kron(C, np.outer(np.ones(self._w.size), self._w))
+                # Total interaction operator (reflective)
+                region = (
+                    self._geometry.regions[0] if i == 0 else self._geometry.regions[-1]
+                )
+                self._H.append(
+                    [
+                        np.diag(self._xs_server.total(region.material)),
+                        np.kron(C_ref, -IL),
+                        Ip_ref,
+                    ]
+                    if num_groups > 1
+                    else [
+                        self._xs_server.total(region.material) * np.kron(C_ref, -IL),
+                        Ip_ref,
+                    ]
+                )
 
-            # Fission
-            if self._xs_server.num_groups > 1:
+            # Iterate through regions in the problem from left to right
+            for region in self._geometry.unique_regions:
+                # Define XS matrices
+                mat = region.material
+
+                total = np.diag(self._xs_server.total(mat))
+                scatter_gtg = self._xs_server.scatter_gtg(mat)
+                nu_fission = np.outer(
+                    self._xs_server.chi, self._xs_server.nu_fission(mat)
+                )
+
+                total = np.squeeze(total)
+                scatter_gtg = np.squeeze(scatter_gtg)
+                nu_fission = np.squeeze(nu_fission)
+
+                # Region mask for spatial dependence
+                mask = self._geometry.region_mask(region)
+                mask = (
+                    np.concatenate((mask[[0],], mask))
+                    if i == 0
+                    else np.concatenate((mask, mask[[-1],]))
+                )
+
+                # Total interaction operator
+                self._H.append(
+                    [total, np.kron(C, IL), mask * Ip[i]]
+                    if num_groups > 1
+                    else [total * np.kron(C, IL), mask * Ip[i]]
+                )
+
+                # Fission operator
                 self._F.append(
-                    [
-                        np.outer(self._xs_server.chi, self._xs_server.num_fission(mat)),
-                        Intg,
-                        Ip[i] * bc[i],
-                    ]
-                )
-            else:
-                self._F.append(
-                    [
-                        self._xs_server.chi * self._xs_server.nu_fission(mat) * Intg,
-                        Ip[i] * bc[i],
-                    ]
+                    [nu_fission, Intg, Ip[i] * bc[i] * mask]
+                    if num_groups > 1
+                    else [nu_fission * Intg, Ip[i] * bc[i] * mask]
                 )
 
-            # Scatter
-            if self._xs_server.num_groups > 1:
+                # Scattering operator
                 self._S.append(
-                    [
-                        self._xs_server.scatter_gtg(mat),
-                        Intg,
-                        Ip[i] * bc[i],
-                    ]
-                )
-            else:
-                self._S.append(
-                    [
-                        self._xs_server.scatter_gtg(mat) * Intg,
-                        Ip[i] * bc[i],
-                    ]
+                    [scatter_gtg, Intg, Ip[i] * bc[i] * mask]
+                    if num_groups > 1
+                    else [scatter_gtg * Intg, Ip[i] * bc[i] * mask]
                 )
 
         # Construct TT objects
         self._H = self._tensor_train(self._H)
         self._F = self._tensor_train(self._F)
         self._S = self._tensor_train(self._S)
+
+        # Convert to QTT if requested
+        if self._tt_fmt == "qtt":
+            self._H = self.tt2qtt(self._H)
+            self._F = self.tt2qtt(self._F)
+            self._S = self.tt2qtt(self._S)
 
     # ==============================================================================
     # Full matrix solvers
@@ -198,12 +208,10 @@ class DiscreteOrdinates:
         """
         Solve SN using power iteration with full matrices.
         """
-        # Use only first material for now
-        mat = self._geometry.materials[0]
-        num_nodes = self._geometry.mat_num_nodes(mat)
-
         psi_old = np.random.rand(
-            (num_nodes + 1) * self._num_ordinates * self._xs_server.num_groups
+            (self._geometry.num_nodes + 1)
+            * self._num_ordinates
+            * self._xs_server.num_groups
         ).reshape((-1, 1))
         k_old = np.random.rand(1)[0]
 
@@ -314,10 +322,7 @@ class DiscreteOrdinates:
             return TT(elements)
 
         if isinstance(elements[0], np.ndarray):
-            if self._tt_fmt == "tt":
-                return TT(elements)
-            else:
-                return self.tt2qtt(TT(elements))
+            return TT(elements)
 
         else:
             tt = elements[0]
@@ -350,7 +355,6 @@ class DiscreteOrdinates:
         xs_server=None,
         geometry=None,
         num_ordinates=None,
-        bc=None,
         tol=None,
         max_iter=None,
         tt_fmt=None,
@@ -364,7 +368,6 @@ class DiscreteOrdinates:
         self._num_ordinates = (
             self._num_ordinates if num_ordinates is None else num_ordinates
         )
-        self._bc = self._bc if bc is None else bc
         self._tol = self._tol if tol is None else tol
         self._max_iter = self._max_iter if max_iter is None else max_iter
         self._tt_fmt = self._tt_fmt if tt_fmt is None else tt_fmt
@@ -372,16 +375,12 @@ class DiscreteOrdinates:
             self._qtt_threshold if qtt_threshold is None else qtt_threshold
         )
 
-        # Assert supported boundary conditions
-        assert self._bc == "vacuum" or self._bc == "reflective"
-
         # Assert supported TT formats
         assert self._tt_fmt == "tt" or self._tt_fmt == "qtt"
 
         # Assert dimensions are power of 2
         self._check_dim_size("ordinates", self._num_ordinates)
-        for mat in self._geometry.materials:
-            self._check_dim_size("spatial edges", self._geometry.mat_num_nodes(mat) + 1)
+        self._check_dim_size("spatial edges", self._geometry.num_nodes + 1)
         if self._xs_server.num_groups != 1:
             self._check_dim_size("energy groups", self._xs_server.num_groups)
 

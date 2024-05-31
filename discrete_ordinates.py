@@ -38,7 +38,6 @@ class DiscreteOrdinates:
         Construct operaotr tensor trains as described in
         LANL TT paper.
         """
-        num_regions = len(self._geometry.regions)
         num_nodes = self._geometry.num_nodes
         num_groups = self._xs_server.num_groups
 

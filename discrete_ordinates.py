@@ -1,7 +1,9 @@
 """
 discrete_ordinates.py
 """
+
 import copy
+import matplotlib.pyplot as plt
 
 import numpy as np
 import scikit_tt.solvers.evp as evp
@@ -10,6 +12,8 @@ import scikit_tt.tensor_train as tt
 import scipy.sparse as sp
 from scikit_tt import TT
 from scipy.sparse.linalg import eigs, inv
+from scipy.special import eval_legendre
+from scipy.linalg import svd
 
 
 class DiscreteOrdinates:
@@ -91,7 +95,7 @@ class DiscreteOrdinates:
             # Integral operator
             A = np.zeros((2, 2), dtype=float)
             A[i, :] = 1
-            Intg = np.kron(A, np.outer(np.ones(self._w.size), self._w))
+            F_Intg = np.kron(A, np.outer(np.ones(self._w.size), self._w))
 
             # Add reflection
             if bcs[i] == "reflective":
@@ -134,13 +138,11 @@ class DiscreteOrdinates:
                 mat = region.material
 
                 total = np.diag(self._xs_server.total(mat))
-                scatter_gtg = self._xs_server.scatter_gtg(mat)
                 nu_fission = np.outer(
                     self._xs_server.chi, self._xs_server.nu_fission(mat)
                 )
 
                 total = np.squeeze(total)
-                scatter_gtg = np.squeeze(scatter_gtg)
                 nu_fission = np.squeeze(nu_fission)
 
                 # Region mask for spatial dependence
@@ -160,17 +162,33 @@ class DiscreteOrdinates:
 
                 # Fission operator
                 self._F.append(
-                    [nu_fission, Intg, Ip[i] * bc[i] * mask]
+                    [nu_fission, F_Intg, Ip[i] * bc[i] * mask]
                     if num_groups > 1
-                    else [nu_fission * Intg, Ip[i] * bc[i] * mask]
+                    else [nu_fission * F_Intg, Ip[i] * bc[i] * mask]
                 )
 
-                # Scattering operator
-                self._S.append(
-                    [scatter_gtg, Intg, Ip[i] * bc[i] * mask]
-                    if num_groups > 1
-                    else [scatter_gtg * Intg, Ip[i] * bc[i] * mask]
-                )
+                # Iterate through scattering moments
+                for l in range(self._xs_server.scatter_gtg(mat).shape[0]):
+                    scatter_gtg = np.squeeze(self._xs_server.scatter_gtg(mat)[l,])
+
+                    # Integral operator
+                    A = np.zeros((2, 2), dtype=float)
+                    A[i, :] = 1
+                    A[i, 1 - i] = (-1) ** l
+                    S_Intg = np.kron(
+                        A,
+                        np.outer(
+                            (2 * l + 1) * eval_legendre(l, self._mu),
+                            self._w * eval_legendre(l, self._mu),
+                        ),
+                    )
+
+                    # Scattering operator
+                    self._S.append(
+                        [scatter_gtg, S_Intg, Ip[i] * bc[i] * mask]
+                        if num_groups > 1
+                        else [scatter_gtg * S_Intg, Ip[i] * bc[i] * mask]
+                    )
 
         # Construct TT objects
         self._H = self._tensor_train(self._H)
@@ -330,14 +348,20 @@ class DiscreteOrdinates:
 
             return tt
 
-    def tt2qtt(self, tt):
+    def tt2qtt(self, tt, cores=None):
         """
         Transform TT formatted operator to QTT format.
         """
         # Reshape and permute dims to list of [2] * l_k
         new_dims = []
-        for dim_size in tt.row_dims:
-            new_dims.append([2] * self._get_degree(dim_size))
+        if cores is None:
+            for dim_size in tt.row_dims:
+                new_dims.append([2] * self._get_degree(dim_size))
+
+        else:
+            new_dims = np.copy(tt.row_dims)
+            for core in cores:
+                new_dims[core] = [2] * self._get_degree(new_dims[core])
 
         # Transform operator into QTT format with threshold
         # for SVD decomposition
@@ -409,6 +433,61 @@ class DiscreteOrdinates:
             return sp.csc_matrix(tt.matricize())
         else:
             raise RuntimeError(f"Format requested ({fmt}) is not supported")
+
+    def plot_qtt_svd(self):
+        fig, axs = plt.subplots(3)
+        tts = [self._H, self._F, self._S]
+        tt_names = ["LHS Operator", "Fission Operator", "Scattering Operator"]
+
+        for tt_idx in range(len(tts)):
+            tt = tts[tt_idx]
+            tt_tensor = tt.copy()
+
+            # QTT shaping
+            new_dims = []
+            for dim_size in tt.row_dims:
+                new_dims.append([2] * self._get_degree(dim_size))
+
+            for i in range(tt.order):
+                # Get core features
+                core = tt_tensor.cores[i]
+                rank = tt_tensor.ranks[i]
+                row_dim = tt_tensor.row_dims[i]
+                col_dim = tt_tensor.col_dims[i]
+
+                c = plt.cm.rainbow(np.linspace(0, 1, tt.order))[i]
+
+                for j in range(len(new_dims[i]) - 1):
+                    # Set new row_dim and col_dim for reshape
+                    row_dim = int(row_dim / new_dims[i][j])
+                    col_dim = int(col_dim / new_dims[i][j])
+
+                    # Reshape and transpose core
+                    core = core.reshape(
+                        rank,
+                        new_dims[i][j],
+                        row_dim,
+                        new_dims[i][j],
+                        col_dim,
+                        tt_tensor.ranks[i + 1],
+                    ).transpose([0, 1, 3, 2, 4, 5])
+
+                    # Apply SVD to split core
+                    [_, s, _] = svd(
+                        core.reshape(
+                            rank * new_dims[i][j] ** 2,
+                            row_dim * col_dim * tt_tensor.ranks[i + 1],
+                        ),
+                        full_matrices=False,
+                        overwrite_a=True,
+                        check_finite=False,
+                        lapack_driver="gesvd",
+                    )
+
+                    # Plot SVD singular values
+                    axs[tt_idx].plot(s, c=c)
+
+        return fig, axs
 
     # ==============================================================================
     # Quadrature sets

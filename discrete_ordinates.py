@@ -3,7 +3,6 @@ discrete_ordinates.py
 """
 
 import copy
-import matplotlib.pyplot as plt
 
 import numpy as np
 import scikit_tt.solvers.evp as evp
@@ -13,7 +12,7 @@ import scipy.sparse as sp
 from scikit_tt import TT
 from scipy.sparse.linalg import eigs, inv
 from scipy.special import eval_legendre
-from scipy.linalg import svd
+import utils
 
 
 class DiscreteOrdinates:
@@ -219,7 +218,7 @@ class DiscreteOrdinates:
         if np.sum(psi) < 0:
             psi = -psi
 
-        return np.real(k)[0], psi / np.linalg.norm(psi)
+        return np.real(k)[0], psi / np.linalg.norm(psi, 2)
 
     def solve_matrix_power(self):
         """
@@ -230,6 +229,8 @@ class DiscreteOrdinates:
             * self._num_ordinates
             * self._xs_server.num_groups
         ).reshape((-1, 1))
+        psi_old /= np.linalg.norm(psi_old, 2)
+
         k_old = np.random.rand(1)[0]
 
         err = 1.0
@@ -244,10 +245,13 @@ class DiscreteOrdinates:
 
             # Compute new eigenvalue and eigenvector L2 error
             k_new = k_old * np.sum(F.dot(psi_new)) / np.sum(F.dot(psi_old))
-            err = np.linalg.norm(psi_new - psi_old, ord=2)
+            err = np.linalg.norm(psi_new - psi_old, ord=2) / np.linalg.norm(
+                psi_old, ord=2
+            )
 
+            # Return if tolerance is met
             if err < self._tol:
-                return k_new, psi_new.flatten() / np.linalg.norm(psi_new.flatten())
+                return k_new, psi_new.flatten() / np.linalg.norm(psi_new.flatten(), 2)
 
             # Copy results for next iteration
             psi_old = copy.deepcopy(psi_new)
@@ -261,59 +265,134 @@ class DiscreteOrdinates:
     # ==============================================================================
     # TT solvers (scikit_tt and power iteration implementation)
 
-    def solve_TT_scikit_als(self, rank=4):
+    def solve_TT_scikit_als(self, ranks=None, repeats=10):
         """
         SN using TT with ALS/generalized eigenvalue solver.
         """
-        # Create initial guess
-        psi = tt.rand(self._H.row_dims, [1] * self._H.order, ranks=rank)
+        # Get maximum ranks for each core for possible convergence
+        if ranks == None:
+            ranks = (
+                np.array([self._H.ranks, self._S.ranks, self._F.ranks], dtype=int)
+                .max(axis=0)
+                .tolist()
+            )
+
+        psi = tt.rand(self._H.row_dims, [1] * self._H.order, ranks=ranks)
+        psi *= 1 / psi.norm(2)
 
         # Run ALS GES
         k, psi, _ = evp.als(
-            self._F, psi, operator_gevp=(self._H - self._S), conv_eps=self._tol
+            self._F, psi, operator_gevp=(self._H - self._S), repeats=repeats
         )
-
-        psi = psi.full().flatten() / psi.norm()
+        psi = psi.full().flatten() / psi.norm(2)
 
         if np.sum(psi) < 0:
             psi = -psi
 
         return k, psi
 
-    def solve_TT_power(self, method="als", rank=4, threshold=1e-12, max_rank=np.infty):
+    def solve_TT_power(
+        self,
+        method="als",
+        ranks=None,
+        threshold=1e-8,
+        start_max_rank=4,
+        max_rank=None,
+        verbose=False,
+    ):
         """
         Solve SN using power iteration with TT ALS or MALS
         """
-        psi_old = tt.rand(self._H.row_dims, [1] * self._H.order, ranks=rank)
+        assert method == "als" or method == "mals"
+
+        # Get maximum ranks for each core for possible convergence
+        if method == "als" and ranks == None:
+            ranks = (
+                np.array([self._H.ranks, self._S.ranks, self._F.ranks], dtype=int)
+                .max(axis=0)
+                .tolist()
+            )
+
+        elif method == "mals" and max_rank == None:
+            # Prepare adaptive rank algorithm
+            ranks = start_max_rank
+            max_rank = np.array(
+                [self._H.ranks, self._S.ranks, self._F.ranks], dtype=int
+            ).max()
+
+        # Initial guess for psi and k
+        psi_old = tt.rand(self._H.row_dims, [1] * self._H.order, ranks=ranks)
+        psi_old *= 1 / psi_old.norm(2)
 
         k_old = np.random.rand(1)[0]
-        err = 1.0
+        err_old = 1.0
 
-        solver = sle.als if method == "als" else sle.mals
-        kwargs = (
-            {} if method == "als" else {"threshold": threshold, "max_rank": max_rank}
-        )
-
-        for i in range(self._max_iter):
-            psi_new = solver(
+        # Run initial 5 iteration of ALS if MALS is chosen
+        for i in range(self._max_iter if method == "als" else 5):
+            psi_new = sle.als(
                 self._H,
                 psi_old,
                 (self._S + 1 / k_old * self._F).dot(psi_old),
-                **kwargs,
             )
 
             # Compute new eigenvalue and eigenvector L2 error
             k_new = (
-                k_old * (self._F.dot(psi_new)).norm() / (self._F.dot(psi_old)).norm()
+                k_old * (self._F.dot(psi_new)).norm(1) / (self._F.dot(psi_old)).norm(1)
             )
-            err = (psi_new - psi_old).norm(p=2)
+            err_new = (psi_new - psi_old).norm(2) / psi_old.norm(2)
 
-            if err < self._tol:
-                return k_new, psi_new.full().flatten() / psi_new.norm()
+            # Return if tolerance is met
+            if err_new < self._tol:
+                return k_new, psi_new.full().flatten() / psi_new.norm(2)
 
             # Copy results for next iteration
             psi_old = copy.deepcopy(psi_new)
             k_old = copy.deepcopy(k_new)
+            err_old = copy.deepcopy(err_new)
+
+        if method == "mals":
+            kwargs = {"threshold": threshold, "max_rank": start_max_rank}
+
+            # Get polynomial coefficients for rank
+            self._poly = np.polyfit(
+                np.log([err_old, self._tol * 100]),
+                [start_max_rank, max_rank],
+                1,
+            )
+
+            for i in range(self._max_iter - 5):
+                psi_new = sle.mals(
+                    self._H,
+                    psi_old,
+                    (self._S + 1 / k_old * self._F).dot(psi_old),
+                    **kwargs,
+                )
+
+                # Compute new eigenvalue and eigenvector L2 error
+                k_new = (
+                    k_old
+                    * (self._F.dot(psi_new)).norm(1)
+                    / (self._F.dot(psi_old)).norm(1)
+                )
+                err_new = (psi_new - psi_old).norm(2) / psi_old.norm(2)
+
+                # New rank calculation (based on y = A + B * log(x))
+                kwargs["max_rank"] = np.round(
+                    self._poly[0] * np.log(err_new) + self._poly[1]
+                ).astype(int)
+
+                # Return if tolerance is met
+                if err_new < self._tol:
+                    return k_new, psi_new.full().flatten() / psi_new.norm(2)
+                elif err_new > err_old and verbose:
+                    print(
+                        "Warning: Error increased last iteration, convergence in question"
+                    )
+
+                # Copy results for next iteration
+                psi_old = copy.deepcopy(psi_new)
+                k_old = copy.deepcopy(k_new)
+                err_old = copy.deepcopy(err_new)
 
         raise RuntimeError(
             f"Maximum number of power iteration ({self._max_iter})"
@@ -356,22 +435,18 @@ class DiscreteOrdinates:
         new_dims = []
         if cores is None:
             for dim_size in tt.row_dims:
-                new_dims.append([2] * self._get_degree(dim_size))
+                new_dims.append([2] * utils.get_degree(dim_size))
 
         else:
-            new_dims = np.copy(tt.row_dims)
-            for core in cores:
-                new_dims[core] = [2] * self._get_degree(new_dims[core])
+            for i in range(len(tt.row_dims)):
+                if i in cores:
+                    new_dims.append([2] * utils.get_degree(tt.row_dims[i]))
+                else:
+                    new_dims.append([tt.row_dims[i]])
 
         # Transform operator into QTT format with threshold
         # for SVD decomposition
         return tt.tt2qtt(new_dims, new_dims, threshold=self._qtt_threshold)
-
-    def _get_degree(self, dim_size):
-        """
-        Get degree where the dimension size is 2 ** degree.
-        """
-        return int(np.round(np.log(dim_size) / np.log(2)))
 
     def update_settings(
         self,
@@ -402,24 +477,16 @@ class DiscreteOrdinates:
         assert self._tt_fmt == "tt" or self._tt_fmt == "qtt"
 
         # Assert dimensions are power of 2
-        self._check_dim_size("ordinates", self._num_ordinates)
-        self._check_dim_size("spatial edges", self._geometry.num_nodes + 1)
+        utils.check_dim_size("ordinates", self._num_ordinates)
+        utils.check_dim_size("spatial edges", self._geometry.num_nodes + 1)
         if self._xs_server.num_groups != 1:
-            self._check_dim_size("energy groups", self._xs_server.num_groups)
+            utils.check_dim_size("energy groups", self._xs_server.num_groups)
 
         # Get square quadrature set (in 1D this is Gauss-Legendre)
         self._w, self._mu = self._gauss_legendre(self._num_ordinates)
 
         # Construct operator tensors
         self._construct_tensor_trains()
-
-    @staticmethod
-    def _check_dim_size(name, dim_size):
-        """
-        Check dimension sizes are powers of 2.
-        """
-        if not ((dim_size & (dim_size - 1) == 0) and dim_size != 0):
-            raise RuntimeError(f"Number of {name} must be a power of 2")
 
     def _format_tt(self, tt, fmt):
         """
@@ -433,61 +500,6 @@ class DiscreteOrdinates:
             return sp.csc_matrix(tt.matricize())
         else:
             raise RuntimeError(f"Format requested ({fmt}) is not supported")
-
-    def plot_qtt_svd(self):
-        fig, axs = plt.subplots(3)
-        tts = [self._H, self._F, self._S]
-        tt_names = ["LHS Operator", "Fission Operator", "Scattering Operator"]
-
-        for tt_idx in range(len(tts)):
-            tt = tts[tt_idx]
-            tt_tensor = tt.copy()
-
-            # QTT shaping
-            new_dims = []
-            for dim_size in tt.row_dims:
-                new_dims.append([2] * self._get_degree(dim_size))
-
-            for i in range(tt.order):
-                # Get core features
-                core = tt_tensor.cores[i]
-                rank = tt_tensor.ranks[i]
-                row_dim = tt_tensor.row_dims[i]
-                col_dim = tt_tensor.col_dims[i]
-
-                c = plt.cm.rainbow(np.linspace(0, 1, tt.order))[i]
-
-                for j in range(len(new_dims[i]) - 1):
-                    # Set new row_dim and col_dim for reshape
-                    row_dim = int(row_dim / new_dims[i][j])
-                    col_dim = int(col_dim / new_dims[i][j])
-
-                    # Reshape and transpose core
-                    core = core.reshape(
-                        rank,
-                        new_dims[i][j],
-                        row_dim,
-                        new_dims[i][j],
-                        col_dim,
-                        tt_tensor.ranks[i + 1],
-                    ).transpose([0, 1, 3, 2, 4, 5])
-
-                    # Apply SVD to split core
-                    [_, s, _] = svd(
-                        core.reshape(
-                            rank * new_dims[i][j] ** 2,
-                            row_dim * col_dim * tt_tensor.ranks[i + 1],
-                        ),
-                        full_matrices=False,
-                        overwrite_a=True,
-                        check_finite=False,
-                        lapack_driver="gesvd",
-                    )
-
-                    # Plot SVD singular values
-                    axs[tt_idx].plot(s, c=c)
-
-        return fig, axs
 
     # ==============================================================================
     # Quadrature sets

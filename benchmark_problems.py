@@ -14,9 +14,9 @@ from xs_server import XSServer
 
 def pu_brick(num_nodes):
     """
-    Pu-239 1D slab problem taken from the Criticality Verification Benchmark Suite.
-    The width of the slab is 3.707444 cm with vacuum boundary conditions on either
-    side.
+    Pu-239 1D slab problem taken from the Criticality Verification Benchmark 
+    Suite. The width of the slab is 3.707444 cm with vacuum boundary conditions
+    on either side.
     """
     # Nuclides
     pu239 = Nuclide(Z=94, A=239)
@@ -37,7 +37,7 @@ def pu_brick(num_nodes):
 
     # Slab Geometry
     fuel_region = Region(fuel, 3.707444, num_nodes - 1)
-    geometry = Geometry([fuel_region], "vacuum", "vacuum")
+    geometry = Geometry([fuel_region], "vacuum", "vacuum", "vacuum", "vacuum")
 
     return xs_server, geometry
 

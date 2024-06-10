@@ -7,12 +7,12 @@ class Inputs_fissile_brick:
         nu_fission  = 3.24 * 0.081600,
         scatter_gtg = 0.225216,
         total       = 0.32640,
-        Num_ordinates = [2],
+        num_ordinates = [2,4,8,16],
         
         # desired solvers
         
         MGES     = True,
-        MPower   = True,
+        MPower   = False,
         TTPower  = True,
         QTTPower = False,
         
@@ -27,7 +27,7 @@ class Inputs_fissile_brick:
         self.nu_fission = nu_fission
         self.scatter_gtg = scatter_gtg,
         self.total       = total,
-        self.Num_ordinates = Num_ordinates       
+        #self.num_ordinates = num_ordinates,        
         self.MGES = MGES,
         self.MPower = MPower,
         self.TTPower = TTPower,
@@ -35,3 +35,4 @@ class Inputs_fissile_brick:
         self.Eigenvec_err = Eigenvec_err,
         self.Eigenval_err = Eigenval_err,
         self.compression_ratio = compression_ratio,
+        

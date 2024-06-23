@@ -22,7 +22,7 @@ def solve_linear_system(A_matrix, b_vector):
 
     start = time.perf_counter()
     # Do LCU routine (https://arxiv.org/pdf/1511.02306.pdf), equation 18
-    num_LCU_bits = 5
+    num_LCU_bits = 4
     num_unitaries = pow(2,num_LCU_bits)
     last_error_norm = np.inf
 
@@ -48,22 +48,40 @@ def solve_linear_system(A_matrix, b_vector):
         _, _, error_norm = LcuFunctions.get_fourier_unitaries(J, K, y_max, z_max, quantum_mat, False, A_mat_size)
         return error_norm
 
-    #define search space (lower, upper bound)
+    # define search space (lower, upper bound)
     '''space = [Integer(int(num_LCU_bits/4), num_LCU_bits - int(num_LCU_bits/4), name='j'),
-            Real(0.5, 5, name='y_max'), Real(0.5, 5, name='z_max')]
+        Real(0.5, 5, name='y_max'), 
+        Real(0.5, 4, name='z_max')]
+    ###adjust stopping criteria to allow optimizer to explore parameter space ###
+    #stop if no improvement in the best value for 10 consecutive iterations
+    stopper = DeltaYStopper(delta=0.001, n_best=10)
 
-    #stop if no improvement in the best value for 2 consecutive iterations
-    stopper = DeltaYStopper(delta=0.001, n_best=2)
+    first_result = gp_minimize(objective_function, space, n_calls=50, random_state=42, callback=[stopper])
 
-    result = gp_minimize(objective_function, space, n_calls=50, random_state=42, callback=[stopper])
-    best_j, best_y_max, best_z_max = result.x
-    best_error_norm = result.fun'''
+    best_j, best_y_max, best_z_max = first_result.x
+    'best_error_norm = result.fun'
 
+    #refine params again
+    refined_space = [Integer(max(best_j-1, int(num_LCU_bits/4)), min(best_j+1, num_LCU_bits-int(num_LCU_bits/4)), name='j'),
+            Real(max(0.5, best_y_max-0.5), min(5, best_y_max+0.5), name='y_max'), 
+            Real(max(0.5, best_z_max-0.5), min(5, best_z_max+0.5), name='z_max')]
+
+    result = gp_minimize(objective_function, refined_space, n_calls=50, random_state=42, callback=[stopper])
+    best_j, best_y_max, best_z_max = result.x'''
 
     # manually input parameters for LCU (16x16 diffusion, dx=0.5, dy=0.5, 5 LCU bits)
-    best_j = 3
+    '''best_j = 3
     best_y_max = 4.0
-    best_z_max = 2.0
+    best_z_max = 2.0'''
+
+    # manually input parameters for LCU (16x16 diffusion, dx=0.5, dy=0.5, 4 LCU bits)
+    '''best_j = 2
+    best_y_max = 2.4918
+    best_z_max = 1.987'''
+  
+    best_j = 2
+    best_y_max = 3.875
+    best_z_max = 3.15
 
     # manually input parameters for LCU (32x32 diffusion, dx=0.5, dy=0.5, 3 LCU bits) (does not work well)
     '''best_j = 1
@@ -72,8 +90,8 @@ def solve_linear_system(A_matrix, b_vector):
 
     # manually input parameters for LCU (16x16 sp3, dx=0.5, dy=0.5, 4 LCU bits)
     '''best_j = 2
-    best_y_max = 1.5
-    best_z_max = 1.5'''
+    best_y_max = 1.825634
+    best_z_max = 1.3984179'''
 
     #print("Best J: ", pow(2, best_j))
     #print("Best K: ", pow(2, num_LCU_bits - best_j - 1))

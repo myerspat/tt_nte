@@ -34,8 +34,8 @@ one_group_xs = {
     "chi": np.array([1.0]),
     fissile_brick: {
         "nu_fission": np.array([3.24 * 0.081600]),  # 1/cm
-        "scatter_gtg": np.array([[0.225216]]),  # 1/cm
-        "total": np.array([0.32640]),  # 1/cm
+        "scatter_gtg": np.array([[0.225216]]),  # 1/cm #0.225216
+        "total": np.array([.35]),  # 1/cm #.35 for 4 LCU bits
     },
 }
 
@@ -76,7 +76,7 @@ num_nodes = 7
 geometry = Geometry({fissile_brick: {"num_nodes": num_nodes, "thickness": thickness}})
 tol = 1e-6
 
-num_ordinates_list = [2, 4, 8, 16]
+num_ordinates_list = [2, 4, 8] #8, 16 also
 
 SN = DiscreteOrdinates(
     xs_server=xs_server,
@@ -112,7 +112,7 @@ for method in ks.keys():
         stop = None
         if method == "ISFM":
             start = time.time()
-            k, psi = SN.solve_matrix_power()
+            k, psi = SN.solve_matrix_quantum() #solve_matrix_quantum, reduce error between solve_matrix_power optimize psi
             stop = time.time()
         elif method == "TT/ALS":
             start = time.time()
@@ -131,6 +131,7 @@ ax2.set(xlabel="Ordinate $n$", ylabel="Eigenvalue Error (pcm)")
 ax3.set(xlabel="Ordinate $n$", ylabel="Execution Time (s)")
 ax2.set_yscale("log")
 plt.legend()
-plt.show()
+# plt.show()
+plt.savefig('plot_quant.png')
 
 # tt.solve_TT()

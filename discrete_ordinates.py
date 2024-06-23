@@ -224,12 +224,14 @@ class DiscreteOrdinates:
             F_expand = np.reshape(self._F.full().flatten(), mat_shape)
             H_expand = np.reshape(self._H.full().flatten(), mat_shape)
             psi_new = LCU_solve.solve_linear_system(H_expand,np.reshape((S_expand + 1 / k_old * F_expand).dot(psi_old),(self._xs_server.num_groups * self._num_ordinates * (num_nodes + 1))))
-
+            
             # Compute new eigenvalue and eigenvector L2 error
             k_new = k_old * np.sum(F.dot(psi_new)) / np.sum(F.dot(psi_old))
             err = np.linalg.norm(psi_new - psi_old, ord=2)
 
-            print("k: ", k_new, "err: ", err)
+            # print("k: ", k_new, "err: ", err)
+            U, sing_vals, Vh = np.linalg.svd(H_expand)
+            print("condition number: ", max(sing_vals) / min(sing_vals))
 
             if err < self._tol:
                 return k_new, psi_new.flatten() / np.linalg.norm(psi_new.flatten())

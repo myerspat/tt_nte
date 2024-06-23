@@ -4,7 +4,7 @@ import math
 from scipy.linalg import expm
 
 from qiskit.circuit import QuantumCircuit
-
+from qiskit.quantum_info import Statevector
 
 # Perform Gram-Schmidt orthogonalization to return V vector from LCU paper.
 # The first column is the normalized set of sqrt(alpha) values,
@@ -41,9 +41,12 @@ def get_b_setup_gate(vector, nb):
     if isinstance(vector, list):
         vector = np.array(vector)
     vector_circuit = QuantumCircuit(nb)
-    vector_circuit.isometry(
-        vector / np.linalg.norm(vector), list(range(nb)), None
-    )
+    # vector_circuit.isometry(
+    #     vector / np.linalg.norm(vector), list(range(nb)), None
+    # )
+    ##AttributeError with isometry
+    state = Statevector(vector/np.linalg.norm(vector))
+    vector_circuit.initialize(state, list(range(nb)))
     return vector_circuit
 
 

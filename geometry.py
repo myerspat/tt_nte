@@ -1,16 +1,15 @@
 import numpy as np
 
-
 class Geometry:
-    def __init__(self, regions, left_bc, right_bc, \
-                 top_bc, bottom_bc, \
-                 #into_bc, outof_bc\
+    def __init__(self, regions, left_bc, right_bc, 
+                 # top_bc, bottom_bc, 
+                 # into_bc, outof_bc
                      ):
         self._regions = np.array(regions)
         self._left_bc = left_bc
         self._right_bc = right_bc
-        self._bottom_bc = bottom_bc
-        self._top_bc = top_bc
+        # self._bottom_bc = bottom_bc
+        # self._top_bc = top_bc
         # self._into_bc = into_bc
         # self._outof_bc = outof_bc
 
@@ -18,8 +17,8 @@ class Geometry:
 
         assert self._left_bc == "vacuum" or self._left_bc == "reflective"
         assert self._right_bc == "vacuum" or self._right_bc == "reflective"
-        assert self._top_bc == "vacuum" or self._top_bc == "reflective"
-        assert self._bottom_bc == "vacuum" or self._bottom_bc == "reflective"
+        # assert self._top_bc == "vacuum" or self._top_bc == "reflective"
+        # assert self._bottom_bc == "vacuum" or self._bottom_bc == "reflective"
         # assert self._into_bc == "vacuum" or self._into_bc == "reflective"
         # assert self._outof_bc == "vacuum" or self._outof_bc == "reflective"
 
@@ -75,7 +74,6 @@ class Geometry:
         return sum([region.num_nodes for region in self._regions])
 
     @property
-    #FIXME add dy and dz
     def dx(self):
         dx = np.zeros((self.num_nodes, 1), dtype=float)
 
@@ -86,3 +84,28 @@ class Geometry:
             idx += region.num_nodes
 
         return dx
+    
+    @property
+    def dy(self):
+        dy = np.zeros((self.num_nodes, 1), dtype=float)
+
+        idy = 0
+        for region in self._regions:
+            dy[idy : idy + region.num_nodes, 0] = region.dy
+
+            idy += region.num_nodes
+        
+        return dy
+    
+    @property
+    def dz(self):
+        dz = np.zeros((self.num_nodes, 1), dtype=float)
+
+        idz = 0
+        for region in self._regions:
+            dz[idz : idz + region.num_nodes, 0] = region.dz
+
+            idz += region.num_nodes
+        
+        return dz
+        

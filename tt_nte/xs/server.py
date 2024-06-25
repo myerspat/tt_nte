@@ -1,4 +1,4 @@
-class XSServer:
+class Server:
     def __init__(self, xs):
         self._xs = xs
         self._chi = self._xs.pop("chi")

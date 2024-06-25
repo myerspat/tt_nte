@@ -1,15 +1,14 @@
 """
+crit_verif.py
+
 All cases below are given in https://www.sciencedirect.com/science/article/pii/S0149197002000987.
 All cases are given in a critical configuration.
 """
 
 import numpy as np
 
-from geometry import Geometry
-from region import Region
-from material import Material
-from nuclide import Nuclide
-from xs_server import XSServer
+from tt_nte.geometry import Geometry, Region
+from tt_nte.xs import Material, Nuclide, Server
 
 
 def pu_brick(num_nodes):
@@ -33,7 +32,7 @@ def pu_brick(num_nodes):
             "total": np.array([0.32640]),  # 1/cm
         },
     }
-    xs_server = XSServer(xs)
+    xs_server = Server(xs)
 
     # Slab Geometry
     fuel_region = Region(fuel, 3.707444, num_nodes - 1)
@@ -62,7 +61,7 @@ def pu_brick_multi_region(num_nodes, num_regions):
             "total": np.array([0.32640]),  # 1/cm
         },
     }
-    xs_server = XSServer(xs)
+    xs_server = Server(xs)
 
     # Slab Geometry
     regions = []
@@ -123,7 +122,7 @@ def research_reactor_multi_region(num_nodes, right_bc="reflective"):
             "total": np.array([0.88798, 2.9865]),  # 1/cm
         },
     }
-    xs_server = XSServer(xs)
+    xs_server = Server(xs)
 
     # Slab Geometry
     regions = [Region(mod, 1.126151, num_nodes[0])]
@@ -140,6 +139,10 @@ def research_reactor_multi_region(num_nodes, right_bc="reflective"):
 
 
 def research_reactor_anisotropic(num_nodes, right_bc="reflective"):
+    """
+    Two-group uranium research reactor (linearly-anisotropic), Tables
+    49 and 50.
+    """
     # Nuclides
     u235 = Nuclide(Z=92, A=235)
     h1 = Nuclide(Z=1, A=1)
@@ -168,7 +171,7 @@ def research_reactor_anisotropic(num_nodes, right_bc="reflective"):
             ),  # 1/cm
         },
     }
-    xs_server = XSServer(xs)
+    xs_server = Server(xs)
 
     # Slab Geometry
     regions = []

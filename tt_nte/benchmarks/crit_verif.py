@@ -5,10 +5,51 @@ All cases below are given in https://www.sciencedirect.com/science/article/pii/S
 All cases are given in a critical configuration.
 """
 
+import gmsh
 import numpy as np
 
 from tt_nte.geometry import Geometry, Region
 from tt_nte.xs import Material, Nuclide, Server
+
+
+def _create_1d_mesh(model, materials, lengths, num_nodes, left_bc, right_bc):
+    points = np.zeros(len(lengths) + 1, dtype=int)
+    lines = np.zeros(len(lengths), dtype=int)
+
+    # Start left BC point
+    x = 0
+    points[0] = model.geo.add_point(x, 0, 0)
+
+    # Iterate through points and lines
+    for i in range(len(materials)):
+        x += lengths[i]
+        points[i + 1] = model.geo.add_point(x, 0, 0)
+        lines[i] = model.geo.add_line(points[i], points[i + 1])
+
+    # Name materials
+    for mat in np.unique(materials):
+        model.add_physical_group(
+            1, lines[np.argwhere(materials == mat).flatten()], name=mat
+        )
+
+    # Name boundary conditions
+    if left_bc == right_bc:
+        model.add_physical_group(0, [points[0], points[-1]], name=left_bc)
+    else:
+        model.add_physical_group(0, [points[0]], name=left_bc)
+        model.add_physical_group(1, [points[-1]], name=right_bc)
+
+    # Sync gmsh model
+    model.geo.synchronize()
+
+    # Create structured mesh
+    for i in range(lines.size):
+        # Transfinite curves
+        model.mesh.set_transfinite_curve(lines[i], num_nodes[i])
+
+    # Generate mesh
+    model.mesh.generate(1)
+    model.mesh.recombine()
 
 
 def pu_brick(num_nodes):
@@ -17,28 +58,32 @@ def pu_brick(num_nodes):
     The width of the slab is 3.707444 cm with vacuum boundary conditions on either
     side.
     """
-    # Nuclides
-    pu239 = Nuclide(Z=94, A=239)
-
-    # Materials
-    fuel = Material({pu239: 1.0})
-
     # Cross section data
     xs = {
         "chi": np.array([1.0]),
-        fuel: {
+        "fuel": {
             "nu_fission": np.array([3.24 * 0.081600]),  # 1/cm
             "scatter_gtg": np.array([[[0.225216]]]),  # 1/cm
             "total": np.array([0.32640]),  # 1/cm
         },
     }
-    xs_server = Server(xs)
 
     # Slab Geometry
-    fuel_region = Region(fuel, 3.707444, num_nodes - 1)
-    geometry = Geometry([fuel_region], "vacuum", "vacuum")
+    gmsh.initialize()
+    gmsh.model.add("Pu Brick")
+    gmsh.option.setNumber("General.Terminal", 0)
+    _create_1d_mesh(
+        gmsh.model,
+        np.array(["fuel"]),
+        np.array([3.707444]),
+        np.array([num_nodes]),
+        "vacuum",
+        "vacuum",
+    )
+    geometry = Geometry(gmsh.model)
+    gmsh.finalize()
 
-    return xs_server, geometry
+    return Server(xs), geometry
 
 
 def pu_brick_multi_region(num_nodes, num_regions):
@@ -46,36 +91,44 @@ def pu_brick_multi_region(num_nodes, num_regions):
     Same as pu_brick() but split into several Regions. Regions are
     linearly spaced.
     """
-    # Nuclides
-    pu239 = Nuclide(Z=94, A=239)
-
-    # Materials
-    fuel = Material({pu239: 1.0})
-
     # Cross section data
+    xs_data = {
+        "nu_fission": np.array([3.24 * 0.081600]),  # 1/cm
+        "scatter_gtg": np.array([[[0.225216]]]),  # 1/cm
+        "total": np.array([0.32640]),  # 1/cm
+    }
     xs = {
         "chi": np.array([1.0]),
-        fuel: {
-            "nu_fission": np.array([3.24 * 0.081600]),  # 1/cm
-            "scatter_gtg": np.array([[[0.225216]]]),  # 1/cm
-            "total": np.array([0.32640]),  # 1/cm
-        },
     }
+
+    # Split regions in Server
+    regions = [f"fuel_{i}" for i in range(num_regions)]
+    for region in regions:
+        xs[region] = xs_data
+
     xs_server = Server(xs)
 
     # Slab Geometry
-    regions = []
     num_nodes = np.linspace(0, num_nodes, num_regions + 1, dtype=int)
-    thicknesses = np.linspace(0, 3.707444, num_regions + 1)
+    lengths = np.linspace(0, 3.707444, num_regions + 1)
 
-    num_nodes[-1] -= 1
     num_nodes = num_nodes[1:] - num_nodes[:-1]
-    thicknesses = thicknesses[1:] - thicknesses[:-1]
+    num_nodes[:-1] += 1
+    lengths = lengths[1:] - lengths[:-1]
 
-    for n, t in zip(num_nodes, thicknesses):
-        regions.append(Region(fuel, t, n))
-
-    geometry = Geometry(regions, "vacuum", "vacuum")
+    gmsh.initialize()
+    gmsh.model.add("Pu Brick (Multi-region)")
+    gmsh.option.setNumber("General.Terminal", 0)
+    _create_1d_mesh(
+        gmsh.model,
+        np.array(regions),
+        lengths,
+        num_nodes,
+        "vacuum",
+        "vacuum",
+    )
+    geometry = Geometry(gmsh.model)
+    gmsh.finalize()
 
     return xs_server, geometry
 
@@ -85,19 +138,10 @@ def research_reactor_multi_region(num_nodes, right_bc="reflective"):
     Multi-region case with multiplying medium (fuel) and non-multiplying medium
     (mod). This case is also multi-group.
     """
-    # Nuclides
-    u235 = Nuclide(Z=92, A=235)
-    h1 = Nuclide(Z=1, A=1)
-    o16 = Nuclide(Z=8, A=16)
-
-    # Materials
-    fuel = Material({u235: 1 / 1501, h1: 1000 / 1501, o16: 500 / 1501})
-    mod = Material({h1: 2 / 3, o16: 1 / 3})
-
     # Cross section data
     xs = {
         "chi": np.array([1.0, 0.0]),
-        fuel: {
+        "fuel": {
             "nu_fission": 2.5 * np.array([0.000836, 0.029564]),  # 1/cm
             "scatter_gtg": np.array(
                 [
@@ -109,7 +153,7 @@ def research_reactor_multi_region(num_nodes, right_bc="reflective"):
             ),  # 1/cm
             "total": np.array([0.88721, 2.9727]),  # 1/cm
         },
-        mod: {
+        "moderator": {
             "nu_fission": np.zeros(2),  # 1/cm
             "scatter_gtg": np.array(
                 [
@@ -124,16 +168,31 @@ def research_reactor_multi_region(num_nodes, right_bc="reflective"):
     }
     xs_server = Server(xs)
 
-    # Slab Geometry
-    regions = [Region(mod, 1.126151, num_nodes[0])]
+    # Slab geometry
+    regions = ["moderator", "fuel"]
+    lengths = [1.126151, 6.696802]
 
-    if right_bc == "reflective":
-        regions.append(Region(fuel, 6.696802, num_nodes[1] - 1))
-    else:
-        regions.append(Region(fuel, 2 * 6.696802, num_nodes[1]))
-        regions.append(Region(mod, 1.126151, num_nodes[2] - 1))
+    if right_bc == "vacuum":
+        regions += ["moderator"]
+        lengths[-1] *= 2
+        lengths += [lengths[0]]
 
-    geometry = Geometry(regions, "vacuum", right_bc)
+    num_nodes = np.array(num_nodes)
+    num_nodes[:-1] += 1
+
+    gmsh.initialize()
+    gmsh.model.add("Multi-Region Research Reactor")
+    gmsh.option.setNumber("General.Terminal", 0)
+    _create_1d_mesh(
+        gmsh.model,
+        np.array(regions),
+        np.array(lengths),
+        np.array(num_nodes),
+        "vacuum",
+        "vacuum",
+    )
+    geometry = Geometry(gmsh.model)
+    gmsh.finalize()
 
     return xs_server, geometry
 
@@ -143,18 +202,10 @@ def research_reactor_anisotropic(num_nodes, right_bc="reflective"):
     Two-group uranium research reactor (linearly-anisotropic), Tables
     49 and 50.
     """
-    # Nuclides
-    u235 = Nuclide(Z=92, A=235)
-    h1 = Nuclide(Z=1, A=1)
-    o16 = Nuclide(Z=8, A=16)
-
-    # Materials
-    fuel = Material({u235: 1 / 1501, h1: 1000 / 1501, o16: 500 / 1501})
-
     # Cross section data
     xs = {
         "chi": np.array([1.0, 0.0]),
-        fuel: {
+        "fuel": {
             "total": np.array([0.65696, 2.52025]),  # 1/cm
             "nu_fission": 2.5 * np.array([0.0010484, 0.050632]),  # 1/cm
             "scatter_gtg": np.array(
@@ -171,16 +222,20 @@ def research_reactor_anisotropic(num_nodes, right_bc="reflective"):
             ),  # 1/cm
         },
     }
-    xs_server = Server(xs)
 
     # Slab Geometry
-    regions = []
+    gmsh.initialize()
+    gmsh.model.add("Pu Brick")
+    gmsh.option.setNumber("General.Terminal", 0)
+    _create_1d_mesh(
+        gmsh.model,
+        np.array(["fuel"]),
+        np.array([9.4959 if right_bc == "reflective" else 2 * 9.4959]),
+        np.array([num_nodes]),
+        "vacuum",
+        right_bc,
+    )
+    geometry = Geometry(gmsh.model)
+    gmsh.finalize()
 
-    if right_bc == "reflective":
-        regions.append(Region(fuel, 9.4959, num_nodes - 1))
-    else:
-        regions.append(Region(fuel, 2 * 9.4959, num_nodes - 1))
-
-    geometry = Geometry(regions, "vacuum", right_bc)
-
-    return xs_server, geometry
+    return Server(xs), geometry

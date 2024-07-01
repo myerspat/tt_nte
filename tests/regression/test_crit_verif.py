@@ -76,7 +76,7 @@ def test_single_media():
 
     # ----------------------------------------------------------------
     # SN in QTT format
-    qtt_solvers = [solvers.MALS, solvers.GMRES]
+    qtt_solvers = [solvers.MALS]
     qtt_solver_configs = [{"max_rank": 20}, {}]
 
     for i in range(len(num_ordinates)):

@@ -34,14 +34,14 @@ class DiscreteOrdinates:
         num_nodes = self._geometry.num_nodes
         num_groups = self._xs_server.num_groups
 
-        d = np.eye(num_nodes + 1, k=0)
-        d_p = np.eye(num_nodes + 1, k=-1)
-        d_m = np.eye(num_nodes + 1, k=1)
+        d = np.eye(num_nodes, k=0)
+        d_p = np.eye(num_nodes, k=-1)
+        d_m = np.eye(num_nodes, k=1)
 
         # Boundary condition matrix
         bc = [
-            np.ones((num_nodes + 1, 1)),
-            np.ones((num_nodes + 1, 1)),
+            np.ones((num_nodes, 1)),
+            np.ones((num_nodes, 1)),
         ]
         bc[1][-1, 0] = 0
         bc[0][0, 0] = 0
@@ -69,7 +69,7 @@ class DiscreteOrdinates:
         self._H = []
         self._F = []
         self._S = []
-        bcs = [self._geometry.left_bc, self._geometry.right_bc]
+        bcs = [self._geometry.bcs[0], self._geometry.bcs[3]]
 
         for i in range(2):
             C = np.zeros((2, 2), dtype=float)
@@ -88,10 +88,10 @@ class DiscreteOrdinates:
 
             # Add reflection
             if bcs[i] == "reflective":
-                Ip_ref = np.zeros((num_nodes + 1, num_nodes + 1))
+                Ip_ref = np.zeros((num_nodes, num_nodes))
                 Ip_ref[-i, -i] = 1 / 2
 
-                D_ref = np.zeros((num_nodes + 1, num_nodes + 1))
+                D_ref = np.zeros((num_nodes, num_nodes))
                 D_ref[-i, -i] = 1 / dx[0,] if i == 0 else 1 / dx[-1,]
 
                 C_ref = np.zeros((2, 2), dtype=float)
@@ -106,26 +106,26 @@ class DiscreteOrdinates:
 
                 # Total interaction operator (reflective)
                 region = (
-                    self._geometry.regions[0] if i == 0 else self._geometry.regions[-1]
+                    self._geometry.bc_regions(0)[0]
+                    if i == 0
+                    else self._geometry.bc_regions(3)[0]
                 )
                 self._H.append(
                     [
-                        np.diag(self._xs_server.total(region.material)),
+                        np.diag(self._xs_server.total(region)),
                         np.kron(C_ref, -IL),
                         Ip_ref,
                     ]
                     if num_groups > 1
                     else [
-                        self._xs_server.total(region.material) * np.kron(C_ref, -IL),
+                        self._xs_server.total(region) * np.kron(C_ref, -IL),
                         Ip_ref,
                     ]
                 )
 
             # Iterate through regions in the problem from left to right
-            for region in self._geometry.unique_regions:
-                # Define XS matrices
-                mat = region.material
-
+            for mat in self._geometry.regions:
+                # Define XSs
                 total = np.diag(self._xs_server.total(mat))
                 nu_fission = np.outer(
                     self._xs_server.chi, self._xs_server.nu_fission(mat)
@@ -135,7 +135,7 @@ class DiscreteOrdinates:
                 nu_fission = np.squeeze(nu_fission)
 
                 # Region mask for spatial dependence
-                mask = self._geometry.region_mask(region)
+                mask = self._geometry.region_mask(mat)[0]
                 mask = (
                     np.concatenate((mask[[0],], mask))
                     if i == 0
@@ -219,7 +219,7 @@ class DiscreteOrdinates:
 
         # Assert dimensions are power of 2
         check_dim_size("ordinates", self._num_ordinates)
-        check_dim_size("spatial edges", self._geometry.num_nodes + 1)
+        check_dim_size("spatial edges", self._geometry.num_nodes)
         if self._xs_server.num_groups != 1:
             check_dim_size("energy groups", self._xs_server.num_groups)
 

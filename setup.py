@@ -11,7 +11,9 @@ setup(
     install_requires=[
         "numpy",
         "scikit_tt",
-        "ttpy",
+        # "ttpy",
+        "scipy",
+        "gmsh"
     ],
     extras_require={
         "dev": [

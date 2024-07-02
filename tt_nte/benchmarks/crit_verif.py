@@ -8,8 +8,8 @@ All cases are given in a critical configuration.
 import gmsh
 import numpy as np
 
-from tt_nte.geometry import Geometry, Region
-from tt_nte.xs import Material, Nuclide, Server
+from tt_nte.geometry import Geometry
+from tt_nte.xs import Server
 
 
 def _create_1d_mesh(model, materials, lengths, num_nodes, left_bc, right_bc):
@@ -239,3 +239,130 @@ def research_reactor_anisotropic(num_nodes, right_bc="reflective"):
     gmsh.finalize()
 
     return Server(xs), geometry
+
+
+def research_reactor_multi_region_2d(x_num_nodes, y_num_nodes, right_bc="reflective"):
+    """
+    Multi-region case (in 2D) with multiplying medium (fuel) and non-multiplying medium
+    (mod). This case is also multi-group.
+    """
+    # Cross section data
+    xs = {
+        "chi": np.array([1.0, 0.0]),
+        "fuel": {
+            "nu_fission": 2.5 * np.array([0.000836, 0.029564]),  # 1/cm
+            "scatter_gtg": np.array(
+                [
+                    [
+                        [0.83892, 0.000767],
+                        [0.04635, 2.918300],
+                    ],
+                ]
+            ),  # 1/cm
+            "total": np.array([0.88721, 2.9727]),  # 1/cm
+        },
+        "moderator": {
+            "nu_fission": np.zeros(2),  # 1/cm
+            "scatter_gtg": np.array(
+                [
+                    [
+                        [0.83975, 0.000336],
+                        [0.04749, 2.967600],
+                    ],
+                ]
+            ),  # 1/cm
+            "total": np.array([0.88798, 2.9865]),  # 1/cm
+        },
+    }
+    xs_server = Server(xs)
+
+    # Slab geometry
+    regions = ["moderator", "fuel"]
+    lengths = [1.126151, 6.696802]
+
+    if right_bc == "vacuum":
+        regions += ["moderator"]
+        lengths[-1] *= 2
+        lengths += [lengths[0]]
+
+    x_num_nodes = np.array(x_num_nodes)
+    x_num_nodes[:-1] += 1
+
+    regions = np.array(regions)
+    lengths = np.array(lengths)
+    x_num_nodes = np.array(x_num_nodes)
+    y_num_nodes = np.array(y_num_nodes)
+
+    gmsh.initialize()
+    gmsh.model.add("Multi-Region Research Reactor")
+    gmsh.option.setNumber("General.Terminal", 0)
+
+    points = np.zeros((lengths.size + 1, 2), dtype=int)
+    y_lines = np.zeros((lengths.size, 2), dtype=int)
+    x_lines = np.zeros(lengths.size + 1, dtype=int)
+    faces = np.zeros(lengths.size, dtype=int)
+    surfaces = np.zeros(lengths.size, dtype=int)
+
+    # Start left BC edge
+    x = 0
+    y = 1
+    points[0, 0] = gmsh.model.geo.add_point(x, 0, 0)
+    points[0, 1] = gmsh.model.geo.add_point(x, y, 0)
+    x_lines[0] = gmsh.model.geo.add_line(points[0, 0], points[0, 1])
+
+    # Iterate through points, lines, and surfaces
+    for i in range(lengths.size):
+        x += lengths[i]
+
+        for j in range(2):
+            points[i + 1, j] = gmsh.model.geo.add_point(x, y * j, 0)
+            y_lines[i, j] = gmsh.model.geo.add_line(points[i, j], points[i + 1, j])
+
+        x_lines[i + 1] = gmsh.model.geo.add_line(points[i + 1, 0], points[i + 1, 1])
+
+        faces[i] = gmsh.model.geo.add_curve_loop(
+            [-x_lines[i], y_lines[i, 0], x_lines[i + 1], -y_lines[i, 1]]
+        )
+        surfaces[i] = gmsh.model.geo.add_plane_surface([faces[i]])
+
+    # Name materials
+    for mat in np.unique(regions):
+        gmsh.model.add_physical_group(
+            2, surfaces[np.argwhere(regions == mat).flatten()], name=mat
+        )
+
+    # Name BCs
+    if right_bc == "vacuum":
+        gmsh.model.add_physical_group(1, [x_lines[0], x_lines[-1]], name="vacuum")
+    else:
+        gmsh.model.add_physical_group(1, [x_lines[0]], name="vacuum")
+        gmsh.model.add_physical_group(1, [x_lines[-1]], name=right_bc)
+
+    gmsh.model.add_physical_group(1, y_lines.flatten().tolist(), name="reflective")
+
+    # Sync gmsh model
+    gmsh.model.geo.synchronize()
+
+    # Create structured mesh
+    gmsh.model.mesh.set_transfinite_curve(x_lines[0], y_num_nodes)
+
+    for i in range(lengths.size):
+        # Transfinite curves
+        for j in range(2):
+            gmsh.model.mesh.set_transfinite_curve(y_lines[i, j], x_num_nodes[i])
+
+        gmsh.model.mesh.set_transfinite_curve(x_lines[i + 1], y_num_nodes)
+
+        # Transfinite surfaces
+        gmsh.model.mesh.set_transfinite_surface(
+            surfaces[i], cornerTags=points[i : i + 1, :].flatten().tolist()
+        )
+
+    # Generate mesh
+    gmsh.model.mesh.generate(2)
+    gmsh.model.mesh.recombine()
+
+    geometry = Geometry(gmsh.model)
+    gmsh.finalize()
+
+    return xs_server, geometry

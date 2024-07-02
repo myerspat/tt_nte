@@ -136,7 +136,7 @@ class Geometry(object):
         coords = np.round(coords.reshape((-1, 3)), 10)
 
         # Sorted indices
-        idxs = np.lexsort((coords[:, 0], coords[:, 1], coords[:, 2]))
+        idxs = np.lexsort((coords[:, 2], coords[:, 1], coords[:, 0]))
 
         return node_tags[idxs], coords[idxs, :]
 

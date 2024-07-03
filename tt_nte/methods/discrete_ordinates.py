@@ -39,6 +39,29 @@ class DiscreteOrdinates:
         Construct operaotr tensor trains as described in
         LANL TT paper.
         """
+        num_groups = self._xs_server.num_groups
+
+        # Differential and interpolation operators
+        D = []
+        Ip = []
+
+        for i in range(self._geometry.num_dim):
+            diff = self._geometry.diff[i]
+
+            dim_num_nodes = diff.size + 1
+
+            d = np.eye(dim_num_nodes, k=0)
+            d_p = np.eye(dim_num_nodes, k=-1)
+            d_m = np.eye(dim_num_nodes, k=1)
+
+            # Boundary condition matrix
+            bc = [
+                np.ones((dim_num_nodes, 1)),
+                np.ones((dim_num_nodes, 1)),
+            ]
+            bc[1][-1, 0] = 0
+            bc[0][0, 0] = 0
+
         num_nodes = self._geometry.num_nodes
         num_groups = self._xs_server.num_groups
 
@@ -240,24 +263,28 @@ class DiscreteOrdinates:
         # 1D = (N, 2): w, mu
         # 2D = (N, 3): w, mu, eta
         # 3D = (N, 4): w, mu, eta, xi
-        if octant_ords == None:
-            # Square quadrature set
-            if self._geometry.num_dim == 1:
-                self._octant_ords = self._gauss_legendre(self._num_ordinates)
-            elif self._geometry.num_dim == 2:
-                self._octant_ords = np.unique(
-                    self._chebyshev_legendre(self._num_ordinates * 4), axis=0
-                )
-            else:
-                self._octant_ords = self._chebyshev_legendre(self._num_ordinates)
-        else:
-            self._octant_ords = octant_ords
+        self._octant_ords = (
+            self._compute_square_set(self._num_ordinates, self._geometry.num_dim)
+            if octant_ords is None
+            else octant_ords
+        )
 
         # Construct operator tensors
         self._construct_tensor_trains()
 
     # =====================================================================
     # Quadrature sets
+
+    @staticmethod
+    def _compute_square_set(N, num_dim):
+        if num_dim == 1:
+            return DiscreteOrdinates._gauss_legendre(N)
+        elif num_dim == 2:
+            octant_ords = DiscreteOrdinates._chebyshev_legendre(N * 2)[:, :-1]
+            octant_ords[:, 0] *= 2
+            return octant_ords
+        else:
+            return DiscreteOrdinates._chebyshev_legendre(N)
 
     @staticmethod
     def _gauss_legendre(N):
@@ -277,8 +304,8 @@ class DiscreteOrdinates:
         """
         Gauss-Chebyshev quadrature.
         """
-        gamma = (2 * np.arange(1, N / 2 + 1) - 1) * np.pi / (2 * N / 2)
-        w = np.ones(int(N / 2)) * 1 / N
+        gamma = (2 * np.arange(1, int(N / 2) + 1) - 1) * np.pi / (2 * N)
+        w = np.ones(int(N / 2)) / (2 * N)
 
         return np.concatenate([w[:, np.newaxis], gamma[:, np.newaxis]], axis=1)
 
@@ -288,47 +315,28 @@ class DiscreteOrdinates:
         Chebyshev-Legendre (square) qudrature set given by
         https://www.osti.gov/servlets/purl/5958402.
         """
+        assert N % 8 == 0
+
         n = np.round(np.sqrt(N / 2)).astype(int)
 
         # Compute quadrature
         q_l = DiscreteOrdinates._gauss_legendre(n)
         q_c = DiscreteOrdinates._gauss_chebyshev(n)
 
-        w_l, mu = q_l[:, 0], q_l[:, 1]
-        w_c, gamma = q_c[:, 0], q_c[:, 1]
+        w_l, xi = q_l[:, 0], q_l[:, 1]
+        w_c, omega = q_c[:, 0], q_c[:, 1]
 
-        # Add quadrature on other side
-        mu = np.concatenate([mu, -mu])
-        w_l = np.concatenate([w_l, w_l])
+        # Assert number of ordinates
+        assert 8 * omega.size * xi.size == N
 
-        gamma = np.concatenate([gamma, -gamma])
-        w_c = np.concatenate([w_c, w_c])
-
-        # assert 2 * gamma.size * mu.size == N
-
-        # Compute ordinates
-        ordinates = np.zeros((N, 4))
-        for i in range(mu.size):
-            for j in range(gamma.size):
-                ordinates[i * gamma.size + j, 0] = w_l[i] * w_c[j]
-                ordinates[i * gamma.size + j, 1] = mu[i]
-                ordinates[i * gamma.size + j, 2] = np.sqrt(1 - mu[i] ** 2) * np.cos(
-                    gamma[j]
-                )
-                ordinates[i * gamma.size + j, 3] = np.sqrt(
-                    1 - mu[i] ** 2 - ordinates[i * gamma.size + j, 2] ** 2
-                )
-
-        ordinates[int(N / 2) :, :] = ordinates[: int(N / 2), :]
-        ordinates[int(N / 2) :, 2] *= -1
-
-        # Get first octant ordinates
-        ordinates = ordinates[
-            np.argwhere(
-                (ordinates[:, 1] > 0) & (ordinates[:, 2] > 0) & (ordinates[:, 3] > 0)
-            ).flatten(),
-            :,
-        ]
+        ordinates = np.zeros((int(N / 8), 4))
+        for i in range(xi.size):
+            for j in range(omega.size):
+                k = i * omega.size + j
+                ordinates[k, 0] = w_l[i] * w_c[j]
+                ordinates[k, 1] = np.sqrt(1 - xi[i] ** 2) * np.cos(omega[j])
+                ordinates[k, 2] = np.sqrt(1 - xi[i] ** 2 - ordinates[k, 1] ** 2)
+                ordinates[k, 3] = xi[i]
 
         return ordinates
 

@@ -2,7 +2,6 @@ import numpy as np
 
 import tt_nte.benchmarks as benchmarks
 
-
 def test_pu_brick():
     _, geometry = benchmarks.pu_brick(64)
 
@@ -51,3 +50,20 @@ def test_research_reactor_anisotropic():
         np.round(geometry.dx, 8), np.round(9.4959 / 63 * np.ones(63), 8)
     )
     assert geometry.num_elements == 63
+
+
+def test_research_reactor_multi_region_2d():
+    _, geometry = benchmarks.research_reactor_multi_region_2d(
+        [32, 32, 32], 32, right_bc="vacuum"
+    )
+
+    # Assertions
+    assert geometry.num_nodes == 3072
+    assert geometry.dx.shape == (95,)
+    assert geometry.dy.shape == (31,)
+    assert geometry.bcs == ["vacuum", "reflective", None, "vacuum", "reflective", None]
+    assert np.sum(geometry.region_mask("fuel")[0]) == 32
+    assert np.sum(geometry.region_mask("fuel")[1]) == 31
+    assert np.sum(geometry.region_mask("moderator")[0]) == 63
+    assert np.sum(geometry.region_mask("moderator")[1]) == 31
+    assert geometry.num_elements == 2945

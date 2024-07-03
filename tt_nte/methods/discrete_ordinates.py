@@ -10,6 +10,12 @@ from tt_nte.utils.utils import check_dim_size
 
 
 class DiscreteOrdinates:
+    _direction_spaces = [
+        np.array([[1], [-1]]),
+        np.array(np.meshgrid([1, -1], [1, -1])).T.reshape(-1, 2),
+        np.array(np.meshgrid([1, -1], [1, -1], [1, -1])).T.reshape(-1, 3),
+    ]
+
     def __init__(
         self,
         xs_server,
@@ -17,6 +23,7 @@ class DiscreteOrdinates:
         num_ordinates,
         tt_fmt="tt",
         qtt_threshold=1e-15,
+        octant_ords=None,
     ):
         self.update_settings(
             xs_server=xs_server,
@@ -24,6 +31,7 @@ class DiscreteOrdinates:
             num_ordinates=num_ordinates,
             tt_fmt=tt_fmt,
             qtt_threshold=qtt_threshold,
+            octant_ords=octant_ords,
         )
 
     def _construct_tensor_trains(self):
@@ -76,7 +84,7 @@ class DiscreteOrdinates:
             C[i, i] = 1.0
 
             # Angular point matrix
-            Qu = np.kron(C, (-1) ** (i) * np.diag(self._mu))
+            Qu = np.kron(C, (-1) ** (i) * np.diag(self._octant_ords[:, 1]))
 
             # Streaming operator
             self._H.append([Ig, Qu, D[i]] if num_groups > 1 else [Qu, D[i]])
@@ -84,7 +92,10 @@ class DiscreteOrdinates:
             # Integral operator
             A = np.zeros((2, 2), dtype=float)
             A[i, :] = 1
-            F_Intg = np.kron(A, np.outer(np.ones(self._w.size), self._w))
+            F_Intg = np.kron(
+                A,
+                np.outer(np.ones(self._octant_ords.shape[0]), self._octant_ords[:, 0]),
+            )
 
             # Add reflection
             if bcs[i] == "reflective":
@@ -97,7 +108,7 @@ class DiscreteOrdinates:
                 C_ref = np.zeros((2, 2), dtype=float)
                 C_ref[i, (i + 1) % 2] = 1
 
-                Qu_ref = np.kron(C_ref, -np.diag(self._mu))
+                Qu_ref = np.kron(C_ref, -np.diag(self._octant_ords[:, 1]))
 
                 # Streaming operator (reflective)
                 self._H.append(
@@ -167,8 +178,9 @@ class DiscreteOrdinates:
                     S_Intg = np.kron(
                         A,
                         np.outer(
-                            (2 * l + 1) * eval_legendre(l, self._mu),
-                            self._w * eval_legendre(l, self._mu),
+                            (2 * l + 1) * eval_legendre(l, self._octant_ords[:, 1]),
+                            self._octant_ords[:, 0]
+                            * eval_legendre(l, self._octant_ords[:, 1]),
                         ),
                     )
 
@@ -200,6 +212,7 @@ class DiscreteOrdinates:
         num_ordinates=None,
         tt_fmt=None,
         qtt_threshold=None,
+        octant_ords=None,
     ):
         """
         Update SN settings.
@@ -223,8 +236,22 @@ class DiscreteOrdinates:
         if self._xs_server.num_groups != 1:
             check_dim_size("energy groups", self._xs_server.num_groups)
 
-        # Get square quadrature set (in 1D this is Gauss-Legendre)
-        self._w, self._mu = self._gauss_legendre(self._num_ordinates)
+        # Get quadrature set
+        # 1D = (N, 2): w, mu
+        # 2D = (N, 3): w, mu, eta
+        # 3D = (N, 4): w, mu, eta, xi
+        if octant_ords == None:
+            # Square quadrature set
+            if self._geometry.num_dim == 1:
+                self._octant_ords = self._gauss_legendre(self._num_ordinates)
+            elif self._geometry.num_dim == 2:
+                self._octant_ords = np.unique(
+                    self._chebyshev_legendre(self._num_ordinates * 4), axis=0
+                )
+            else:
+                self._octant_ords = self._chebyshev_legendre(self._num_ordinates)
+        else:
+            self._octant_ords = octant_ords
 
         # Construct operator tensors
         self._construct_tensor_trains()
@@ -243,7 +270,67 @@ class DiscreteOrdinates:
 
         assert np.round(np.sum(w), 1) == 0.5
 
-        return w, mu
+        return np.concatenate([w[:, np.newaxis], mu[:, np.newaxis]], axis=1)
+
+    @staticmethod
+    def _gauss_chebyshev(N):
+        """
+        Gauss-Chebyshev quadrature.
+        """
+        gamma = (2 * np.arange(1, N / 2 + 1) - 1) * np.pi / (2 * N / 2)
+        w = np.ones(int(N / 2)) * 1 / N
+
+        return np.concatenate([w[:, np.newaxis], gamma[:, np.newaxis]], axis=1)
+
+    @staticmethod
+    def _chebyshev_legendre(N):
+        """
+        Chebyshev-Legendre (square) qudrature set given by
+        https://www.osti.gov/servlets/purl/5958402.
+        """
+        n = np.round(np.sqrt(N / 2)).astype(int)
+
+        # Compute quadrature
+        q_l = DiscreteOrdinates._gauss_legendre(n)
+        q_c = DiscreteOrdinates._gauss_chebyshev(n)
+
+        w_l, mu = q_l[:, 0], q_l[:, 1]
+        w_c, gamma = q_c[:, 0], q_c[:, 1]
+
+        # Add quadrature on other side
+        mu = np.concatenate([mu, -mu])
+        w_l = np.concatenate([w_l, w_l])
+
+        gamma = np.concatenate([gamma, -gamma])
+        w_c = np.concatenate([w_c, w_c])
+
+        # assert 2 * gamma.size * mu.size == N
+
+        # Compute ordinates
+        ordinates = np.zeros((N, 4))
+        for i in range(mu.size):
+            for j in range(gamma.size):
+                ordinates[i * gamma.size + j, 0] = w_l[i] * w_c[j]
+                ordinates[i * gamma.size + j, 1] = mu[i]
+                ordinates[i * gamma.size + j, 2] = np.sqrt(1 - mu[i] ** 2) * np.cos(
+                    gamma[j]
+                )
+                ordinates[i * gamma.size + j, 3] = np.sqrt(
+                    1 - mu[i] ** 2 - ordinates[i * gamma.size + j, 2] ** 2
+                )
+
+        ordinates[int(N / 2) :, :] = ordinates[: int(N / 2), :]
+        ordinates[int(N / 2) :, 2] *= -1
+
+        # Get first octant ordinates
+        ordinates = ordinates[
+            np.argwhere(
+                (ordinates[:, 1] > 0) & (ordinates[:, 2] > 0) & (ordinates[:, 3] > 0)
+            ).flatten(),
+            :,
+        ]
+
+        return ordinates
 
     # =====================================================================
     # Getters

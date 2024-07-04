@@ -1,9 +1,10 @@
 """
 discrete_ordinates.py
 """
+import math
 
 import numpy as np
-from scipy.special import eval_legendre
+from scipy.special import eval_legendre, lpmv
 
 from tt_nte.tensor_train import TensorTrain
 from tt_nte.utils.utils import check_dim_size
@@ -39,180 +40,228 @@ class DiscreteOrdinates:
         Construct operaotr tensor trains as described in
         LANL TT paper.
         """
+        octants = self._direction_spaces[self._geometry.num_dim - 1]
+        num_octants = octants.shape[0]
+        num_dim = self._geometry.num_dim
         num_groups = self._xs_server.num_groups
+        num_ordinates = self._num_ordinates
 
         # Differential and interpolation operators
         D = []
         Ip = []
+        bc = []
 
-        for i in range(self._geometry.num_dim):
+        for i in range(num_dim):
+            # Get differential length along dimension
             diff = self._geometry.diff[i]
 
+            # Number of nodes along dimension
             dim_num_nodes = diff.size + 1
 
             d = np.eye(dim_num_nodes, k=0)
             d_p = np.eye(dim_num_nodes, k=-1)
             d_m = np.eye(dim_num_nodes, k=1)
 
-            # Boundary condition matrix
-            bc = [
-                np.ones((dim_num_nodes, 1)),
-                np.ones((dim_num_nodes, 1)),
-            ]
-            bc[1][-1, 0] = 0
-            bc[0][0, 0] = 0
+            # Add to differential operator
+            D.append(
+                [
+                    (d - d_p)
+                    / np.concatenate(
+                        [
+                            diff[
+                                [
+                                    0,
+                                ]
+                            ],
+                            diff,
+                        ]
+                    ),
+                    (d_m - d) / np.concatenate([diff, diff[[-1],]]),
+                ]
+            )
 
-        num_nodes = self._geometry.num_nodes
-        num_groups = self._xs_server.num_groups
+            # Add to interpolation operator
+            Ip.append([(d + d_p) / 2, (d + d_m) / 2])
 
-        d = np.eye(num_nodes, k=0)
-        d_p = np.eye(num_nodes, k=-1)
-        d_m = np.eye(num_nodes, k=1)
-
-        # Boundary condition matrix
-        bc = [
-            np.ones((num_nodes, 1)),
-            np.ones((num_nodes, 1)),
-        ]
-        bc[1][-1, 0] = 0
-        bc[0][0, 0] = 0
-
-        # Interpolation
-        Ip = [1 / 2 * (d + d_p), 1 / 2 * (d + d_m)]
-
-        # Differentiation matrix
-        dx = self._geometry.dx
-        D = [
-            1 / np.concatenate((dx[[0],], dx)) * (d - d_p),
-            1 / np.concatenate((dx, dx[[-1],])) * (d_m - d),
-        ]
+            # Add bc matrix
+            bc.append([np.ones((dim_num_nodes, 1)), np.ones((dim_num_nodes, 1))])
+            bc[-1][0][0, 0] = 0
+            bc[-1][1][-1, 0] = 0
 
         # Group identity matrix
-        Ig = np.identity(self._xs_server.num_groups)
+        Ig = np.identity(num_groups)
 
         # Ordinate identity matrix
-        IL = np.identity(int(self._num_ordinates / 2))
+        IL = np.identity(int(num_ordinates / num_octants))
 
-        # Iterate over two half spaces
-        # Because we're in 1D we have 2 direction spaces
-        # 2D - 4 (quadrants)
-        # 3D - 8 (octants)
+        # Iterate over half-spaces/quadrants/octants and append
+        # TT cores
         self._H = []
         self._F = []
         self._S = []
-        bcs = [self._geometry.bcs[0], self._geometry.bcs[3]]
 
-        for i in range(2):
-            C = np.zeros((2, 2), dtype=float)
+        bcs = self._geometry.bcs
+
+        for i in range(num_octants):
+            octant = octants[i, :]
+
+            # Index into D, Ip, bc based on direction (1 or -1)
+            dir_idx = [0 if dir > 0 else 1 for dir in octant]
+
+            C = np.zeros((num_octants, num_octants), dtype=float)
             C[i, i] = 1.0
 
-            # Angular point matrix
-            Qu = np.kron(C, (-1) ** (i) * np.diag(self._octant_ords[:, 1]))
+            for j in range(num_dim):
+                # Angular point matrix
+                Q = np.kron(C, octant[j] * np.diag(self._octant_ords[:, j + 1]))
 
-            # Streaming operator
-            self._H.append([Ig, Qu, D[i]] if num_groups > 1 else [Qu, D[i]])
+                # Get spatial cores in correct order depending on dimension
+                spatial_cores = []
+                for k in range(num_dim):
+                    if j != k:
+                        spatial_cores.append(Ip[k][dir_idx[k]])
+                    else:
+                        spatial_cores.append(D[k][dir_idx[k]])
 
-            # Integral operator
-            A = np.zeros((2, 2), dtype=float)
+                # Append dimension streaming operator
+                self._H.append(
+                    (
+                        [
+                            Ig,
+                            Q,
+                        ]
+                        if num_groups > 1
+                        else [Q]
+                    )
+                    + spatial_cores
+                )
+
+                # Add reflective boundary condition
+                if bcs[j + 3 * dir_idx[octant[j]]] == "reflective":
+                    # Find reflected octant
+                    ref_octant = np.copy(octant)
+                    ref_octant[j] *= -1
+
+                    # Place values in reflected octant position
+                    C_ref = np.zeros((num_octants, num_octants), dtype=float)
+                    C_ref[i, np.where((octants == ref_octant).all(axis=1))[0]] = 1
+
+                    Q_ref = np.kron(
+                        C_ref, ref_octant[j] * np.diag(self._octant_ords[:, j + 1])
+                    )
+
+                    # Apply boundary mask to spatial cores
+                    for k in range(num_dim):
+                        bc_mask = np.zeros((spatial_cores[k].shape[0], 1))
+                        bc_mask[-dir_idx[k], 0] = 1
+                        spatial_cores[k] *= bc_mask
+
+                    # Append boundary condition
+                    self._H.append(
+                        (
+                            [
+                                Ig,
+                                Q_ref,
+                            ]
+                            if num_groups > 1
+                            else [Q_ref]
+                        )
+                        + spatial_cores
+                    )
+
+            # Fission integral operator
+            A = np.zeros((num_octants, num_octants), dtype=float)
             A[i, :] = 1
             F_Intg = np.kron(
-                A,
-                np.outer(np.ones(self._octant_ords.shape[0]), self._octant_ords[:, 0]),
+                A, np.outer(self._octant_ords.shape[0], self._octant_ords[:, 0])
             )
 
-            # Add reflection
-            if bcs[i] == "reflective":
-                Ip_ref = np.zeros((num_nodes, num_nodes))
-                Ip_ref[-i, -i] = 1 / 2
-
-                D_ref = np.zeros((num_nodes, num_nodes))
-                D_ref[-i, -i] = 1 / dx[0,] if i == 0 else 1 / dx[-1,]
-
-                C_ref = np.zeros((2, 2), dtype=float)
-                C_ref[i, (i + 1) % 2] = 1
-
-                Qu_ref = np.kron(C_ref, -np.diag(self._octant_ords[:, 1]))
-
-                # Streaming operator (reflective)
-                self._H.append(
-                    [Ig, Qu_ref, D_ref] if num_groups > 1 else [Qu_ref, D_ref]
-                )
-
-                # Total interaction operator (reflective)
-                region = (
-                    self._geometry.bc_regions(0)[0]
-                    if i == 0
-                    else self._geometry.bc_regions(3)[0]
-                )
-                self._H.append(
-                    [
-                        np.diag(self._xs_server.total(region)),
-                        np.kron(C_ref, -IL),
-                        Ip_ref,
-                    ]
-                    if num_groups > 1
-                    else [
-                        self._xs_server.total(region) * np.kron(C_ref, -IL),
-                        Ip_ref,
-                    ]
-                )
-
-            # Iterate through regions in the problem from left to right
+            # Total interaction, fission, and scattering operators
+            # Iterate through each material region
             for mat in self._geometry.regions:
-                # Define XSs
-                total = np.diag(self._xs_server.total(mat))
-                nu_fission = np.outer(
-                    self._xs_server.chi, self._xs_server.nu_fission(mat)
-                )
+                # Region masks for spatial dependence
+                masks = self._geometry.region_mask(mat)
 
-                total = np.squeeze(total)
-                nu_fission = np.squeeze(nu_fission)
+                # Add 0 at boundary condition and get spatial cores
+                spatial_cores = []
+                for j in range(num_dim):
+                    masks[j] = (
+                        np.concatenate((0, masks[j]))
+                        if dir_idx[j] == 0
+                        else np.concatenate((masks[j], 0))
+                    )
+                    spatial_cores.append(masks[j] * Ip[j][dir_idx[j]])
 
-                # Region mask for spatial dependence
-                mask = self._geometry.region_mask(mat)[0]
-                mask = (
-                    np.concatenate((mask[[0],], mask))
-                    if i == 0
-                    else np.concatenate((mask, mask[[-1],]))
-                )
-
-                # Total interaction operator
+                # Append total interaction operator
+                total = np.squeeze(np.diag(self._xs_server.total(mat)))
                 self._H.append(
-                    [total, np.kron(C, IL), mask * Ip[i]]
-                    if num_groups > 1
-                    else [total * np.kron(C, IL), mask * Ip[i]]
-                )
-
-                # Fission operator
-                self._F.append(
-                    [nu_fission, F_Intg, Ip[i] * bc[i] * mask]
-                    if num_groups > 1
-                    else [nu_fission * F_Intg, Ip[i] * bc[i] * mask]
-                )
-
-                # Iterate through scattering moments
-                for l in range(self._xs_server.scatter_gtg(mat).shape[0]):
-                    scatter_gtg = np.squeeze(self._xs_server.scatter_gtg(mat)[l,])
-
-                    # Integral operator
-                    A = np.zeros((2, 2), dtype=float)
-                    A[i, :] = 1
-                    A[i, 1 - i] = (-1) ** l
-                    S_Intg = np.kron(
-                        A,
-                        np.outer(
-                            (2 * l + 1) * eval_legendre(l, self._octant_ords[:, 1]),
-                            self._octant_ords[:, 0]
-                            * eval_legendre(l, self._octant_ords[:, 1]),
-                        ),
-                    )
-
-                    # Scattering operator
-                    self._S.append(
-                        [scatter_gtg, S_Intg, Ip[i] * bc[i] * mask]
+                    (
+                        [total, np.kron(C, IL)]
                         if num_groups > 1
-                        else [scatter_gtg * S_Intg, Ip[i] * bc[i] * mask]
+                        else [total * np.kron(C, IL)]
                     )
+                    + spatial_cores
+                )
+
+                # Append fission operator
+                nu_fission = np.squeeze(
+                    np.outer(self._xs_server.chi, self._xs_server.nu_fission(mat))
+                )
+                self._F.append(
+                    ([nu_fission, F_Intg] if num_groups > 1 else [nu_fission * F_Intg])
+                    + spatial_cores
+                )
+
+                # # Number of ordinates in an octant
+                # n = int(num_ordinates / num_octants)
+                #
+                # # Iterate through scattering moments
+                # def Y(l, m, ordinates):
+                #     y = (
+                #         (-1) ** m
+                #         * np.sqrt(
+                #             (2 * l + 1)
+                #             * math.factorial(l - abs(m))
+                #             / math.factorial(l + abs(m))
+                #         )
+                #         * lpmv(m, l, ordinates[:, 1])
+                #     )
+                #
+                #     if m == 0:
+                #         return y
+                #     elif m % 2 == 0:
+                #         return (
+                #             y * m * ordinates[:, 2] / np.sqrt(1 - ordinates[:, 1] ** 2)
+                #         )
+                #     else:
+                #         return (
+                #             y * m * ordinates[:, 3] / np.sqrt(1 - ordinates[:, 1] ** 2)
+                #         )
+                #
+                # for l in range(self._xs_server.scatter_gtg(mat).shape[0]):
+                #
+                #     for m in range(l + 1):
+                #
+                #     # Scattering integral Operator
+                #     S_intg = np.zeros(F_Intg.shape)
+                #
+                #     for k in range(octants.shape[0]):
+                #         S_Intg_p = np.zeros((n, n))
+
+                        # S_Intg[
+                        #     i
+                        #     * num_ordinates
+                        #     / num_octants : i
+                        #     * num_ordinates
+                        #     / num_octants
+                        #     + num_ordinates / num_octants,
+                        #     k
+                        #     * num_ordinates
+                        #     / num_octants : k
+                        #     * num_ordinates
+                        #     / num_octants
+                        #     + num_ordinates / num_octants,
+                        # ] = np.outer()
 
         # Construct TT objects
         self._H = TensorTrain(self._H)
@@ -261,8 +310,7 @@ class DiscreteOrdinates:
 
         # Get quadrature set
         # 1D = (N, 2): w, mu
-        # 2D = (N, 3): w, mu, eta
-        # 3D = (N, 4): w, mu, eta, xi
+        # 2/3D = (N, 4): w, mu, eta, xi
         self._octant_ords = (
             self._compute_square_set(self._num_ordinates, self._geometry.num_dim)
             if octant_ords is None
@@ -279,10 +327,10 @@ class DiscreteOrdinates:
     def _compute_square_set(N, num_dim):
         if num_dim == 1:
             return DiscreteOrdinates._gauss_legendre(N)
-        elif num_dim == 2:
-            octant_ords = DiscreteOrdinates._chebyshev_legendre(N * 2)[:, :-1]
-            octant_ords[:, 0] *= 2
-            return octant_ords
+        # elif num_dim == 2:
+        #     octant_ords = DiscreteOrdinates._chebyshev_legendre(N * 2)
+        #     octant_ords[:, 0] *= 2
+        #     return octant_ords
         else:
             return DiscreteOrdinates._chebyshev_legendre(N)
 

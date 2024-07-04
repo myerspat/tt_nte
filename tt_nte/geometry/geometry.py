@@ -176,6 +176,8 @@ class Geometry(object):
                 forward_correct = masks[-1][1:] - masks[-1][:-1]
                 masks[-1][np.argwhere(forward_correct == 1).flatten() + 1] = 0
 
+                masks[-1] = masks[-1].reshape((-1, 1))
+
             else:
                 masks.append(None)
 

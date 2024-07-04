@@ -49,7 +49,6 @@ class DiscreteOrdinates:
         # Differential and interpolation operators
         D = []
         Ip = []
-        bc = []
 
         for i in range(num_dim):
             # Get differential length along dimension
@@ -82,11 +81,6 @@ class DiscreteOrdinates:
 
             # Add to interpolation operator
             Ip.append([(d + d_p) / 2, (d + d_m) / 2])
-
-            # Add bc matrix
-            bc.append([np.ones((dim_num_nodes, 1)), np.ones((dim_num_nodes, 1))])
-            bc[-1][0][0, 0] = 0
-            bc[-1][1][-1, 0] = 0
 
         # Group identity matrix
         Ig = np.identity(num_groups)

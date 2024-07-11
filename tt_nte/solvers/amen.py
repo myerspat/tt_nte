@@ -23,7 +23,7 @@ class AMEn(Solver):
     # =======================================================================
     # Methods
 
-    def power(self, ranks=None, tol=1e-6, max_iter=100, amen_tol=1e-6):
+    def power(self, ranks=None, tol=1e-6, max_iter=100, amen_tol=1e-6, amen_nswp=20):
         """
         Power iteration using tt.amen.amen_solve(). ``amen_tol`` controls the
         tolerance of the solution produced by tt.amen.amen_solve(). ``ranks``
@@ -33,7 +33,9 @@ class AMEn(Solver):
         psi0, k0 = self._setup(ranks)
 
         def solver(A, B, x0):
-            return amen_solve(A, tt.matvec(B, x0), x0, amen_tol, verb=self._verbose)
+            return amen_solve(
+                A, tt.matvec(B, x0), x0, amen_tol, verb=self._verbose, nswp=amen_nswp
+            )
 
         super()._power(
             psi0=psi0,

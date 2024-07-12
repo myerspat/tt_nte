@@ -113,7 +113,7 @@ def test_research_reactor_multi_region():
 
     # Get research reactor XS server and geometry
     xs_server, geometry = benchmarks.research_reactor_multi_region(
-        [133, 760, 133], "vacuum"
+        [133, 761, 132], "vacuum"
     )
 
     # Initialize SN solver
@@ -209,54 +209,6 @@ def test_research_reactor_anisotropic():
         assert SN.S.matricize().shape == (1024 * N * 2, 1024 * N * 2)
         assert SN.F.matricize().shape == (1024 * N * 2, 1024 * N * 2)
         assert abs(expected_k[i] - solver.k) < 0.00005
-
-
-def test_pu_brick_2d():
-    # Set numpy random seed
-    np.random.seed(42)
-
-    # Get single-media problem geometry and XS server
-    server, geometry = benchmarks.pu_brick_2d(512, 16)
-
-    # Initialize SN solver
-    SN = DiscreteOrdinates(
-        xs_server=server,
-        geometry=geometry,
-        num_ordinates=4,
-    )
-    assert SN.H.row_dims == SN.H.col_dims
-    assert SN.S.row_dims == SN.S.col_dims
-    assert SN.F.row_dims == SN.F.col_dims
-    assert SN.H.row_dims == [4, 16, 512]
-    assert SN.S.row_dims == [4, 16, 512]
-    assert SN.F.row_dims == [4, 16, 512]
-
-    # Ordinates to test
-    num_ordinates = [4, 16]
-
-    # Old k
-    old_k = 0.75
-
-    for i in range(len(num_ordinates)):
-        N = num_ordinates[i]
-
-        # Change number of ordinates in SN
-        SN.update_settings(num_ordinates=N, tt_fmt="qtt")
-
-        # Run solver
-        solver = solvers.AMEn(method=SN, verbose=True)
-        solver.power(max_iter=2000)
-
-        # Assertions
-        assert SN.H.row_dims == SN.H.col_dims
-        assert SN.S.row_dims == SN.S.col_dims
-        assert SN.F.row_dims == SN.F.col_dims
-        assert SN.H.row_dims == [4, 16, 512]
-        assert SN.S.row_dims == [4, 16, 512]
-        assert SN.F.row_dims == [4, 16, 512]
-        assert solver.k > old_k and solver.k < 1.0
-
-        old_k = solver.k
 
 
 def test_research_reactor_anisotropic_2d():

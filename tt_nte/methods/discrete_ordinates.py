@@ -1,6 +1,7 @@
 """
 discrete_ordinates.py
 """
+
 import math
 
 import numpy as np
@@ -341,6 +342,12 @@ class DiscreteOrdinates:
             self._compute_square_set(self._num_ordinates, self._geometry.num_dim)
             if octant_ords is None
             else octant_ords
+        )
+        self._octant_ords[:, 0] = (
+            1
+            / self._direction_spaces[self._geometry.num_dim - 1].shape[0]
+            * self._octant_ords[:, 0]
+            / np.sum(self._octant_ords[:, 0])
         )
 
         # Construct operator tensors

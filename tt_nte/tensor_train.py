@@ -13,7 +13,6 @@ class TensorTrain(object):
         """
         if isinstance(elements, list):
             # Create scikit_tt train
-
             self._train = self._construct_scikit_tt(elements)
         elif isinstance(elements, TT):
             self._train = elements

@@ -107,7 +107,7 @@ class Geometry(object):
     def _find_diff(self, xmin, xmax, coords, dim_idx):
         if xmin != xmax:
             x = np.unique(coords[:, dim_idx])
-            self._diff[dim_idx] = np.round(x[1:] - x[:-1], 9)
+            self._diff[dim_idx] = np.round(x[1:] - x[:-1], 9).reshape((-1, 1))
 
     def _find_face(self, xmin, xmax, bc_mesh, dim_idx):
         if xmin != xmax:

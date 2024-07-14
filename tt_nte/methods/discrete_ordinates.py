@@ -188,7 +188,10 @@ class DiscreteOrdinates:
                 total = np.squeeze(np.diag(self._xs_server.total(mat)))
                 self._H.append(
                     (
-                        [total, np.kron(C, IL)]
+                        [
+                            total,
+                            np.kron(C, IL),
+                        ]
                         if num_groups > 1
                         else [total * np.kron(C, IL)]
                     )
@@ -281,7 +284,10 @@ class DiscreteOrdinates:
                     scatter_gtg = np.squeeze(self._xs_server.scatter_gtg(mat)[l,])
                     self._S.append(
                         (
-                            [scatter_gtg, S_Intg]
+                            [
+                                scatter_gtg,
+                                S_Intg,
+                            ]
                             if num_groups > 1
                             else [scatter_gtg * S_Intg]
                         )
@@ -343,6 +349,11 @@ class DiscreteOrdinates:
             if octant_ords is None
             else octant_ords
         )
+        if octant_ords is not None:
+            self._num_ordinates = int(
+                2**self._geometry.num_dim * self._octant_ords.shape[0]
+            )
+
         self._octant_ords[:, 0] = (
             1
             / self._direction_spaces[self._geometry.num_dim - 1].shape[0]

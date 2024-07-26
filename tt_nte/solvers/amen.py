@@ -14,8 +14,7 @@ class AMEn(Solver):
         """
         # Initialize base class
         super().__init__(
-            method.H.train("ttpy"),
-            method.S.train("ttpy"),
+            (method.H - method.S).train("ttpy"),
             method.F.train("ttpy"),
             verbose,
         )
@@ -23,14 +22,28 @@ class AMEn(Solver):
     # =======================================================================
     # Methods
 
-    def power(self, ranks=None, tol=1e-6, max_iter=100, amen_tol=1e-6, amen_nswp=20):
+    def power(
+        self,
+        ranks=None,
+        tol=1e-6,
+        max_iter=100,
+        amen_tol=1e-6,
+        amen_nswp=20,
+        k0=None,
+        psi0=None,
+    ):
         """
         Power iteration using tt.amen.amen_solve(). ``amen_tol`` controls the
         tolerance of the solution produced by tt.amen.amen_solve(). ``ranks``
         controls the ranks of the cores in the solution.
         """
         # Setup power iteration
-        psi0, k0 = self._setup(ranks)
+        if k0 is None and psi0 is None:
+            psi0, k0 = self._setup(ranks)
+        elif isinstance(psi0, TensorTrain):
+            psi0 = psi0.train("ttpy")
+
+        assert psi0 is not None and k0 is not None
 
         def solver(A, B, x0):
             return amen_solve(
@@ -50,14 +63,14 @@ class AMEn(Solver):
     def _setup(self, ranks):
         # Get maximum ranks for each core
         ranks = (
-            ((np.array([self._H.r, self._S.r, self._F.r])).max(axis=0).tolist())
+            ((np.array([self._M.r, self._F.r])).max(axis=0).tolist())
             if ranks == None
             else ranks
         )
 
         # Initial guess for psi and k
         psi0 = tt.vector.from_list(
-            TensorTrain.rand(self._H.n, [1] * self._H.d, ranks).cores
+            TensorTrain.rand(self._M.n, [1] * self._M.d, ranks).cores
         )
         k0 = np.random.rand(1)[0]
 

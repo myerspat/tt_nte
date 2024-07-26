@@ -14,8 +14,7 @@ class ALS(Solver):
         """
         # Initialize base class
         super().__init__(
-            method.H.train("scikit_tt"),
-            method.S.train("scikit_tt"),
+            (method.H - method.S).train("scikit_tt"),
             method.F.train("scikit_tt"),
             verbose,
         )
@@ -39,13 +38,16 @@ class ALS(Solver):
             norm=lambda x, p: x.norm(p),
         )
 
-    def power(self, ranks=None, tol=1e-6, max_iter=100):
+    def power(self, ranks=None, tol=1e-6, max_iter=100, k0=None, psi0=None):
         """
         Power iteration using scikit_tt.solvers.sle.als(). ``ranks`` is the
         ranks of the cores in the solution.
         """
         # Setup power iteration
-        psi0, k0 = self._setup(ranks)
+        if k0 is None and psi0 is None:
+            psi0, k0 = self._setup(ranks)
+        elif isinstance(psi0, TensorTrain):
+            psi0 = psi0.train("scikit_tt")
 
         super()._power(
             psi0=psi0,
@@ -60,17 +62,13 @@ class ALS(Solver):
     def _setup(self, ranks):
         # Get maximum ranks for each core
         ranks = (
-            (
-                (np.array([self._H.ranks, self._S.ranks, self._F.ranks]))
-                .max(axis=0)
-                .tolist()
-            )
+            ((np.array([self._M.ranks, self._F.ranks])).max(axis=0).tolist())
             if ranks == None
             else ranks
         )
 
         # Initial guess for psi and k
-        psi0 = TensorTrain.rand(self._H.row_dims, [1] * self._H.order, ranks).train(
+        psi0 = TensorTrain.rand(self._M.row_dims, [1] * self._M.order, ranks).train(
             "scikit_tt"
         )
         k0 = np.random.rand(1)[0]

@@ -26,6 +26,7 @@ class DiscreteOrdinates:
         tt_fmt="tt",
         qtt_threshold=1e-15,
         octant_ords=None,
+        regions=None,
     ):
         self.update_settings(
             xs_server=xs_server,
@@ -34,6 +35,7 @@ class DiscreteOrdinates:
             tt_fmt=tt_fmt,
             qtt_threshold=qtt_threshold,
             octant_ords=octant_ords,
+            regions=regions,
         )
 
     def _construct_tensor_trains(self):
@@ -170,9 +172,9 @@ class DiscreteOrdinates:
 
             # Total interaction, fission, and scattering operators
             # Iterate through each material region
-            for mat in self._geometry.regions:
+            for region, mat in self._regions.items():
                 # Region masks for spatial dependence
-                masks = self._geometry.region_mask(mat)
+                masks = self._geometry.region_mask(region)
 
                 # Add 0 at boundary condition and get spatial cores
                 spatial_cores = []
@@ -235,7 +237,7 @@ class DiscreteOrdinates:
                         )
                         return y * np.sin(m * gamma)
 
-                for l in range(self._xs_server.scatter_gtg(mat).shape[0]):
+                for l in range(self._xs_server.num_moments):
                     # Scattering integral operator
                     S_Intg = np.zeros(F_Intg.shape)
 
@@ -295,15 +297,9 @@ class DiscreteOrdinates:
                     )
 
         # Construct TT objects
-        self._H = TensorTrain(self._H)
-        self._F = TensorTrain(self._F)
-        self._S = TensorTrain(self._S)
-
-        # Convert to QTT format
-        if self._tt_fmt == "qtt":
-            self._H.tt2qtt(self._qtt_threshold)
-            self._F.tt2qtt(self._qtt_threshold)
-            self._S.tt2qtt(self._qtt_threshold)
+        self._H = TensorTrain(self._H, fmt=self._tt_fmt, threshold=self._qtt_threshold)
+        self._F = TensorTrain(self._F, fmt=self._tt_fmt, threshold=self._qtt_threshold)
+        self._S = TensorTrain(self._S, fmt=self._tt_fmt, threshold=self._qtt_threshold)
 
     # =====================================================================
     # Utility methods
@@ -316,6 +312,7 @@ class DiscreteOrdinates:
         tt_fmt=None,
         qtt_threshold=None,
         octant_ords=None,
+        regions=None,
     ):
         """
         Update SN settings.
@@ -360,6 +357,11 @@ class DiscreteOrdinates:
             * self._octant_ords[:, 0]
             / np.sum(self._octant_ords[:, 0])
         )
+
+        if regions is None:
+            self._regions = {region: region for region in self._geometry.regions}
+        else:
+            self._regions = regions
 
         # Construct operator tensors
         self._construct_tensor_trains()

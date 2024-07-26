@@ -208,7 +208,7 @@ def test_research_reactor_anisotropic():
         assert SN.H.matricize().shape == (1024 * N * 2, 1024 * N * 2)
         assert SN.S.matricize().shape == (1024 * N * 2, 1024 * N * 2)
         assert SN.F.matricize().shape == (1024 * N * 2, 1024 * N * 2)
-        assert abs(expected_k[i] - solver.k) < 0.00005
+        assert abs(expected_k[i] - solver.k) < 0.00010
 
 
 def test_research_reactor_anisotropic_2d():

@@ -107,7 +107,7 @@ class Geometry(object):
     def _find_diff(self, xmin, xmax, coords, dim_idx):
         if xmin != xmax:
             x = np.unique(coords[:, dim_idx])
-            self._diff[dim_idx] = np.round(x[1:] - x[:-1], 9).reshape((-1, 1))
+            self._diff[dim_idx] = np.round(x[1:] - x[:-1], 8).reshape((-1, 1))
 
     def _find_face(self, xmin, xmax, bc_mesh, dim_idx):
         if xmin != xmax:
@@ -133,7 +133,7 @@ class Geometry(object):
     @staticmethod
     def _sort_nodes(node_tags, coords):
         # Round and reshape coordinates
-        coords = np.round(coords.reshape((-1, 3)), 10)
+        coords = np.round(coords.reshape((-1, 3)), 8)
 
         # Sorted indices
         idxs = np.lexsort((coords[:, 2], coords[:, 1], coords[:, 0]))

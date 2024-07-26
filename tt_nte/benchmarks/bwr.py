@@ -21,7 +21,7 @@ def bwr_assembly(xy_num_nodes, control_rod=True, return_model=False):
         (
             Path(__file__).parent
             / "supporting/bwr/"
-            / ("xs_control.dat" if control_rod else "xs.dat")
+            / ("xs_assembly_control.dat" if control_rod else "xs_assembly.dat")
         ),
         delim_whitespace=True,
         header=None,

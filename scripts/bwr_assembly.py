@@ -7,7 +7,7 @@ from tt_nte.methods import DiscreteOrdinates
 from tt_nte.solvers import ALS, AMEn
 
 # Load unreflected data
-xs_server, geometry, ordinates, regions = bwr_assembly(264, control_rod=False)
+xs_server, geometry, ordinates = bwr_assembly(264, control_rod=False)
 
 # Initialize SN solver
 start = time.time()
@@ -16,7 +16,6 @@ SN = DiscreteOrdinates(
     geometry=geometry,
     num_ordinates=int(4 * ordinates.shape[0]),
     tt_fmt="qtt",
-    regions=regions,
     qtt_threshold=1e-10,
 )
 print(f"H = {SN.H}")
@@ -38,7 +37,7 @@ nocont_k = solver.k
 nocont_solve = time.time() - start
 
 # Load reflected data
-xs_server, geometry, ordinates, regions = bwr_assembly(264, control_rod=True)
+xs_server, geometry, ordinates = bwr_assembly(256, control_rod=True)
 
 # Initialize SN solver
 start = time.time()
@@ -47,7 +46,6 @@ SN = DiscreteOrdinates(
     geometry=geometry,
     num_ordinates=int(4 * ordinates.shape[0]),
     tt_fmt="qtt",
-    regions=regions,
     qtt_threshold=1e-10,
 )
 print(f"H = {SN.H}")
@@ -70,8 +68,12 @@ cont_solve = time.time() - start
 
 print("\nSolutions")
 print(
-    f"No control rod k = {np.round(nocont_k, 5)}, Setup time = {np.round(nocont_setup, 3)} s, Solve time = {np.round(nocont_solve, 3)} s"
+    f"No control rod k = {np.round(nocont_k, 5)}, "
+    + f"Setup time = {np.round(nocont_setup, 3)} s, "
+    + f"Solve time = {np.round(nocont_solve, 3)} s"
 )
 print(
-    f"Control Rod k = {np.round(cont_k, 5)}, Setup time = {np.round(cont_setup, 3)} s, Solve time = {np.round(cont_solve, 3)} s"
+    f"Control Rod k = {np.round(cont_k, 5)}, "
+    + f"Setup time = {np.round(cont_setup, 3)} s, "
+    + f"Solve time = {np.round(cont_solve, 3)} s"
 )

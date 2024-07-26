@@ -6,8 +6,9 @@ from tt_nte.benchmarks import bwr_core
 from tt_nte.methods import DiscreteOrdinates
 from tt_nte.solvers import ALS, AMEn
 
+print("hello")
 # Load unreflected data
-xs_server, geometry, ordinates, regions = bwr_core(264, reflected=False)
+xs_server, geometry, ordinates, regions = bwr_core(256, reflected=False)
 
 # Initialize SN solver
 start = time.time()
@@ -38,7 +39,7 @@ unref_k = solver.k
 unref_solve = time.time() - start
 
 # Load reflected data
-xs_server, geometry, ordinates, regions = bwr_core(264, reflected=True)
+xs_server, geometry, ordinates, regions = bwr_core(256, reflected=True)
 
 # Initialize SN solver
 start = time.time()
@@ -70,9 +71,13 @@ ref_solve = time.time() - start
 
 print("\nSolutions")
 print(
-    f"Unreflected k = {np.round(unref_k, 5)}, Setup time = {np.round(unref_setup, 3)} s, Solve time = {np.round(unref_solve, 3)} s"
+    f"Unreflected k = {np.round(unref_k, 5)}, "
+    + f"Setup time = {np.round(unref_setup, 3)} s, "
+    + f"Solve time = {np.round(unref_solve, 3)} s"
 )
 print(
-    f"Reflected k = {np.round(ref_k, 5)}, Setup time = {np.round(ref_setup, 3)} s, Solve time = {np.round(ref_solve, 3)} s"
+    f"Reflected k = {np.round(ref_k, 5)}, "
+    + f"Setup time = {np.round(ref_setup, 3)} s, "
+    + f"Solve time = {np.round(ref_solve, 3)} s"
 )
 print(f"Delta = {abs(ref_k - unref_k) * 1e5} pcm")

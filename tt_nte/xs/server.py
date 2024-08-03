@@ -10,6 +10,7 @@ class Server:
         # Shape assertions
         assert self._chi.shape == (self._num_groups,)
 
+        self._num_moments = None
         for mat in self._xs.keys():
             assert self.total(mat).shape == (self._num_groups,)
             assert self.nu_fission(mat).shape == (self._num_groups,)
@@ -18,6 +19,11 @@ class Server:
                 self._num_groups,
                 self._num_groups,
             )
+
+            if self._num_moments is None:
+                self._num_moments = self.scatter_gtg(mat).shape[0]
+            else:
+                assert self._num_moments == self.scatter_gtg(mat).shape[0]
 
     def total(self, mat):
         return self._xs[mat]["total"]
@@ -35,3 +41,7 @@ class Server:
     @property
     def num_groups(self):
         return self._num_groups
+
+    @property
+    def num_moments(self):
+        return self._num_moments

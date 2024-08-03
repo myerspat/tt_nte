@@ -366,6 +366,12 @@ class DiscreteOrdinates:
         # Construct operator tensors
         self._construct_tensor_trains()
 
+    def get_group(self, psi, g):
+        """
+        Get gth group of TT-decomposed solution.
+        """
+        return TensorTrain([psi.cores[0][:, [g], :, :]] + psi.cores[1:])
+
     # =====================================================================
     # Quadrature sets
 
@@ -451,6 +457,25 @@ class DiscreteOrdinates:
     def F(self):
         assert isinstance(self._F, TensorTrain)
         return self._F
+
+    @property
+    def Int_N(self):
+        """
+        Angular integral operator to get scalar flux from angular flux.
+        """
+        # Define integration TT
+        return TensorTrain(
+            (
+                [np.identity(self._xs_server.num_groups)]
+                if self._xs_server.num_groups > 1
+                else []
+            )
+            + [np.block([2**self._geometry.num_dim * [self._octant_ords[:, 0]]])]
+            + [
+                np.identity(diff.size + 1)
+                for diff in self._geometry.diff[: self._geometry.num_dim]
+            ]
+        )
 
     @property
     def geometry(self):

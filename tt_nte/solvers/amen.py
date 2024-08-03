@@ -13,8 +13,10 @@ class AMEn(Solver):
         Ax=b.
         """
         # Initialize base class
+        M = method.H - method.S
+        M.ortho(threshold=1e-8)
         super().__init__(
-            (method.H - method.S).train("ttpy"),
+            M.train("ttpy"),
             method.F.train("ttpy"),
             verbose,
         )
@@ -29,6 +31,7 @@ class AMEn(Solver):
         max_iter=100,
         amen_tol=1e-6,
         amen_nswp=20,
+        amen_kickrank=4,
         k0=None,
         psi0=None,
     ):
@@ -47,14 +50,20 @@ class AMEn(Solver):
 
         def solver(A, B, x0):
             return amen_solve(
-                A, tt.matvec(B, x0), x0, amen_tol, verb=self._verbose, nswp=amen_nswp
+                A,
+                tt.matvec(B, x0),
+                x0,
+                amen_tol,
+                kickrank=amen_kickrank,
+                verb=self._verbose,
+                nswp=amen_nswp,
             )
 
         super()._power(
             psi0=psi0,
             k0=k0,
             solver=solver,
-            norm=lambda x, p: TensorTrain(tt.vector.to_list(x)).norm(p),
+            norm=lambda x, p: x.norm(),
             matvec=tt.matvec,
             tol=tol,
             max_iter=max_iter,

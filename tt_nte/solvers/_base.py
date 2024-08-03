@@ -1,4 +1,6 @@
+import copy
 import warnings
+import time
 
 import numpy as np
 
@@ -42,17 +44,15 @@ class Solver(object):
 
         self._num_iter = 0
         err0 = 1
+        mat_nrm0 = norm(matvec(self._F, psi0), 1)
 
         for _ in range(max_iter):
             # Compute x in Ax = b
             self._psi = solver(A=self._M, B=self._F * (1 / k0), x0=psi0)
 
             # Compute new eigenvalue and eigenvector L2 error
-            self._k = (
-                k0
-                * norm(matvec(self._F, self._psi), 2)
-                / norm(matvec(self._F, psi0), 2)
-            )
+            mat_nrm = norm(matvec(self._F, self._psi), 1)
+            self._k = k0 * mat_nrm / mat_nrm0
             self._err = norm(self._psi - psi0, 2) / norm(psi0, 2)
 
             # Increment iteration number
@@ -94,6 +94,7 @@ class Solver(object):
             psi0 = self._psi
             k0 = self._k
             err0 = self._err
+            mat_nrm0 = mat_nrm
 
         # Normalize eigenvector
         self._psi *= 1 / norm(self._psi, 2)

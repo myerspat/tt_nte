@@ -13,8 +13,10 @@ class ALS(Solver):
         Ax=b.
         """
         # Initialize base class
+        M = method.H - method.S
+        M.ortho(threshold=1e-8)
         super().__init__(
-            (method.H - method.S).train("scikit_tt"),
+            M.train("scikit_tt"),
             method.F.train("scikit_tt"),
             verbose,
         )

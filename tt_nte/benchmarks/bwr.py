@@ -30,6 +30,7 @@ def bwr_assembly(xy_num_nodes, control_rod=True, return_model=False):
         (Path(__file__).parent / "./supporting/bwr/quadrature.dat"),
         delim_whitespace=True,
     ).values[:, [4, 1, 2]]
+    ordinates[:, 0] = 0.25 * ordinates[:, 0] / (np.sum(ordinates[:, 0]))
 
     xs = {
         "chi": np.array(
@@ -183,6 +184,7 @@ def bwr_core(xy_num_nodes, reflected=False, return_model=False):
         (Path(__file__).parent / "./supporting/bwr/quadrature.dat"),
         delim_whitespace=True,
     ).values[:, [4, 1, 2]]
+    ordinates[:, 0] = 0.25 * ordinates[:, 0] / (np.sum(ordinates[:, 0]))
 
     num_groups = int(np.max(data[:, 1]))
     num_moments = int((data.shape[1] - 5) / num_groups)
@@ -370,6 +372,7 @@ def bwr_core_homogenized(xy_num_nodes, reflected=False, return_model=False):
         (Path(__file__).parent / "./supporting/bwr/quadrature.dat"),
         delim_whitespace=True,
     ).values[:, [4, 1, 2]]
+    ordinates[:, 0] = 0.25 * ordinates[:, 0] / (np.sum(ordinates[:, 0]))
 
     num_groups = int(np.max(data[:, 1]))
     num_moments = int((data.shape[1] - 5) / num_groups)

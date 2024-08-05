@@ -44,7 +44,7 @@ def bwr_assembly(xy_num_nodes, control_rod=True, return_model=False):
                 0.13135319,
                 0.86825800,
             ]
-        )
+        )[::-1]
     }
     num_elements = int(np.max(data[:, 0]))
     num_groups = int(np.max(data[:, 1]))
@@ -102,6 +102,7 @@ def bwr_assembly(xy_num_nodes, control_rod=True, return_model=False):
         + x_lines[:, -1].tolist()
         + y_lines[0, :].tolist()
         + x_lines[:, 0].tolist(),
+        name="reflective",
     )
 
     # Create surfaces

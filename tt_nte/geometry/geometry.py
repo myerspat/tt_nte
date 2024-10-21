@@ -141,47 +141,43 @@ class Geometry(object):
         return node_tags[idxs], coords[idxs, :]
 
     def region_mask(self, mat_name):
-        """
-        Create masks for each spatial dimension.
-        """
+        """Create masks for each spatial dimension."""
         # Create 1d array of node positions
         region = np.zeros(self._num_nodes)
         region[self._mat_regions[mat_name]] = 1
 
         # Get dimension based masks
-        region = region.reshape(
-            [diff.size + 1 if diff is not None else 1 for diff in self._diff]
+        region = np.squeeze(
+            region.reshape(
+                [diff.size + 1 if diff is not None else 1 for diff in self._diff]
+            )
         )
 
-        # Append masks for each spatial dimension
-        masks = []
-        for d in range(len(region.shape)):
-            if region.shape[d] > 1:
-                forward_region = np.take(
-                    region, indices=np.arange(1, region.shape[d]), axis=d
+        if self._num_dim == 1:
+            return np.where((region[:-1] + region[1:]) == 2, 1, 0)
+        elif self._num_dim == 2:
+            return np.where(
+                (region[:-1, :-1] + region[:-1, 1:] + region[1:, :-1] + region[1:, 1:])
+                == 4,
+                1,
+                0,
+            )
+        else:
+            return np.where(
+                (
+                    region[:-1, :-1, :-1]
+                    + region[:-1, :-1, 1:]
+                    + region[:-1, 1:, :-1]
+                    + region[1:, :-1, :-1]
+                    + region[1:, :1, :-1]
+                    + region[1:, :-1, 1:]
+                    + region[:-1, 1:, 1:]
+                    + region[1:, 1:, 1:]
                 )
-                masks.append(
-                    (
-                        np.apply_over_axes(
-                            np.sum,
-                            forward_region,
-                            np.delete(np.arange(len(region.shape)), d),
-                        )
-                        > 0
-                    )
-                    .astype(int)
-                    .flatten()
-                )
-
-                forward_correct = masks[-1][1:] - masks[-1][:-1]
-                masks[-1][np.argwhere(forward_correct == 1).flatten() + 1] = 0
-
-                masks[-1] = masks[-1].reshape((-1, 1))
-
-            else:
-                masks.append(None)
-
-        return masks
+                == 8,
+                1,
+                0,
+            )
 
     def bc_region_mask(self, mat_name, idx):
         if self._bc_tags[idx] is not None:

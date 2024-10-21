@@ -1,17 +1,16 @@
-import copy
 import warnings
-import time
 
 import numpy as np
 
 
 class Solver(object):
-    def __init__(self, M, F, verbose):
-        """
-        Construct Solver object with the NTE operators.
-        """
-        self._M = M
+    def __init__(self, H, F, S, verbose):
+        """Construct Solver object with the NTE operators."""
+        # self._H = H
         self._F = F
+        # self._S = S
+
+        self._M = H - S
 
         self._verbose = verbose
 
@@ -19,9 +18,7 @@ class Solver(object):
     # Methods
 
     def _ges(self, solver, norm):
-        """
-        Base generalized eigenvalue solver algorithm.
-        """
+        """Base generalized eigenvalue solver algorithm."""
         if self._verbose:
             print(f"-- {self.__class__.__name__} Generalized Eigenvalue Solver")
 
@@ -36,9 +33,7 @@ class Solver(object):
         self._psi *= 1 / norm(self._psi, 2)
 
     def _power(self, psi0, k0, solver, norm, matvec, tol, max_iter, callback=None):
-        """
-        Base power iteration algorithm.
-        """
+        """Base power iteration algorithm."""
         if self._verbose:
             print(f"-- {self.__class__.__name__} Power Iteration")
 
@@ -53,7 +48,7 @@ class Solver(object):
             # Compute new eigenvalue and eigenvector L2 error
             mat_nrm = norm(matvec(self._F, self._psi), 1)
             self._k = k0 * mat_nrm / mat_nrm0
-            self._err = norm(self._psi - psi0, 2) / norm(psi0, 2)
+            self._err = abs(norm(self._psi - psi0, 1) / norm(psi0, 1))
 
             # Increment iteration number
             self._num_iter += 1

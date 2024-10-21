@@ -1,40 +1,40 @@
 import numpy as np
 import scipy.sparse as sp
 from scikit_tt import TT
+from quimb.tensor import MatrixProductState, MatrixProductOperator
+import copy
 
 from tt_nte.utils.utils import get_degree
 
 
 class TensorTrain(object):
     def __init__(self, elements, fmt="tt", rank_grp_size=500, threshold=1e-15):
-        """
-        Construct tensor train from a single numpy array, a list of cores
-        as numpy arrays, or a list of list of cores as numpy arrays.
-        """
+        """Construct tensor train from a single numpy array, a list of cores as numpy
+        arrays, or a list of list of cores as numpy arrays."""
         assert fmt == "tt" or fmt == "qtt"
         self._fmt = fmt
         self._rank_grp_size = rank_grp_size
         self._threshold = threshold
 
-        if isinstance(elements, list):
+        if isinstance(elements, list) or isinstance(elements, np.ndarray):
             # Create scikit_tt train
-            self._train = self._construct_scikit_tt(elements)
+            self._train = self._construct_scikit_tt(copy.deepcopy(elements))
         elif isinstance(elements, TT):
-            self._train = elements
+            self._train = copy.deepcopy(elements)
 
         else:
             raise TypeError(
-                f"Unsupported type {type(elements).__name__} given to {type(self).__name__}"
+                f"Unsupported type {type(elements).__name__} "
+                + f"given to {type(self).__name__}"
             )
 
     # =======================================================================
     # Methods
 
     def _construct_scikit_tt(self, trains):
-        """
-        Construct TT using scikit_tt.TT objects.
-        """
+        """Construct TT using scikit_tt.TT objects."""
         if isinstance(trains, list) and isinstance(trains[0], list):
+            raise RuntimeError("no")
             ranks = (
                 np.ones(int(len(trains) / self._rank_grp_size), dtype=int)
                 * self._rank_grp_size
@@ -112,6 +112,7 @@ class TensorTrain(object):
                     add_tt.tt2qtt()
 
                 tt += add_tt
+                tt.ortho(self._threshold)
                 del add_tt
 
             return tt.train()
@@ -127,15 +128,18 @@ class TensorTrain(object):
                         f"Shape of core {trains[i].shape} is not supported"
                     )
 
-            return TT(trains)
+            return TT(trains, threshold=self._threshold)
+
+        elif isinstance(trains, np.ndarray):
+            tt = TT(trains, threshold=self._threshold)
+            # tt.cores = [np.real(core) for core in tt.cores]
+            return tt
 
         else:
-            return TT(trains)
+            return TT(trains, threshold=self._threshold)
 
     def tt2qtt(self, threshold=1e-15, cores=None):
-        """
-        Transform TT formatted operator to QTT format.
-        """
+        """Transform TT formatted operator to QTT format."""
         # Reshape and permute dims to list of [2] * l_k
         new_dims = []
         if cores is None:
@@ -153,20 +157,87 @@ class TensorTrain(object):
         # for SVD decomposition
         self._train = self._train.tt2qtt(new_dims, new_dims, threshold=threshold)
 
+    def qtt2tt(self, modes):
+        """QTT to TT format, must provide the modes (degree) if we have a 4th order TT
+        with rows/cols of shape 2^X then modes=[X, X, X, X]"""
+        self._train = self._train.qtt2tt(modes)
+
     def norm(self, p=2):
-        """
-        Calculate the Manhattan norm (p=1) or Euclidean norm (p=2) of a TT.
-        """
+        """Calculate the Manhattan norm (p=1) or Euclidean norm (p=2) of a TT."""
         return self._train.norm(p)
 
     def ortho(self, threshold=0.0, max_rank=np.infty):
         self._train.ortho(threshold=threshold, max_rank=max_rank)
+        return self
+
+    def to_quimb(self):
+        if self.col_dims == [1] * self.order:
+            return MatrixProductState(
+                arrays=[self.cores[0][0, :, 0, :]]
+                + [core[:, :, 0, :] for core in self.cores[1:-1]]
+                + [self.cores[-1][:, :, 0, 0]],
+                shape="lpr",
+            )
+
+        elif self.row_dims == [1] * self.order:
+            return MatrixProductState(
+                arrays=[self.cores[0][0, 0, :, :]]
+                + [core[:, 0, :, :] for core in self.cores[1:-1]]
+                + [self.cores[-1][:, 0, :, 0]],
+                shape="lpr",
+            )
+
+        else:
+            return MatrixProductOperator(
+                arrays=[self.cores[0][0, :, :, :]]
+                + [core[:, :, :, :] for core in self.cores[1:-1]]
+                + [self.cores[-1][:, :, :, 0]],
+                shape="ludr",
+            )
+
+    @staticmethod
+    def from_quimb(train):
+        if isinstance(train, MatrixProductState):
+            return TensorTrain(
+                [
+                    np.transpose(
+                        train[0].data[
+                            np.newaxis,
+                            np.newaxis,
+                        ],
+                        axes=(0, 3, 1, 2),
+                    )
+                ]
+                + [
+                    np.transpose(train[i].data[np.newaxis,], axes=(1, 3, 0, 2))
+                    for i in range(1, train.L - 1)
+                ]
+                + [
+                    np.transpose(
+                        train[-1].data[
+                            np.newaxis,
+                            np.newaxis,
+                        ],
+                        axes=(2, 3, 1, 0),
+                    )
+                ]
+            )
+
+        elif isinstance(train, MatrixProductOperator):
+            return TensorTrain(
+                [np.transpose(train[0].data[np.newaxis,], axes=(0, 2, 3, 1))]
+                + [np.transpose(train[1:-1].data, axes=(0, 2, 3, 1))]
+                + [np.transpose(train[-1].data[np.newaxis,], axes=(1, 2, 3, 0))]
+            )
+
+        else:
+            raise TypeError(
+                "train must be a MatrixProductOperator or MatrixProductState"
+            )
 
     @staticmethod
     def rand(row_dims, col_dims, ranks):
-        """
-        Create tensor train with random values in cores.
-        """
+        """Create tensor train with random values in cores."""
         if not isinstance(ranks, list):
             ranks = [1] + [ranks] * (len(row_dims) - 1) + [1]
 
@@ -197,6 +268,18 @@ class TensorTrain(object):
 
         return train
 
+    def diag(self, diag_list):
+        return TensorTrain(self._train.diag(diag_list=diag_list))
+
+    def concatenate(self, other):
+        if isinstance(other, TensorTrain):
+            return TensorTrain(self._train.concatenate(other.train(), overwrite=True))
+        else:
+            return TensorTrain(self._train.concatenate(other, overwrite=True))
+
+    def squeeze(self):
+        return TensorTrain(self._train.squeeze())
+
     # =======================================================================
     # Overloads
 
@@ -205,7 +288,6 @@ class TensorTrain(object):
             other = other._train
 
         train = self._train + other
-        train.ortho(threshold=1e-10)
         return TensorTrain(train)
 
     def __sub__(self, other):
@@ -213,27 +295,23 @@ class TensorTrain(object):
             other = other._train
 
         train = self._train - other
-        train.ortho(threshold=1e-10)
         return TensorTrain(train)
 
     def __mul__(self, other):
         assert not isinstance(other, TensorTrain)
 
         train = self._train * other
-        train.ortho(threshold=1e-10)
         return TensorTrain(train)
 
     def __truediv__(self, other):
         assert not isinstance(other, TensorTrain)
 
         train = self._train * (1 / other)
-        train.ortho(threshold=1e-10)
         return TensorTrain(train)
 
     def __matmul__(self, other):
         assert isinstance(other, TensorTrain)
         train = TensorTrain(self._train.dot(other.train()))
-        train.ortho(threshold=1e-10)
         return train
 
     def __repr__(self):
@@ -243,9 +321,7 @@ class TensorTrain(object):
     # Getters
 
     def train(self, tt_driver="scikit_tt"):
-        """
-        Get scikit_tt or ttpy TT.
-        """
+        """Get scikit_tt or ttpy TT."""
         if tt_driver == "scikit_tt":
             return self._train
 
@@ -264,10 +340,8 @@ class TensorTrain(object):
             )
 
     def matricize(self, tt_driver="scikit_tt"):
-        """
-        Get matricized TT, if 2D then the return type is a
-        scipy.sparse.csc_matrix and a numpy array if 1D.
-        """
+        """Get matricized TT, if 2D then the return type is a scipy.sparse.csc_matrix
+        and a numpy array if 1D."""
         train = self.train(tt_driver)
         array = None
         if tt_driver == "scikit_tt":
@@ -279,6 +353,9 @@ class TensorTrain(object):
             return sp.csc_matrix(array)
         else:
             return array.flatten()
+
+    def full(self):
+        return self._train.full()
 
     @property
     def cores(self):

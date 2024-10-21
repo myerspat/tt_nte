@@ -8,16 +8,12 @@ from tt_nte.tensor_train import TensorTrain
 
 class ALS(Solver):
     def __init__(self, method, verbose=False):
-        """
-        Eignenvalue solver using Alternating Linear Scheme (ALS) to solve
-        Ax=b.
-        """
+        """Eignenvalue solver using Alternating Linear Scheme (ALS) to solve Ax=b."""
         # Initialize base class
-        M = method.H - method.S
-        M.ortho(threshold=1e-8)
         super().__init__(
-            M.train("scikit_tt"),
+            method.H.train("scikit_tt"),
             method.F.train("scikit_tt"),
+            method.S.train("scikit_tt"),
             verbose,
         )
 
@@ -25,9 +21,7 @@ class ALS(Solver):
     # Methods
 
     def ges(self, ranks=None, repeats=10):
-        """
-        Generalized eigenvalue solver using scikit_tt.solvers.evp.als().
-        """
+        """Generalized eigenvalue solver using scikit_tt.solvers.evp.als()."""
         # Setup power iteration
         psi0, _ = self._setup(ranks)
 
@@ -42,7 +36,9 @@ class ALS(Solver):
 
     def power(self, ranks=None, tol=1e-6, max_iter=100, k0=None, psi0=None):
         """
-        Power iteration using scikit_tt.solvers.sle.als(). ``ranks`` is the
+        Power iteration using scikit_tt.solvers.sle.als().
+
+        ``ranks`` is the
         ranks of the cores in the solution.
         """
         # Setup power iteration
@@ -65,12 +61,12 @@ class ALS(Solver):
         # Get maximum ranks for each core
         ranks = (
             ((np.array([self._M.ranks, self._F.ranks])).max(axis=0).tolist())
-            if ranks == None
+            if ranks is None
             else ranks
         )
 
         # Initial guess for psi and k
-        psi0 = TensorTrain.rand(self._M.row_dims, [1] * self._M.order, ranks).train(
+        psi0 = TensorTrain.rand(self._F.row_dims, [1] * self._F.order, ranks).train(
             "scikit_tt"
         )
         k0 = np.random.rand(1)[0]

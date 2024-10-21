@@ -7,13 +7,12 @@ from tt_nte.tensor_train import TensorTrain
 
 class GMRES(Solver):
     def __init__(self, method, verbose=False):
-        """
-        Eigenvalue solver using GMRES to solve Ax=b.
-        """
+        """Eigenvalue solver using GMRES to solve Ax=b."""
         # Initialize base class
         super().__init__(
-            (method.H - method.S).train("ttpy"),
+            method.H.train("ttpy"),
             method.F.train("ttpy"),
+            method.S.train("ttpy"),
             verbose,
         )
 
@@ -32,7 +31,9 @@ class GMRES(Solver):
         psi0=None,
     ):
         """
-        Power iteration using tt.solvers.GMRES(). ``ranks`` controls the ranks
+        Power iteration using tt.solvers.GMRES().
+
+        ``ranks`` controls the ranks
         of the solution. ``gmres_tol`` controls the tolerance of the solution
         produced by GMRES. ``gmres_max_iter`` controls the maximum number of
         iterations of GMRES. ``m`` controls the number of GMRES iterations
@@ -74,13 +75,13 @@ class GMRES(Solver):
         # Get maximum ranks for each core
         ranks = (
             ((np.array([self._M.r, self._F.r])).max(axis=0).tolist())
-            if ranks == None
+            if ranks is None
             else ranks
         )
 
         # Initial guess for psi and k
         psi0 = tt.vector.from_list(
-            TensorTrain.rand(self._M.n, [1] * self._M.d, ranks).cores
+            TensorTrain.rand(self._F.n, [1] * self._F.d, ranks).cores
         )
         k0 = np.random.rand(1)[0]
 

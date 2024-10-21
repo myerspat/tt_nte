@@ -1,7 +1,8 @@
 """
-crit_verif.py
+crit_verif.py.
 
-All cases below are given in https://www.sciencedirect.com/science/article/pii/S0149197002000987.
+All cases below are given in
+https://www.sciencedirect.com/science/article/pii/S0149197002000987.
 All cases are given in a critical configuration.
 """
 
@@ -130,11 +131,11 @@ def _create_2d_mesh(
     model.mesh.recombine()
 
 
-def pu_brick(num_nodes):
+def pu_brick(num_nodes, infinity=False):
     """
     Pu-239 1D slab problem taken from the Criticality Verification Benchmark Suite.
-    The width of the slab is 3.707444 cm with vacuum boundary conditions on either
-    side.
+
+    The width of the slab is 3.707444 cm with vacuum boundary conditions on either side.
     """
     # Cross section data
     xs = {
@@ -155,8 +156,8 @@ def pu_brick(num_nodes):
         np.array(["fuel"]),
         np.array([3.707444]),
         np.array([num_nodes]),
-        "vacuum",
-        "vacuum",
+        "vacuum" if infinity is False else "reflective",
+        "vacuum" if infinity is False else "reflective",
     )
     geometry = Geometry(gmsh.model)
     gmsh.finalize()
@@ -166,8 +167,9 @@ def pu_brick(num_nodes):
 
 def pu_brick_multi_region(num_nodes, num_regions):
     """
-    Same as pu_brick() but split into several Regions. Regions are
-    linearly spaced.
+    Same as pu_brick() but split into several Regions.
+
+    Regions are linearly spaced.
     """
     # Cross section data
     xs_data = {
@@ -211,10 +213,11 @@ def pu_brick_multi_region(num_nodes, num_regions):
     return xs_server, geometry
 
 
-def research_reactor_multi_region(num_nodes, right_bc="reflective"):
+def research_reactor_multi_region(num_nodes, right_bc="reflective", infinite=False):
     """
-    Multi-region case with multiplying medium (fuel) and non-multiplying medium
-    (mod). This case is also multi-group.
+    Multi-region case with multiplying medium (fuel) and non-multiplying medium (mod).
+
+    This case is also multi-group.
     """
     # Cross section data
     xs = {
@@ -250,6 +253,9 @@ def research_reactor_multi_region(num_nodes, right_bc="reflective"):
     regions = ["moderator", "fuel"]
     lengths = [1.126151, 6.696802]
 
+    if infinite:
+        right_bc = "reflective"
+
     if right_bc == "vacuum":
         regions += ["moderator"]
         lengths[-1] *= 2
@@ -263,7 +269,7 @@ def research_reactor_multi_region(num_nodes, right_bc="reflective"):
         np.array(regions),
         np.array(lengths),
         np.array(num_nodes),
-        "vacuum",
+        "vacuum" if not infinite else "reflective",
         right_bc,
     )
     geometry = Geometry(gmsh.model)
@@ -273,10 +279,7 @@ def research_reactor_multi_region(num_nodes, right_bc="reflective"):
 
 
 def research_reactor_anisotropic(num_nodes, right_bc="reflective"):
-    """
-    Two-group uranium research reactor (linearly-anisotropic), Tables
-    49 and 50.
-    """
+    """Two-group uranium research reactor (linearly-anisotropic), Tables 49 and 50."""
     # Cross section data
     xs = {
         "chi": np.array([1.0, 0.0]),
@@ -316,11 +319,11 @@ def research_reactor_anisotropic(num_nodes, right_bc="reflective"):
     return Server(xs), geometry
 
 
-def pu_brick_2d(x_num_nodes, y_num_nodes):
+def pu_brick_2d(x_num_nodes, y_num_nodes, infinite=False):
     """
     Pu-239 1D slab problem taken from the Criticality Verification Benchmark Suite.
-    The width of the slab is 3.707444 cm with vacuum boundary conditions on either
-    side.
+
+    The width of the slab is 3.707444 cm with vacuum boundary conditions on either side.
     """
     # Cross section data
     xs = {
@@ -342,8 +345,8 @@ def pu_brick_2d(x_num_nodes, y_num_nodes):
         lengths=np.array([3.707444]),
         x_num_nodes=np.array([x_num_nodes]),
         y_num_nodes=y_num_nodes,
-        left_bc="vacuum",
-        right_bc="vacuum",
+        left_bc="vacuum" if infinite is False else "reflective",
+        right_bc="vacuum" if infinite is False else "reflective",
     )
     geometry = Geometry(gmsh.model)
     gmsh.finalize()
@@ -352,10 +355,7 @@ def pu_brick_2d(x_num_nodes, y_num_nodes):
 
 
 def research_reactor_anisotropic_2d(x_num_nodes, y_num_nodes, right_bc="reflective"):
-    """
-    Two-group uranium research reactor (linearly-anisotropic), Tables
-    49 and 50.
-    """
+    """Two-group uranium research reactor (linearly-anisotropic), Tables 49 and 50."""
     # Cross section data
     xs = {
         "chi": np.array([1.0, 0.0]),
@@ -399,7 +399,9 @@ def research_reactor_anisotropic_2d(x_num_nodes, y_num_nodes, right_bc="reflecti
 def research_reactor_multi_region_2d(x_num_nodes, y_num_nodes, right_bc="reflective"):
     """
     Multi-region case (in 2D) with multiplying medium (fuel) and non-multiplying medium
-    (mod). This case is also multi-group.
+    (mod).
+
+    This case is also multi-group.
     """
     # Cross section data
     xs = {

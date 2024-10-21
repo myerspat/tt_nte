@@ -1,6 +1,4 @@
-"""
-discrete_ordinates.py
-"""
+"""discrete_ordinates.py."""
 
 import math
 
@@ -27,6 +25,7 @@ class DiscreteOrdinates:
         qtt_threshold=1e-15,
         octant_ords=None,
         regions=None,
+        xs_threshold=1e-8,
     ):
         self.update_settings(
             xs_server=xs_server,
@@ -36,13 +35,11 @@ class DiscreteOrdinates:
             qtt_threshold=qtt_threshold,
             octant_ords=octant_ords,
             regions=regions,
+            xs_threshold=xs_threshold,
         )
 
     def _construct_tensor_trains(self):
-        """
-        Construct operaotr tensor trains as described in
-        LANL TT paper.
-        """
+        """Construct operaotr tensor trains as described in LANL TT paper."""
         octants = self._direction_spaces[self._geometry.num_dim - 1]
         num_octants = octants.shape[0]
         num_dim = self._geometry.num_dim
@@ -89,9 +86,9 @@ class DiscreteOrdinates:
 
         # Iterate over half-spaces/quadrants/octants and append
         # TT cores
-        self._H = []
-        self._F = []
-        self._S = []
+        self._H = None
+        self._F = None
+        self._S = None
 
         bcs = self._geometry.bcs
 
@@ -117,17 +114,10 @@ class DiscreteOrdinates:
                         spatial_cores.append(D[k][dir_idx[k]])
 
                 # Append dimension streaming operator
-                self._H.append(
-                    (
-                        [
-                            Ig,
-                            Q,
-                        ]
-                        if num_groups > 1
-                        else [Q]
-                    )
-                    + spatial_cores
-                )
+                if self._H is None:
+                    self._H = TensorTrain([Q, Ig] + spatial_cores)
+                else:
+                    self._H += TensorTrain([Q, Ig] + spatial_cores)
 
                 # Add reflective boundary condition
                 if bcs[int(j + 3 * dir_idx[j])] == "reflective":
@@ -150,17 +140,21 @@ class DiscreteOrdinates:
                     spatial_cores[sp_idx] = bc_mask * np.copy(spatial_cores[sp_idx])
 
                     # Append boundary condition
-                    self._H.append(
-                        (
-                            [
-                                Ig,
-                                Q_ref,
-                            ]
-                            if num_groups > 1
-                            else [Q_ref]
-                        )
-                        + spatial_cores
-                    )
+                    self._H += TensorTrain([Q_ref, Ig] + spatial_cores)
+
+            # Get spatial cores
+            spatial_cores = []
+            for j in range(num_dim - 1, -1, -1):
+                spatial_cores.append(Ip[j][dir_idx[j]])
+
+            # Append total interaction operator
+            def total(mat):
+                return np.diag(self._xs_server.total(mat))
+
+            assert isinstance(self._H, TensorTrain)
+            self._H += TensorTrain([np.kron(C, IL)]).concatenate(
+                self._xs_operator(total, dir_idx) @ TensorTrain([Ig] + spatial_cores)
+            )
 
             # Fission integral operator
             A = np.zeros((num_octants, num_octants), dtype=float)
@@ -170,136 +164,123 @@ class DiscreteOrdinates:
                 np.outer(np.ones(self._octant_ords.shape[0]), self._octant_ords[:, 0]),
             )
 
-            # Total interaction, fission, and scattering operators
-            # Iterate through each material region
-            for region, mat in self._regions.items():
-                # Region masks for spatial dependence
-                masks = self._geometry.region_mask(region)
+            # Append fission operator
+            def nu_fission(mat):
+                return np.outer(self._xs_server.chi, self._xs_server.nu_fission(mat))
 
-                # Add 0 at boundary condition and get spatial cores
-                spatial_cores = []
-                for j in range(num_dim - 1, -1, -1):
-                    masks[j] = (
-                        np.concatenate((np.zeros((1, 1)), masks[j]))
-                        if dir_idx[j] == 0
-                        else np.concatenate((masks[j], np.zeros((1, 1))))
-                    )
-                    spatial_cores.append(masks[j] * Ip[j][dir_idx[j]])
-
-                # Append total interaction operator
-                total = np.squeeze(np.diag(self._xs_server.total(mat)))
-                self._H.append(
-                    (
-                        [
-                            total,
-                            np.kron(C, IL),
-                        ]
-                        if num_groups > 1
-                        else [total * np.kron(C, IL)]
-                    )
-                    + spatial_cores
+            if self._F is None:
+                self._F = TensorTrain([F_Intg]).concatenate(
+                    self._xs_operator(nu_fission, dir_idx)
+                    @ TensorTrain([Ig] + spatial_cores)
+                )
+            else:
+                self._F += TensorTrain([F_Intg]).concatenate(
+                    self._xs_operator(nu_fission, dir_idx)
+                    @ TensorTrain([Ig] + spatial_cores)
                 )
 
-                # Append fission operator
-                nu_fission = np.squeeze(
-                    np.outer(self._xs_server.chi, self._xs_server.nu_fission(mat))
-                )
-                self._F.append(
-                    ([nu_fission, F_Intg] if num_groups > 1 else [nu_fission * F_Intg])
-                    + spatial_cores
+            # Number of ordinates in an octant
+            n = int(num_ordinates / num_octants)
+
+            # Iterate through scattering moments
+            def Y(l, m, ordinates, even=True):
+                y = (
+                    (-1) ** m
+                    * np.sqrt(
+                        (2 * l + 1)
+                        * math.factorial(l - abs(m))
+                        / math.factorial(l + abs(m))
+                    )
+                    * lpmv(m, l, ordinates[:, 1])
                 )
 
-                # Number of ordinates in an octant
-                n = int(num_ordinates / num_octants)
+                if m == 0:
+                    return y
+                elif even:
+                    gamma = np.arccos(
+                        ordinates[:, 2] / np.sqrt(1 - ordinates[:, 1] ** 2)
+                    )
+                    return y * np.cos(m * gamma)
+                else:
+                    gamma = np.arcsin(
+                        ordinates[:, 3] / np.sqrt(1 - ordinates[:, 1] ** 2)
+                    )
+                    return y * np.sin(m * gamma)
 
-                # Iterate through scattering moments
-                def Y(l, m, ordinates, even=True):
-                    y = (
-                        (-1) ** m
-                        * np.sqrt(
-                            (2 * l + 1)
-                            * math.factorial(l - abs(m))
-                            / math.factorial(l + abs(m))
-                        )
-                        * lpmv(m, l, ordinates[:, 1])
+            for l in range(self._xs_server.num_moments):
+                # Scattering integral operator
+                S_Intg = np.zeros(F_Intg.shape)
+
+                # Outgoing ordinates
+                out_ords = np.copy(self._octant_ords)
+                out_ords[:, 1:] *= octant[np.newaxis, :]
+
+                for k in range(octants.shape[0]):
+                    # Incoming ordinates
+                    in_ords = np.copy(self._octant_ords)
+                    in_ords[:, 1:] *= octants[[k], :]
+
+                    S_Intg[
+                        int(i * n) : int(i * n + n),
+                        int(k * n) : int(k * n + n),
+                    ] = np.outer(
+                        Y(l, 0, out_ords),
+                        self._octant_ords[:, 0] * Y(l, 0, in_ords),
                     )
 
-                    if m == 0:
-                        return y
-                    elif even:
-                        gamma = np.arccos(
-                            ordinates[:, 2] / np.sqrt(1 - ordinates[:, 1] ** 2)
-                        )
-                        return y * np.cos(m * gamma)
-                    else:
-                        gamma = np.arcsin(
-                            ordinates[:, 3] / np.sqrt(1 - ordinates[:, 1] ** 2)
-                        )
-                        return y * np.sin(m * gamma)
+                if num_dim > 1:
+                    for m in range(1, l + 1):
+                        for k in range(octants.shape[0]):
+                            # Incoming ordinates
+                            in_ords = np.copy(self._octant_ords)
+                            in_ords[:, 1:] *= octants[[k], :]
 
-                for l in range(self._xs_server.num_moments):
-                    # Scattering integral operator
-                    S_Intg = np.zeros(F_Intg.shape)
-
-                    # Outgoing ordinates
-                    out_ords = np.copy(self._octant_ords)
-                    out_ords[:, 1:] *= octant[np.newaxis, :]
-
-                    for k in range(octants.shape[0]):
-                        # Incoming ordinates
-                        in_ords = np.copy(self._octant_ords)
-                        in_ords[:, 1:] *= octants[[k], :]
-
-                        S_Intg[
-                            int(i * n) : int(i * n + n),
-                            int(k * n) : int(k * n + n),
-                        ] = np.outer(
-                            Y(l, 0, out_ords),
-                            self._octant_ords[:, 0] * Y(l, 0, in_ords),
-                        )
-
-                    if num_dim > 1:
-                        for m in range(1, l + 1):
-                            for k in range(octants.shape[0]):
-                                # Incoming ordinates
-                                in_ords = np.copy(self._octant_ords)
-                                in_ords[:, 1:] *= octants[[k], :]
-
-                                S_Intg[
-                                    int(i * n) : int(i * n + n),
-                                    int(k * n) : int(k * n + n),
-                                ] += 2 * np.outer(
-                                    Y(l, m, out_ords, even=True),
+                            S_Intg[
+                                int(i * n) : int(i * n + n),
+                                int(k * n) : int(k * n + n),
+                            ] += 2 * np.outer(
+                                Y(l, m, out_ords, even=True),
+                                self._octant_ords[:, 0] * Y(l, m, in_ords, even=True),
+                            ) + (
+                                2
+                                * np.outer(
+                                    Y(l, m, out_ords, even=False),
                                     self._octant_ords[:, 0]
-                                    * Y(l, m, in_ords, even=True),
-                                ) + (
-                                    2
-                                    * np.outer(
-                                        Y(l, m, out_ords, even=False),
-                                        self._octant_ords[:, 0]
-                                        * Y(l, m, in_ords, even=False),
-                                    )
-                                    if num_dim > 2
-                                    else 0
+                                    * Y(l, m, in_ords, even=False),
                                 )
-                    # Append train to scattering operator
-                    scatter_gtg = np.squeeze(self._xs_server.scatter_gtg(mat)[l,])
-                    self._S.append(
-                        (
-                            [
-                                scatter_gtg,
-                                S_Intg,
-                            ]
-                            if num_groups > 1
-                            else [scatter_gtg * S_Intg]
-                        )
-                        + spatial_cores
+                                if num_dim > 2
+                                else 0
+                            )
+
+                # Append train to scattering operator
+                def scatter_gtg(mat):
+                    return self._xs_server.scatter_gtg(mat)[l,]
+
+                if self._S is None:
+                    self._S = TensorTrain([S_Intg]).concatenate(
+                        self._xs_operator(scatter_gtg, dir_idx)
+                        @ TensorTrain([Ig] + spatial_cores)
+                    )
+                else:
+                    self._S += TensorTrain([S_Intg]).concatenate(
+                        self._xs_operator(scatter_gtg, dir_idx)
+                        @ TensorTrain([Ig] + spatial_cores)
                     )
 
         # Construct TT objects
-        self._H = TensorTrain(self._H, fmt=self._tt_fmt, threshold=self._qtt_threshold)
-        self._F = TensorTrain(self._F, fmt=self._tt_fmt, threshold=self._qtt_threshold)
-        self._S = TensorTrain(self._S, fmt=self._tt_fmt, threshold=self._qtt_threshold)
+        self._H = self._H.squeeze()
+        self._F = self._F.squeeze()
+        self._S = self._S.squeeze()
+
+        # Ensure we only have real component
+        self._H._train.cores = [np.real(core) for core in self._H.cores]
+        self._F._train.cores = [np.real(core) for core in self._F.cores]
+        self._S._train.cores = [np.real(core) for core in self._S.cores]
+
+        if self._tt_fmt == "qtt":
+            self._H.tt2qtt(self._qtt_threshold)
+            self._F.tt2qtt(self._qtt_threshold)
+            self._S.tt2qtt(self._qtt_threshold)
 
     # =====================================================================
     # Utility methods
@@ -313,10 +294,9 @@ class DiscreteOrdinates:
         qtt_threshold=None,
         octant_ords=None,
         regions=None,
+        xs_threshold=None,
     ):
-        """
-        Update SN settings.
-        """
+        """Update SN settings."""
         self._xs_server = self._xs_server if xs_server is None else xs_server
         self._geometry = self._geometry if geometry is None else geometry
         self._num_ordinates = (
@@ -363,14 +343,16 @@ class DiscreteOrdinates:
         else:
             self._regions = regions
 
+        self._xs_threshold = xs_threshold if xs_threshold else self._xs_threshold
+
         # Construct operator tensors
         self._construct_tensor_trains()
 
     def get_group(self, psi, g):
-        """
-        Get gth group of TT-decomposed solution.
-        """
-        return TensorTrain([psi.cores[0][:, [g], :, :]] + psi.cores[1:])
+        """Get gth group of TT-decomposed solution."""
+        return TensorTrain(
+            [psi.cores[0]] + [psi.cores[1][:, [g], :, :]] + psi.cores[2:]
+        )
 
     # =====================================================================
     # Quadrature sets
@@ -389,7 +371,9 @@ class DiscreteOrdinates:
     @staticmethod
     def _gauss_legendre(N):
         """
-        Gauss Legendre quadrature set. Only given for positive half space.
+        Gauss Legendre quadrature set.
+
+        Only given for positive half space.
         """
         mu, w = np.polynomial.legendre.leggauss(N)
         w = w[: int(mu.size / 2)] / 2
@@ -401,9 +385,7 @@ class DiscreteOrdinates:
 
     @staticmethod
     def _gauss_chebyshev(N):
-        """
-        Gauss-Chebyshev quadrature.
-        """
+        """Gauss-Chebyshev quadrature."""
         gamma = (2 * np.arange(1, int(N / 2) + 1) - 1) * np.pi / (2 * N)
         w = np.ones(int(N / 2)) / (2 * N)
 
@@ -440,6 +422,60 @@ class DiscreteOrdinates:
 
         return ordinates
 
+    def _xs_operator(self, xs_method, dir_idx):
+        num_dim = self._geometry.num_dim
+
+        # Create XS tensor containing all material types
+        xs = np.zeros(
+            [self._xs_server.num_groups] * 2
+            + [d.size for d in self._geometry.diff if d is not None]
+        )
+        for region, mat in self._regions.items():
+            xs += np.tensordot(
+                xs_method(mat), self._geometry.region_mask(region), axes=0
+            )
+
+        # import matplotlib.pyplot as plt
+        # import itertools
+        #
+        # X = np.array(
+        #     list(itertools.accumulate([0] + self._geometry.dx.flatten().tolist()))
+        # )
+        # Y = np.array(
+        #     list(itertools.accumulate([0] + self._geometry.dy.flatten().tolist()))
+        # )
+        # c = plt.pcolormesh(
+        #     X,
+        #     Y,
+        #     xs[0, 0, :, :],
+        # )
+        # plt.colorbar(c)
+        # plt.show()
+
+        # Transpose
+        xs = np.transpose(
+            xs, axes=[0] + np.arange(2, len(xs.shape))[::-1].tolist() + [1]
+        )
+
+        # Add additional dimensions for matrix operator
+        for _ in range(num_dim):
+            xs = xs[..., np.newaxis]
+
+        # Apply tensor decomposition
+        xs_tt = TensorTrain(xs, threshold=self._xs_threshold)
+
+        # Append boundary conditions
+        for i in range(num_dim - 1, -1, -1):
+            core = xs_tt.cores[1 + i]
+            xs_tt.cores[1 + i] = (
+                np.concatenate((np.zeros(core[:, [0], :, :].shape), core), axis=1)
+                if dir_idx[num_dim - 1 - i] == 0
+                else np.concatenate((core, np.zeros(core[:, [0], :, :].shape)), axis=1)
+            )
+
+        # Return operator
+        return xs_tt.diag(np.arange(1, xs_tt.order).tolist())
+
     # =====================================================================
     # Getters
 
@@ -460,17 +496,15 @@ class DiscreteOrdinates:
 
     @property
     def Int_N(self):
-        """
-        Angular integral operator to get scalar flux from angular flux.
-        """
+        """Angular integral operator to get scalar flux from angular flux."""
         # Define integration TT
         return TensorTrain(
-            (
+            [np.block([2**self._geometry.num_dim * [self._octant_ords[:, 0]]])]
+            + (
                 [np.identity(self._xs_server.num_groups)]
                 if self._xs_server.num_groups > 1
                 else []
             )
-            + [np.block([2**self._geometry.num_dim * [self._octant_ords[:, 0]]])]
             + [
                 np.identity(diff.size + 1)
                 for diff in self._geometry.diff[: self._geometry.num_dim]

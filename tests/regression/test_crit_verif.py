@@ -88,7 +88,7 @@ def test_pu_brick():
             solver = qtt_solvers[j](method=SN, verbose=True, **qtt_solver_configs[j])
 
             # Run power iteration
-            solver.power(ranks=4)
+            solver.power(ranks=4, tol=3e-5)
 
             # Assertions
             assert abs(expected_k[i] - solver.k) < 0.00005
@@ -139,6 +139,8 @@ def test_research_reactor_multi_region():
         solver = solvers.AMEn(method=SN, verbose=True)
         solver.power(max_iter=2000)
 
+        print(f"N = {N}, k = {solver.k}")
+
         # Assertions
         assert SN.H.matricize().shape == (1024 * N * 2, 1024 * N * 2)
         assert SN.S.matricize().shape == (1024 * N * 2, 1024 * N * 2)
@@ -167,11 +169,52 @@ def test_research_reactor_multi_region():
         solver = solvers.AMEn(method=SN, verbose=True)
         solver.power(max_iter=2000)
 
+        print(f"N = {N}, k = {solver.k}")
+
         # Assertions
         assert SN.H.matricize().shape == (512 * N * 2, 512 * N * 2)
         assert SN.S.matricize().shape == (512 * N * 2, 512 * N * 2)
         assert SN.F.matricize().shape == (512 * N * 2, 512 * N * 2)
         assert abs(expected_k[i] - solver.k) < 0.00010
+
+
+def test_research_reactor_multi_region_infinite():
+    # Set numpy random seed
+    np.random.seed(42)
+
+    # Get single-media problem geometry and XS server
+    xs_server, geometry = benchmarks.research_reactor_multi_region(
+        [300, 725], infinite=True
+    )
+
+    # ----------------------------------------------------------------
+    # SN in TT format
+
+    # Initialize SN solver
+    SN = DiscreteOrdinates(
+        xs_server=xs_server,
+        geometry=geometry,
+        num_ordinates=2,
+        tt_fmt="tt",
+    )
+
+    num_ordinates = [8]
+    correct_k = 1.365821
+    current_k = 1.25
+
+    for i in range(len(num_ordinates)):
+        # Change number of ordinates in SN
+        SN.update_settings(num_ordinates=num_ordinates[i])
+
+        solver = solvers.Matrix(method=SN, verbose=True)
+        solver.ges()
+
+        print(f"N = {num_ordinates[i]}, k = {solver.k}")
+
+        # Assertions
+        assert round(solver.k, 6) >= current_k and round(solver.k, 6) <= correct_k
+
+        current_k = round(solver.k, 6)
 
 
 def test_research_reactor_anisotropic():
@@ -211,6 +254,43 @@ def test_research_reactor_anisotropic():
         assert abs(expected_k[i] - solver.k) < 0.00010
 
 
+def test_pu_brick_infinite_2d():
+    # Set numpy random seed
+    np.random.seed(42)
+
+    # Get single-media problem geometry and XS server
+    xs_server, geometry = benchmarks.pu_brick_2d(512, 16, infinite=True)
+
+    # ----------------------------------------------------------------
+    # SN in TT format
+
+    # Initialize SN solver
+    SN = DiscreteOrdinates(
+        xs_server=xs_server,
+        geometry=geometry,
+        num_ordinates=4,
+        tt_fmt="tt",
+    )
+
+    num_ordinates = [4, 16]
+    correct_k = 2.612903
+    current_k = 2.5
+
+    for i in range(len(num_ordinates)):
+        # Change number of ordinates in SN
+        SN.update_settings(num_ordinates=num_ordinates[i])
+
+        solver = solvers.AMEn(method=SN, verbose=True)
+        solver.power(ranks=4, tol=1e-4)
+
+        print(f"N = {num_ordinates[i]}, k = {solver.k}")
+
+        # Assertions
+        assert round(solver.k, 6) >= current_k and round(solver.k, 6) <= correct_k
+
+        current_k = round(solver.k, 6)
+
+
 def test_research_reactor_anisotropic_2d():
     # Set numpy random seed
     np.random.seed(42)
@@ -229,9 +309,9 @@ def test_research_reactor_anisotropic_2d():
     assert SN.H.row_dims == SN.H.col_dims
     assert SN.S.row_dims == SN.S.col_dims
     assert SN.F.row_dims == SN.F.col_dims
-    assert SN.H.row_dims == [2, 4, 4, 512]
-    assert SN.S.row_dims == [2, 4, 4, 512]
-    assert SN.F.row_dims == [2, 4, 4, 512]
+    assert SN.H.row_dims == [4, 2, 4, 512]
+    assert SN.S.row_dims == [4, 2, 4, 512]
+    assert SN.F.row_dims == [4, 2, 4, 512]
 
     # Ordinates to test
     num_ordinates = [4, 16]
@@ -273,9 +353,9 @@ def test_research_reactor_multi_region_2d():
     assert SN.H.row_dims == SN.H.col_dims
     assert SN.S.row_dims == SN.S.col_dims
     assert SN.F.row_dims == SN.F.col_dims
-    assert SN.H.row_dims == [2, 4, 4, 512]
-    assert SN.S.row_dims == [2, 4, 4, 512]
-    assert SN.F.row_dims == [2, 4, 4, 512]
+    assert SN.H.row_dims == [4, 2, 4, 512]
+    assert SN.S.row_dims == [4, 2, 4, 512]
+    assert SN.F.row_dims == [4, 2, 4, 512]
 
     # Ordinates to test
     num_ordinates = [4, 16]

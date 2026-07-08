@@ -1,9 +1,10 @@
 #include "ttnte/parallel/thread_pool.hpp"
 
-#ifdef USE_CUDA
 #include "ttnte/parallel/parallel_context.hpp"
-#include <c10/cuda/CUDAFunctions.h>
 #include <torch/cuda.h>
+
+#ifdef USE_CUDA
+#include <c10/cuda/CUDAFunctions.h>
 
 namespace {
 void init_cuda(torch::DeviceIndex device_idx)

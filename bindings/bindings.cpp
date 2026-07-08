@@ -1,3 +1,4 @@
+#include "ttnte/python/package_manager.hpp"
 #include <pybind11/pybind11.h>
 
 namespace py = pybind11;
@@ -19,6 +20,10 @@ void register_python_cleanup(py::module_& m);
 
 PYBIND11_MODULE(ttnte_python, m)
 {
+  // Eagerly initialize so the numpy/torchtt imports happen now, not during
+  // interpreter shutdown when sys.meta_path is already None.
+  ttnte::python::PackageManager::instance();
+
   // auto m_utils = m.def_submodule("utils");
   // init_utils(m_utils);
 

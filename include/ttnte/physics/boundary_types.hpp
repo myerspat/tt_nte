@@ -12,6 +12,7 @@ enum class BoundaryType : uint8_t {
   INTERNAL,
   VACUUM,
   REFLECTIVE,
+  PERIODIC,
   DEGENERATE,
 };
 
@@ -27,6 +28,8 @@ enum class BoundaryType : uint8_t {
     return "VACUUM";
   case BoundaryType::REFLECTIVE:
     return "REFLECTIVE";
+  case BoundaryType::PERIODIC:
+    return "PERIODIC";
   case BoundaryType::DEGENERATE:
     return "DEGENERATE";
   default:

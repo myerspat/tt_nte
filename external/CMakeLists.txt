@@ -66,4 +66,6 @@ target_compile_definitions(partitioning_suite INTERFACE IDXTYPEWIDTH=64
 add_library(torchtt_headers INTERFACE)
 target_include_directories(
   torchtt_headers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/torchTT/torchtt/cpp)
-target_compile_definitions(torchtt_headers INTERFACE USE_CUDA)
+if(USE_CUDA)
+  target_compile_definitions(torchtt_headers INTERFACE USE_CUDA)
+endif()

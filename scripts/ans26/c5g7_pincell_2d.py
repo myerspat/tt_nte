@@ -1,13 +1,13 @@
-import time
 import multiprocessing
 
 import torch
-import numpy as np
 from igakit.cad import circle, line, ruled, refine, coons
+import matplotlib.pyplot as plt
 
 from ttnte import mpi_context
+from ttnte.visualization.style import get_patch_style
 from ttnte.parallel import IGADofHeuristic
-from ttnte.xs.benchmarks import c5g7, pu239
+from ttnte.xs.benchmarks import c5g7
 from ttnte.cad import Patch
 from ttnte.mesh import IGAMesh
 from ttnte.physics import (
@@ -26,8 +26,6 @@ from ttnte.solvers import (
     ExecMode,
     CommMode,
 )
-import matplotlib.pyplot as mplt
-from igakit.plot import plt
 
 
 def warmup_all_gpus():
@@ -119,12 +117,23 @@ if __name__ == "__main__":
     )
     mesh.finalize()
 
-    if mpi_context.rank == 0:
-        for i, s in enumerate(mesh.blocks):
-            print(i)
-            for dim in [0, 1]:
-                for is_upper in [False, True]:
-                    print(s.get_boundary_info(dim, is_upper).type)
+    backend = "matplotlib"
+    style = get_patch_style(backend)
+    style.mesh.cmap = {
+        fills[0].to_string(): "maroon",
+        fills[-2].to_string(): "cornflowerblue",
+    }
+    mesh.plot(
+        resolution=25,
+        show_ctrlpts=True,
+        show_ctrlnet=True,
+        show_boundary=True,
+        backend="matplotlib",
+        filename="figs/c5g7_pincell_2d.png",
+        style=style,
+    )
+
+    assert 0 == 1
 
     # Create angular quadrature
     qset = ProductQuadrature.gauss_legendre_chebyshev(16, 16, 2)
@@ -154,8 +163,8 @@ if __name__ == "__main__":
         tol=5e-7,
         max_iter=100,
         eps=5e-8,
-        use_gpu=False,
-        memory_policy=MemoryPolicy.OUT_OF_CORE,
+        use_gpu=True,
+        memory_policy=MemoryPolicy.RESIDENT,
         exec_mode=ExecMode.ASYNC,
         comm_mode=CommMode.ASYNC,
         verbose=True,

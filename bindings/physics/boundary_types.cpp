@@ -12,6 +12,7 @@ void register_BoundaryType(py::module_& m)
     .value("INTERNAL", BoundaryType::INTERNAL, "Connected to another MeshBlock")
     .value("VACUUM", BoundaryType::VACUUM, "Free stream/Vacuum boundary")
     .value("REFLECTIVE", BoundaryType::REFLECTIVE, "Mirror/Reflective boundary")
+    .value("PERIODIC", BoundaryType::PERIODIC, "Periodic boundary")
     .value("DEGENERATE", BoundaryType::DEGENERATE,
       "Boundary is degenerate and needs no boundary operators")
     .export_values()

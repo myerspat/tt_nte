@@ -11,7 +11,7 @@ void register_Patch(py::module_& m)
 {
   using Basis = std::vector<ttnte::cad::BSplineBasis>;
   using Patch = ttnte::cad::Patch;
-  register_Label<Patch>(m, "Patch");
+  register_Label<ttnte::mesh::MeshBlock<Patch>>(m, "Patch");
 
   auto py_class =
     py::class_<Patch, std::shared_ptr<Patch>>(m, "Patch")

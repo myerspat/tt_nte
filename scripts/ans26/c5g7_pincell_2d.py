@@ -133,8 +133,6 @@ if __name__ == "__main__":
         style=style,
     )
 
-    assert 0 == 1
-
     # Create angular quadrature
     qset = ProductQuadrature.gauss_legendre_chebyshev(16, 16, 2)
     qset.to_(torch.device("cpu"), dtype)

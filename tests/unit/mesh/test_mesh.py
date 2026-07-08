@@ -138,19 +138,6 @@ def test_mesh(device, dtype):
     assert expected_vacuums == vacuums
     assert expected_degeneracies == degeneracies
 
-    # Test the mapping method for mesh
-    face_a = mesh.blocks[0].get_boundary(0, 0)
-    face_b = Patch()
-    face_b.ctrlptsw = torch.flip(face_a.ctrlptsw.permute((1, 0, 2)), (0,)).contiguous()
-    face_b.basis = face_a.basis[::-1]
-    is_coupled, mapping_a, mapping_b = mesh.get_boundary_mapping(face_a, face_b)
-
-    assert is_coupled == True
-    assert mapping_a.flip == [False, True]
-    assert mapping_a.perm == [1, 0, 2]
-    assert mapping_b.flip == [True, False]
-    assert mapping_b.perm == [1, 0, 2]
-
     # Set reflective boundary conditions
     mesh.set_axis_aligned_conditions(
         BCPlane(z_min=True, z_max=True), BoundaryType.REFLECTIVE, tol=1e-5

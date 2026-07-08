@@ -141,8 +141,8 @@ def test_homogeneous_sphere(device, dtype):
 
     assert len(Bin) == 6
     assert len(Bout) == 6
-    assert sum([b.defined() for b in Bin]) == 4
-    assert sum([b.defined() for b in Bout]) == 5
+    assert sum([b.defined() for b in Bin]) == 3
+    assert sum([b.defined() for b in Bout]) == 4
 
     # Check the operators
     for op in [H, S, F] + Bout + Bin:

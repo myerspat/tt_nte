@@ -69,7 +69,7 @@ def test_compute_partition():
     load_balancer = IGALoadBalancer(comm.size())
 
     # Compute the initial partition
-    local_gids = load_balancer.compute_partition(conn_graph, comm, [heuristic])
+    local_gids, _ = load_balancer.compute_partition(conn_graph, comm, [heuristic])
 
     # 1. Define the two valid expected partitions
     expected_a = torch.tensor([0, 2], dtype=dtype, device=device)

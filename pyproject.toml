@@ -9,7 +9,7 @@ dependencies = [
     "torch>=2.9.0", "torchtt", "numpy<2.0.0", "igakit", "geomdl", "pandas",
     "matplotlib", "plotly", "h5py", "tqdm", "pybind11", "cotengra",
     "optuna", "cmaes", "cotengrust", "cytools", "kahypar", "loky",
-    "networkx", "opt_einsum"
+    "networkx", "opt_einsum", "pyvista"
 ]
 
 [project.optional-dependencies]

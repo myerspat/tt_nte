@@ -120,7 +120,7 @@ void Material::set_absorption(torch::Tensor absorption)
 void Material::set_kappa_fission(torch::Tensor kappa_fission)
 {
   check_finalize("set_kappa_fission");
-  absorption_ = std::move(kappa_fission);
+  kappa_fission_ = std::move(kappa_fission);
 }
 void Material::set_fission(torch::Tensor fission)
 {

@@ -174,7 +174,9 @@ public:
     strategy_->update_eps(
       std::max(cfg.rounding.eps, cfg.eps_forcing * min_error_));
 
-    torch::cuda::synchronize();
+    if (cfg.use_gpu && torch::cuda::is_available()) {
+      torch::cuda::synchronize();
+    }
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int j = 0; j < cfg.max_iter; j++) {

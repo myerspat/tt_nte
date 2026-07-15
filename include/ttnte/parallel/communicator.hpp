@@ -12,6 +12,10 @@ enum class MPITag : int {
   // Load balancing
   PARTITION_ID_MAP = 101,
   ROUTING_TABLE = 102,
+
+  // Post-solve gather (gatherv_by_gid)
+  SOLUTION_GATHER_SIZE = 103,
+  SOLUTION_GATHER_DATA = 104,
 };
 
 enum class MPIOp : int {

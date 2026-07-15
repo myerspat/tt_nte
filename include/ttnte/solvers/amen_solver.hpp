@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ttnte/linalg/format_type.hpp"
 #include "ttnte/solvers/local_solver.hpp"
 #include "ttnte/utils/exception.hpp"
 
@@ -19,6 +20,10 @@ protected:
   int nswp_;
   /// Relative residual.
   double eps_;
+  /// Minimum allowed truncation tolerance.
+  double eps_floor_;
+  /// Forcing for truncation tolerance in an inexact solver.
+  double eps_forcing_;
   /// Maximum allowed rank.
   int max_rank_;
   /// The largest size before switching from a direct solver to GMRES.
@@ -38,7 +43,7 @@ protected:
 
   // =================================================================
   // Protected constructors
-  AMEnSolver(int nswp = 22, double eps = 1e-10,
+  AMEnSolver(int nswp = 22, double eps = 1e-10, double eps_forcing = 0.01,
     int max_rank = std::numeric_limits<int>::max(), int max_full = 500,
     int kickrank = 4, int kick2 = 0, int local_iterations = 40, int resets = 2,
     bool verbose = false, int preconditioner = 0)
@@ -58,6 +63,9 @@ protected:
       throw utils::runtime_error("ttnte::solvers::AMEnSolver::AMEnSolver",
         "`prec` is either 0, 1, or 2");
     }
+
+    eps_floor_ = eps;
+    eps_forcing_ = eps_forcing;
   }
 
 public:
@@ -74,16 +82,30 @@ public:
   /// @param local_system The local linear system to be solved.
   void solve(const linalg::LinearSystem::Ptr& local_system) override final;
 
+  /// @brief Update min_error_ (via LocalSolver), then force eps_ toward
+  /// eps_floor_ as min_error_ improves: eps_ = max(eps_floor_, eps_forcing_ *
+  /// min_error_).
+  void update_convergence_criteria(double error) override
+  {
+    LocalSolver::update_convergence_criteria(error);
+    eps_ = std::max(eps_floor_, eps_forcing_ * min_error_);
+  }
+
   // =================================================================
   // Public getters / setters
   /// @return The current truncation tolerance of the solver.
-  double get_eps() const noexcept override final { return eps_; }
-  /// @param eps The new truncation tolerance of the solver.
-  void set_eps(double eps) override final { eps_ = eps; }
+  double get_eps() const override final { return eps_; }
   /// @return The maximum rank.
-  int get_max_rank() const noexcept final override { return max_rank_; }
-  /// @param max_rank The new maximum rank of the solver.
-  void set_max_rank(int max_rank) final override { max_rank_ = max_rank; }
+  int64_t get_max_rank() const final override
+  {
+    return static_cast<int64_t>(max_rank_);
+  }
+
+  /// @return Always FormatType::TENSOR_TRAIN.
+  linalg::FormatType get_state_format() override final
+  {
+    return linalg::FormatType::TENSOR_TRAIN;
+  }
 };
 
 } // namespace ttnte::solvers

@@ -1,4 +1,5 @@
 #include "ttnte/math/quadrature_set.hpp"
+#include <limits>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 #include <vector>
@@ -20,6 +21,9 @@ void register_quadrature_set(py::module_& m)
     // =================================================================
     // Public methods
     .def("is_tensor_product", &QuadratureSet::is_tensor_product)
+    .def("integrate", &QuadratureSet::integrate, py::arg("state"),
+      py::arg("eps") = 1e-10,
+      py::arg("max_rank") = std::numeric_limits<int64_t>::max())
 
     // Custom robust lambda for the TensorOptions overload
     .def("to_",

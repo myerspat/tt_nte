@@ -39,14 +39,22 @@ static void register_TransportDriver_impl(
       py::arg("angular_qset"), py::arg("config"),
       py::call_guard<py::gil_scoped_release>())
     .def("init_solver", &TransportDriver::init_solver,
-      "Set up the DDSolver, build the iteration DAG, and compute the initial "
+      "Set up the solver, build its iteration DAG, and compute the initial "
       "fission source. Returns the initial k-eigenvalue.",
-      py::arg("strategy"), py::call_guard<py::gil_scoped_release>())
+      py::arg("solver"), py::arg("clear_assemblers") = true,
+      py::call_guard<py::gil_scoped_release>())
     .def("solve_eigenvalue", &TransportDriver::solve_eigenvalue,
-      "Run the k-eigenvalue power iteration with the given DD strategy. "
-      "Returns the converged k-effective.",
-      py::arg("strategy"), py::arg("tol") = 1e-8, py::arg("max_iter") = 500,
-      py::arg("verbose") = true, py::call_guard<py::gil_scoped_release>())
+      "Run the k-eigenvalue power iteration with the given solver (e.g. a "
+      "DDSolver for multi-patch domain decomposition, or a bare LocalSolver "
+      "such as AMEnSolver for a single-patch problem). Returns a "
+      "TransportSolution holding the converged k-effective (.k_eff) and the "
+      "raw angular flux per local patch. Convergence requires BOTH the "
+      "scalar-flux-shape relative L2 error (tol) and k_eff's own absolute "
+      "iteration-to-iteration change (k_tol, in k-units -- e.g. 1e-5 is 1 "
+      "pcm) to fall below their respective tolerances.",
+      py::arg("inner_solver"), py::arg("tol") = 1e-8, py::arg("max_iter") = 500,
+      py::arg("clear_assemblers") = true, py::arg("verbose") = true,
+      py::arg("k_tol") = 1e-5, py::call_guard<py::gil_scoped_release>())
     .def("distribute", &TransportDriver::distribute,
       "Initial partition using METIS on rank 0 and cull the local mesh.",
       py::arg("load_heuristics") = std::vector<LoadHeuristicPtr> {},
@@ -67,7 +75,7 @@ static void register_TransportDriver_impl(
       "label", &TransportDriver::get_label, &TransportDriver::set_label)
     .def_property_readonly("mesh", &TransportDriver::get_mesh)
     .def_property_readonly("server", &TransportDriver::get_server)
-    .def_property_readonly("solver", &TransportDriver::get_solver);
+    .def_property_readonly("gid2rank", &TransportDriver::get_gid2rank);
 }
 
 void register_TransportDriver(py::module_& m)

@@ -11,6 +11,7 @@
 #include <optional>
 #include <torch/types.h>
 #include <tuple>
+#include <unordered_map>
 
 namespace ttnte::mesh {
 
@@ -43,6 +44,11 @@ private:
   GIDtoIdx index_map_;
   /// MPI rank of this mesh.
   int my_rank_;
+  /// GID -> owning rank, for every GID in the whole mesh (identical on every
+  /// rank). Trivially populated in finalize() (every GID -> this rank);
+  /// overwritten by cull_blocks() with the real partition if distribute() is
+  /// ever called.
+  std::unordered_map<int64_t, int> gid2rank_;
 
   // States
   bool is_connected_ = false;
@@ -165,6 +171,12 @@ public:
       // Add a global ID
       bptr->set_gid(i);
       index_map_[i] = i;
+
+      // Trivially populate gid2rank_ (every GID -> this rank) so it's
+      // meaningful without ever having to call cull_blocks() -- e.g. a
+      // single-rank run, or a mesh nobody ever distributes. cull_blocks()
+      // overwrites this with the real partition if/when it's called.
+      gid2rank_[i] = my_rank_;
 
       for (size_t dim = 0; dim < blocks_[0]->get_ndim(); dim++) {
         for (bool is_upper : {false, true}) {
@@ -646,6 +658,7 @@ public:
     // Save the restricted versions
     blocks_ = std::move(new_blocks_);
     index_map_ = std::move(new_index_map_);
+    gid2rank_ = gid2rank;
 
     // Iterate through the blocks and update their boundaries to the correct MPI
     // ranks
@@ -673,6 +686,13 @@ public:
   }
   /// @return The vector of blocks.
   const inline MeshBlocks& get_blocks() const noexcept { return blocks_; }
+  /// @return GID -> owning rank, for every GID in the whole mesh (identical
+  /// on every rank). Trivial (every GID -> this rank) if cull_blocks() was
+  /// never called.
+  const inline std::unordered_map<int64_t, int>& get_gid2rank() const noexcept
+  {
+    return gid2rank_;
+  }
   /// @return The global bounding box represented as a tensor with the first
   /// index of the first dimension being the minimum point in Euclidean space
   /// and the second being the maximum.

@@ -5,6 +5,7 @@ namespace py = pybind11;
 // Forward declarations
 void register_MemoryPolicy(py::module_& m);
 
+void register_Solver(py::module_& m);
 void register_LocalSolver(py::module_& m);
 void register_AMEnSolver(py::module_& m);
 
@@ -21,6 +22,9 @@ void init_solvers(py::module_& m)
   // Register classes
   register_MemoryPolicy(m);
 
+  // Solver must be registered before any class that derives from it
+  // (LocalSolver, DDSolver) so pybind11 knows about the base.
+  register_Solver(m);
   register_LocalSolver(m);
   register_AMEnSolver(m);
 

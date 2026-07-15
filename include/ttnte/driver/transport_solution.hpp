@@ -1,0 +1,881 @@
+#pragma once
+
+#include "ttnte/cad/patch.hpp"
+#include "ttnte/linalg/ops.hpp"
+#include "ttnte/linalg/state.hpp"
+#include "ttnte/math/quadrature_set.hpp"
+#include "ttnte/mesh/mesh.hpp"
+#include "ttnte/parallel/communicator.hpp"
+#include "ttnte/physics/assembly_configs.hpp"
+#include "ttnte/physics/dg_first_order_transport_backends.hpp"
+#include "ttnte/utils/exception.hpp"
+#include "ttnte/utils/label.hpp"
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace ttnte::driver {
+
+/// @brief A distributed, per-patch linalg::State container -- keyed by GID,
+/// holding only this rank's own local patches -- with the machinery to
+/// post-process a solved TransportDriver result. This class does not know
+/// what physical quantity it holds: the raw angular flux
+/// (TransportDriver::get_solution()) and any derived field (e.g. scalar flux
+/// via compute_scalar_flux()) are both just a TransportSolution holding a
+/// different State per patch.
+template<typename BlockType>
+class TransportSolution {
+public:
+  // =================================================================
+  // Public types
+  using Mesh = mesh::Mesh<BlockType>;
+  using Label = utils::Label<TransportSolution>;
+  using Ptr = std::shared_ptr<TransportSolution>;
+
+private:
+  // =================================================================
+  // Private data
+  Label label_;
+  /// The converged k-eigenvalue, if this solution came from an eigenvalue
+  /// solve. Unset for solve modes that don't produce one (e.g. fixed-source).
+  std::optional<double> k_eff_;
+  /// GID -> this rank's local field. Only contains entries for GIDs local to
+  /// this rank.
+  std::unordered_map<int64_t, linalg::State> local_fields_;
+  /// The angular quadrature set used to assemble the originating solve, for
+  /// compute_scalar_flux(). Null if unavailable (e.g. assemble() was never
+  /// called with a quadrature set).
+  math::QuadratureSet::Ptr angular_qset_;
+  /// This rank's own (already-culled, already-local) mesh -- referenced, not
+  /// copied, for local-only geometry access (e.g. regular_mesh_average(),
+  /// gather_plot_data()). No non-local geometry is ever held here.
+  typename Mesh::Ptr mesh_;
+  /// Communicator for MPI reductions/gathers.
+  parallel::Communicator comm_;
+  /// Whether local_fields_ still carries angular dependence (true for what
+  /// TransportDriver::solve_eigenvalue() returns) or has already been
+  /// reduced (false for compute_scalar_flux()'s result). Tracked explicitly
+  /// rather than inferred from tensor rank after the fact.
+  bool has_angular_dependence_ = true;
+
+  // =================================================================
+  // Private methods
+  [[nodiscard]] std::string error_context(const std::string& func_name) const
+  {
+    return "ttnte::driver::TransportSolution::" + func_name;
+  }
+
+  /// @brief Recompute the shared spatial DOF-to-quadrature-point evaluation
+  /// maps and Jacobian-weighted quadrature weight needed to compare `block`'s
+  /// field against `ref_block`'s. Cheap (purely geometric, no
+  /// cross-section/material dependency -- see the material-free
+  /// DGFirstOrderTransportBackend constructors), so not cached; used only by
+  /// compute_errors().
+  ///
+  /// `block` and `ref_block` are assumed to share the same parametric domain
+  /// (e.g. `ref_block` is a differently-refined -- more knot spans and/or
+  /// higher degree -- version of the same geometry), so no point inversion
+  /// is needed. But the two sides' own auto-derived quadratures are each
+  /// only accurate enough to integrate THEIR OWN degree/knot spans exactly
+  /// -- using the coarser side's quadrature to evaluate the finer side's
+  /// basis would under-integrate it. So this picks, WHOLESALE (one winner
+  /// for the whole patch), whichever side has more total quadrature points
+  /// summed across dimensions, and uses that side's own quadrature AND
+  /// Jacobian mapping as the shared integration measure; the coarser side's
+  /// basis is then evaluated at the finer side's quadrature points (a
+  /// coarser/lower-degree basis is still integrated exactly by a rule built
+  /// for a finer one -- the reverse is not true).
+  /// @return {basis for `block`, shared Jacobian-weighted mapping, basis for
+  /// `ref_block`} -- all three evaluated at the SAME (finer side's)
+  /// quadrature points.
+  template<int64_t NumDim, linalg::FormatType fmt>
+  static std::tuple<linalg::TTEngine, linalg::TTEngine, linalg::TTEngine>
+  compute_error_weights_impl(const typename Mesh::BlockTypePtr& block,
+    const typename Mesh::BlockTypePtr& ref_block,
+    const math::QuadratureSet::Ptr& angular_qset)
+  {
+    auto config = physics::DGTransportAssemblerConfig();
+    config.rounding.eps = 0;
+    config.rounding.max_rank = std::numeric_limits<int>::max();
+    config.cross_jacobian_inverse = false;
+
+    using Backend =
+      physics::backends::DGFirstOrderTransportBackend<BlockType, fmt, NumDim>;
+
+    auto total_quad_points = [](const auto& points) {
+      int64_t total = 0;
+      for (const auto& p : points) {
+        total += p.numel();
+      }
+      return total;
+    };
+
+    // Each side's own auto-derived quadrature (sized to exactly integrate
+    // that side's own degree/knot spans).
+    Backend field_backend(block, angular_qset, config);
+    Backend ref_backend(ref_block, angular_qset, config);
+    bool ref_is_finer = total_quad_points(ref_backend.get_quad_points()) >=
+                        total_quad_points(field_backend.get_quad_points());
+
+    Backend& fine_backend = ref_is_finer ? ref_backend : field_backend;
+    const auto& coarse_block = ref_is_finer ? block : ref_block;
+
+    linalg::TTEngine fine_basis = fine_backend.assemble_basis();
+    linalg::TTEngine mapping = fine_backend.assemble_integral_mapping();
+
+    // Evaluate the coarser side's basis at the finer side's own quadrature
+    // points.
+    Backend coarse_backend(
+      coarse_block, angular_qset, fine_backend.get_quad_points(), config);
+    linalg::TTEngine coarse_basis = coarse_backend.assemble_basis();
+
+    linalg::TTEngine basis = ref_is_finer ? coarse_basis : fine_basis;
+    linalg::TTEngine ref_basis = ref_is_finer ? fine_basis : coarse_basis;
+
+    return {std::move(basis), std::move(mapping), std::move(ref_basis)};
+  }
+
+  template<linalg::FormatType fmt>
+  std::tuple<linalg::TTEngine, linalg::TTEngine, linalg::TTEngine>
+  compute_error_weights(const typename Mesh::BlockTypePtr& block,
+    const typename Mesh::BlockTypePtr& ref_block) const
+  {
+    switch (block->get_ndim()) {
+    case 1:
+      return compute_error_weights_impl<1, fmt>(
+        block, ref_block, angular_qset_);
+    case 2:
+      return compute_error_weights_impl<2, fmt>(
+        block, ref_block, angular_qset_);
+    case 3:
+      return compute_error_weights_impl<3, fmt>(
+        block, ref_block, angular_qset_);
+    default:
+      throw utils::runtime_error(*this, error_context("compute_error_weights"),
+        "Unsupported patch dimensionality: " +
+          std::to_string(block->get_ndim()));
+    }
+  }
+
+  /// @brief Evaluate a spatial(+energy) field -- e.g. this solution's own
+  /// local field for `block`'s GID -- at a batch of scattered PARAMETRIC
+  /// points within `block`, via Patch::evaluate_field(). Used only by
+  /// regular_mesh_average().
+  /// @param block The patch whose basis the field lives on.
+  /// @param field This block's own spatial(+energy) field -- NOT angular
+  /// (caller must have already reduced via compute_scalar_flux()).
+  /// @param points Parametric coordinates, shape (n, ndim).
+  /// @return Field values at `points`, shape (n, num_groups).
+  torch::Tensor evaluate_field_at_points(
+    const typename Mesh::BlockTypePtr& block, const linalg::State& field,
+    const torch::Tensor& points) const
+  {
+    int64_t patch_ndim = block->get_ndim();
+    torch::Tensor dense = field.to_dense();
+
+    // Drop the trailing all-1 n-block to_dense() carries for a State,
+    // leaving just (spatial_dims..., num_groups).
+    c10::SmallVector<int64_t, 6> spatial_shape(
+      dense.sizes().begin(), dense.sizes().begin() + patch_ndim + 1);
+    torch::Tensor reshaped = dense.reshape(spatial_shape);
+
+    return block->evaluate_field(reshaped, points);
+  }
+
+  // =================================================================
+  // Private constructors
+  TransportSolution(parallel::Communicator comm, typename Mesh::Ptr mesh,
+    math::QuadratureSet::Ptr angular_qset,
+    std::optional<double> k_eff = std::nullopt,
+    bool has_angular_dependence = true,
+    std::optional<std::string> label = std::nullopt)
+    : comm_(std::move(comm)), mesh_(std::move(mesh)),
+      angular_qset_(std::move(angular_qset)), k_eff_(k_eff),
+      has_angular_dependence_(has_angular_dependence),
+      label_(label.has_value() ? Label::from_string(*label)
+                               : Label::create_internal())
+  {}
+
+public:
+  // =================================================================
+  // Public methods
+  /// @brief Build a TransportSolution and get the shared pointer to it.
+  template<typename... Args>
+  static Ptr create(Args&&... args)
+  {
+    return Ptr(new TransportSolution<BlockType>(std::forward<Args>(args)...));
+  }
+
+  /// @brief Add one of this rank's own local patches' field.
+  /// @param gid Global ID of the mesh block this field belongs to.
+  /// @param field The field for this patch (e.g. the solved angular flux).
+  void add_local_patch(int64_t gid, linalg::State field)
+  {
+    local_fields_[gid] = std::move(field);
+  }
+
+  /// @brief Reduce every local field to its scalar flux (0th angular moment)
+  /// via angular_qset_->integrate(). Returns a NEW TransportSolution holding
+  /// the result -- this instance is untouched. k_eff/gid2rank/angular_qset/
+  /// mesh carry over unchanged.
+  /// @param eps TT-rounding tolerance applied after the contraction.
+  /// @param max_rank TT-rounding max rank applied after the contraction.
+  /// @throws ttnte::utils::runtime_error If no angular quadrature set is
+  /// available (e.g. assemble() was never called on the originating driver).
+  Ptr compute_scalar_flux(double eps = 1e-10,
+    int64_t max_rank = std::numeric_limits<int64_t>::max()) const
+  {
+    if (!angular_qset_) {
+      throw utils::runtime_error(*this, error_context("compute_scalar_flux"),
+        "No angular quadrature set is available. Was assemble() called on "
+        "the originating driver?");
+    }
+
+    auto result = create(parallel::Communicator::world(), mesh_, angular_qset_,
+      k_eff_, /*has_angular_dependence=*/false);
+    for (const auto& [gid, field] : local_fields_) {
+      result->local_fields_[gid] =
+        angular_qset_->integrate(field, eps, max_rank);
+    }
+    return result;
+  }
+
+  /// @brief Select a single energy group, narrowing every local field's
+  /// energy axis (always the last core, regardless of whether angular
+  /// dependence has been reduced) down to size 1. Returns a NEW
+  /// TransportSolution holding the result -- this instance is untouched.
+  /// k_eff/gid2rank/angular_qset/mesh/has_angular_dependence carry over
+  /// unchanged. Works equally on the raw angular flux or an
+  /// already-spatial-only (compute_scalar_flux()'d) solution -- selecting a
+  /// group doesn't depend on angular reduction.
+  /// @param group Index of the energy group to keep (0-based).
+  /// @throws ttnte::utils::runtime_error If `group` is out of range for any
+  /// of this rank's own local fields.
+  Ptr select_group(int64_t group) const
+  {
+    auto result = create(parallel::Communicator::world(), mesh_, angular_qset_,
+      k_eff_, has_angular_dependence_);
+    for (const auto& [gid, field] : local_fields_) {
+      c10::SmallVector<int64_t, 6> m_modes =
+        std::visit([](const auto& engine) { return engine.get_m_modes(); },
+          field.get_variant());
+      int64_t energy_dim = static_cast<int64_t>(m_modes.size()) - 1;
+      int64_t num_groups = m_modes[energy_dim];
+
+      if (group < 0 || group >= num_groups) {
+        throw utils::runtime_error(*this, error_context("select_group"),
+          "group " + std::to_string(group) + " is out of range for GID " +
+            std::to_string(gid) + " (" + std::to_string(num_groups) +
+            " energy groups)");
+      }
+
+      result->local_fields_[gid] = field.narrow(energy_dim, group, 1);
+    }
+    return result;
+  }
+
+  /// @brief Find this rank's own mesh block and the reference's mesh block
+  /// for `gid`, plus the reference's local field -- the lookups shared by
+  /// compute_errors() and error_norm().
+  /// @throws ttnte::utils::runtime_error If no reference field, or no local
+  /// mesh block on either side, is found for `gid`.
+  std::tuple<typename Mesh::BlockTypePtr, typename Mesh::BlockTypePtr,
+    const linalg::State*>
+  find_error_inputs(int64_t gid, const TransportSolution& reference) const
+  {
+    auto ref_it = reference.local_fields_.find(gid);
+    if (ref_it == reference.local_fields_.end()) {
+      throw utils::runtime_error(*this, error_context("find_error_inputs"),
+        "No reference field found for local GID " + std::to_string(gid) +
+          " -- the reference TransportSolution must be distributed so that "
+          "every GID this rank owns is also local on the reference");
+    }
+
+    typename Mesh::BlockTypePtr block;
+    for (const auto& b : mesh_->get_blocks()) {
+      if (b->get_gid() == gid) {
+        block = b;
+        break;
+      }
+    }
+    if (!block) {
+      throw utils::runtime_error(*this, error_context("find_error_inputs"),
+        "No local mesh block found for GID " + std::to_string(gid));
+    }
+
+    typename Mesh::BlockTypePtr ref_block;
+    for (const auto& b : reference.mesh_->get_blocks()) {
+      if (b->get_gid() == gid) {
+        ref_block = b;
+        break;
+      }
+    }
+    if (!ref_block) {
+      throw utils::runtime_error(*this, error_context("find_error_inputs"),
+        "No reference mesh block found for GID " + std::to_string(gid));
+    }
+
+    return {block, ref_block, &ref_it->second};
+  }
+
+  /// @brief Per-energy-group squared numerator (weighted sum of squared
+  /// diff) and denominator (weighted sum of squared reference) for one
+  /// patch -- shared by compute_errors() (which takes sqrt per patch, no
+  /// MPI) and error_norm() (which sums across all local patches AND ranks
+  /// before taking sqrt once, for the whole-solution error).
+  ///
+  /// Because the two sides may live on different DOF grids, they are never
+  /// compared by subtracting DOF/control-point coefficients directly (only
+  /// valid when both bases are identical). Instead both are evaluated at
+  /// the finer side's own quadrature points first (see
+  /// compute_error_weights_impl() for why), then subtracted, squared, and
+  /// weighted -- with the energy axis left unreduced.
+  /// @return {numerator, denominator}, both length-num_groups tensors,
+  /// clamped to be non-negative (squares are mathematically non-negative;
+  /// tiny negative values can appear from floating-point noise when the
+  /// true value is ~0, e.g. comparing a solution against itself).
+  std::pair<torch::Tensor, torch::Tensor> compute_error_terms(
+    const typename Mesh::BlockTypePtr& block,
+    const typename Mesh::BlockTypePtr& ref_block, const linalg::State& field,
+    const linalg::State& ref_field) const
+  {
+    int64_t patch_ndim = block->get_ndim();
+    int64_t num_angular_cores = has_angular_dependence_
+                                  ? (angular_qset_->is_tensor_product() ? 2 : 1)
+                                  : 0;
+
+    // std::visit is needed ONLY to build the operators below -- it's the
+    // one place that must reach into engine-specific internals (cores,
+    // m_modes) to assemble new TT cores. Everything after this uses only
+    // the already format-generic Operator/State APIs (mv, arithmetic,
+    // to_dense()), so it lives outside the dispatch.
+    auto [eval_op, ref_eval_op, weight_op, num_groups] = std::visit(
+      [&](const auto& engine) -> std::tuple<linalg::Operator, linalg::Operator,
+                                linalg::Operator, int64_t> {
+        using EngineType = std::decay_t<decltype(engine)>;
+
+        if constexpr (std::is_same_v<EngineType, linalg::TTEngine>) {
+          const auto& m_modes = engine.get_m_modes();
+          int64_t num_groups = m_modes.back();
+          auto device = engine.get_device();
+          auto dtype = engine.get_dtype();
+
+          auto [basis, mapping, ref_basis] =
+            compute_error_weights<linalg::FormatType::TENSOR_TRAIN>(
+              block, ref_block);
+
+          // Shared identity(angle)/identity(energy) blocks, reused for both
+          // this field's and the reference's evaluation operator -- angular
+          // DOF count and number of groups are assumed identical between
+          // the two (only the spatial discretization may differ).
+          linalg::TTEngine::Tensors id_angle_cores;
+          linalg::TTEngine::Tensors weight_cores;
+
+          if (num_angular_cores > 0) {
+            c10::SmallVector<int64_t, 6> angle_modes(
+              m_modes.begin(), m_modes.begin() + num_angular_cores);
+            auto id_angle =
+              linalg::TTEngine::ones(angle_modes, device, dtype).diagonalize();
+            for (const auto& c : id_angle.get_cores()) {
+              id_angle_cores.push_back(c);
+            }
+
+            if (angular_qset_->is_tensor_product()) {
+              auto product_qset =
+                std::static_pointer_cast<math::ProductQuadrature>(
+                  angular_qset_);
+              for (const auto& w : product_qset->get_factored_weights()) {
+                weight_cores.push_back(w.reshape({1, 1, -1, 1}));
+              }
+            } else {
+              weight_cores.push_back(
+                angular_qset_->get_weights().reshape({1, 1, -1, 1}));
+            }
+          }
+
+          // mapping's cores are shaped as a value at each quadrature point
+          // (m = num_quad_points, n = 1); swap m/n so they act as a
+          // reduction operator, matching the angular weight convention.
+          for (int64_t d = 0; d < patch_ndim; d++) {
+            weight_cores.push_back(
+              mapping[d].permute({0, 2, 1, 3}).contiguous());
+          }
+
+          c10::SmallVector<int64_t, 6> energy_modes {num_groups};
+          auto id_energy =
+            linalg::TTEngine::ones(energy_modes, device, dtype).diagonalize();
+          weight_cores.push_back(id_energy[0]);
+
+          auto build_eval_op =
+            [&](const linalg::TTEngine& spatial_basis) -> linalg::Operator {
+            linalg::TTEngine::Tensors cores = id_angle_cores;
+            for (const auto& c : spatial_basis.get_cores()) {
+              cores.push_back(c);
+            }
+            cores.push_back(id_energy[0]);
+            linalg::TTEngine eval_engine(cores);
+            return linalg::Operator(eval_engine);
+          };
+
+          linalg::Operator eval_op = build_eval_op(basis);
+          linalg::Operator ref_eval_op = build_eval_op(ref_basis);
+          linalg::Operator weight_op =
+            linalg::Operator(linalg::TTEngine(weight_cores));
+
+          return {eval_op, ref_eval_op, weight_op, num_groups};
+        } else {
+          throw utils::runtime_error(*this, error_context("compute_errors"),
+            "This State format is not supported yet");
+        }
+      },
+      field.get_variant());
+
+    // Evaluate both sides at the shared (finer side's) quadrature points
+    // before comparing -- never subtract DOF/control-point coefficients
+    // directly, which is only valid when both bases are identical. All of
+    // this is generic Operator/State arithmetic -- mv()/State's own
+    // operators already dispatch on format internally, so none of this
+    // needs to be inside the visit above.
+    linalg::State at_quad_field = linalg::mv(eval_op, field);
+    linalg::State at_quad_ref = linalg::mv(ref_eval_op, ref_field);
+    linalg::State diff = at_quad_field - at_quad_ref;
+    linalg::State sq_diff = diff * diff;
+    linalg::State sq_ref = at_quad_ref * at_quad_ref;
+
+    // weight_op already reduces every angle/space mode down to size 1 via
+    // the mv() contraction itself (angular quadrature weight + the
+    // Jacobian-weighted spatial mapping), leaving only the energy axis -- so
+    // to_dense() + reshape is all that's needed, no further summation.
+    torch::Tensor numerator =
+      linalg::mv(weight_op, sq_diff).to_dense().reshape({num_groups});
+    torch::Tensor denominator =
+      linalg::mv(weight_op, sq_ref).to_dense().reshape({num_groups});
+
+    numerator.clamp_min_(0.0);
+    denominator.clamp_min_(0.0);
+
+    return {numerator, denominator};
+  }
+
+  /// @brief Per-patch, per-energy-group relative L2 error against a
+  /// reference TransportSolution, for this rank's own local patches only --
+  /// no MPI. Assumes shared geometry: the reference's mesh must have a
+  /// block for every GID this rank owns, on the SAME parametric domain, but
+  /// the reference's NURBS discretization (knot spans, polynomial degree)
+  /// may differ, e.g. a higher-fidelity verification solve.
+  /// @param reference The reference solution (e.g. a finer/higher-degree
+  /// solve of the same geometry). Must hold a local field for every GID this
+  /// rank owns, and must match this solution's has_angular_dependence_.
+  /// @return GID -> length-num_groups tensor of
+  /// sqrt(sum(diff^2) / sum(reference^2)) per group, properly angle- and
+  /// volume-weighted -- only for this rank's own local GIDs.
+  /// @throws ttnte::utils::runtime_error If has_angular_dependence_ doesn't
+  /// match `reference`'s, or no reference/mesh block is found for one of
+  /// this rank's own local GIDs.
+  std::unordered_map<int64_t, torch::Tensor> compute_errors(
+    const TransportSolution& reference) const
+  {
+    if (has_angular_dependence_ != reference.has_angular_dependence_) {
+      throw utils::runtime_error(*this, error_context("compute_errors"),
+        "This solution and the reference must both hold the same kind of "
+        "field (both angular flux, or both already reduced via "
+        "compute_scalar_flux())");
+    }
+
+    std::unordered_map<int64_t, torch::Tensor> result;
+    for (const auto& [gid, field] : local_fields_) {
+      auto [block, ref_block, ref_field] = find_error_inputs(gid, reference);
+      auto [numerator, denominator] =
+        compute_error_terms(block, ref_block, field, *ref_field);
+      result[gid] = (numerator / denominator).sqrt();
+    }
+    return result;
+  }
+
+  /// @brief Relative L2 error per energy group against a reference
+  /// TransportSolution, aggregated over EVERY local patch on EVERY rank --
+  /// always collective (every rank must call this; matches
+  /// solve_eigenvalue()'s own convergence-check pattern of a single small
+  /// iallreduce(SUM), not a gather of the full per-patch breakdown). Sums
+  /// the numerator and denominator across all local patches first (energy
+  /// axis left unreduced), combines across ranks with one iallreduce(SUM),
+  /// and takes sqrt of the combined ratio last -- the properly weighted
+  /// whole-solution error per group, not an average of per-patch ratios.
+  /// @param reference The reference solution (e.g. a finer/higher-degree
+  /// solve of the same geometry). Must hold a local field for every GID
+  /// every rank owns, and must match this solution's
+  /// has_angular_dependence_.
+  /// @return A length-num_groups tensor of sqrt(sum(diff^2) /
+  /// sum(reference^2)) per group, properly weighted and reduced over every
+  /// patch on every rank -- identical on every rank.
+  /// @throws ttnte::utils::runtime_error If has_angular_dependence_ doesn't
+  /// match `reference`'s, or no reference/mesh block is found for one of
+  /// this rank's own local GIDs.
+  torch::Tensor error_norm(const TransportSolution& reference) const
+  {
+    if (has_angular_dependence_ != reference.has_angular_dependence_) {
+      throw utils::runtime_error(*this, error_context("error_norm"),
+        "This solution and the reference must both hold the same kind of "
+        "field (both angular flux, or both already reduced via "
+        "compute_scalar_flux())");
+    }
+
+    torch::Tensor local_numerator, local_denominator;
+    int64_t local_num_groups = 0;
+
+    for (const auto& [gid, field] : local_fields_) {
+      auto [block, ref_block, ref_field] = find_error_inputs(gid, reference);
+      auto [numerator, denominator] =
+        compute_error_terms(block, ref_block, field, *ref_field);
+
+      if (local_num_groups == 0) {
+        local_numerator = numerator.clone();
+        local_denominator = denominator.clone();
+        local_num_groups = numerator.size(0);
+      } else {
+        local_numerator += numerator;
+        local_denominator += denominator;
+      }
+    }
+
+    int64_t num_groups = local_num_groups;
+    if (comm_.size() > 1) {
+      int64_t global_num_groups = 0;
+      comm_
+        .iallreduce(
+          &local_num_groups, &global_num_groups, 1, parallel::MPIOp::MAX)
+        .wait();
+      num_groups = global_num_groups;
+    }
+
+    if (!local_numerator.defined()) {
+      auto options = torch::TensorOptions().dtype(torch::kFloat64);
+      local_numerator = torch::zeros({num_groups}, options);
+      local_denominator = torch::zeros({num_groups}, options);
+    }
+
+    // Combine [numerator | denominator] into one buffer for a single
+    // iallreduce, generalizing the same combined-reduction pattern
+    // TransportDriver::solve_eigenvalue()'s own convergence check uses, now
+    // per-group instead of scalar. The Communicator's iallreduce only
+    // supports double buffers, but local_numerator/local_denominator carry
+    // whatever dtype the solve itself used (e.g. float32) -- cast for the
+    // wire, then cast the reduced result back.
+    torch::Tensor local_sums = torch::cat({local_numerator, local_denominator});
+    torch::ScalarType result_dtype = local_sums.scalar_type();
+    torch::Tensor global_sums = local_sums;
+    if (comm_.size() > 1) {
+      torch::Tensor local_sums_f64 = local_sums.to(torch::kFloat64);
+      torch::Tensor global_sums_f64 = torch::empty_like(local_sums_f64);
+      comm_
+        .iallreduce(local_sums_f64.data_ptr<double>(),
+          global_sums_f64.data_ptr<double>(),
+          static_cast<int>(local_sums_f64.numel()), parallel::MPIOp::SUM)
+        .wait();
+      global_sums = global_sums_f64.to(result_dtype);
+    }
+
+    torch::Tensor numerator =
+      global_sums.narrow(0, 0, num_groups).clamp_min(0.0);
+    torch::Tensor denominator =
+      global_sums.narrow(0, num_groups, num_groups).clamp_min(0.0);
+
+    return (numerator / denominator).sqrt();
+  }
+
+  /// @brief Volume-averaged field on a regular Cartesian grid, via
+  /// composite trapezoidal integration over `n` sub-points per cell.
+  /// Requires this solution to be spatial-only (the result of
+  /// compute_scalar_flux()). Assumes axis-aligned boundaries -- composite
+  /// trapezoidal integration treats each grid cell as a plain box, matching
+  /// the same caveat the legacy ttnte/iga/mesh.py implementation this
+  /// generalizes documents.
+  ///
+  /// Always collective (every rank must call this): every rank redundantly
+  /// builds the identical regular grid -- the physical domain's bounding
+  /// box is auto-computed via one small iallreduce(MIN)/iallreduce(MAX)
+  /// over each rank's own local patches' bboxes (no geometry ever crosses
+  /// ranks, just phys_dim-sized scalars). For each of THIS rank's own local
+  /// patches, candidate grid points inside that patch's (padded) bbox are
+  /// inverse-mapped and evaluated locally (bbox padding absorbs
+  /// floating-point boundary mismatches between neighboring patches,
+  /// matching the legacy tolerance). Because two neighboring patches'
+  /// padded bboxes can overlap even when the patches themselves don't,
+  /// grid-point ownership is resolved via iallreduce(MIN) on the
+  /// Newton-Raphson residual (every rank learns the globally-best residual
+  /// per point), then iallreduce(SUM) on a winner-only contribution (every
+  /// rank ends up with the same, ownership-resolved field value at every
+  /// grid point; ties are vanishingly unlikely with independent
+  /// floating-point residuals from geometrically distinct patches and
+  /// aren't specially handled).
+  /// @param shape Number of cells along each axis; its length fixes the
+  /// dimensionality (1, 2, or 3).
+  /// @param n Number of sub-points per cell, per axis, for trapezoidal
+  /// integration (must be > 1 in every axis); same length as `shape`.
+  /// @param max_iter Max Newton-Raphson iterations for Patch::inverse_map().
+  /// Every candidate point that's inside a patch's bounding box but outside
+  /// the patch's actual (possibly curved) boundary can never converge, so
+  /// it burns every iteration regardless of this cap -- keep this low
+  /// (genuine points converge in well under 10 iterations once seeded via
+  /// seed_resolution) rather than raising it to chase spurious non-converged
+  /// points.
+  /// @param tol Convergence tolerance for Patch::inverse_map().
+  /// @param seed_resolution Points per parametric axis for Patch::
+  /// inverse_map()'s coarse-grid seeding (see DEFAULT_INVERSE_MAP_SEED_
+  /// RESOLUTION). Raise this if the "not covered by any patch" error below
+  /// fires spuriously -- e.g. a grid point genuinely on the mesh but near a
+  /// coordinate singularity or a multi-patch corner can need a finer seed
+  /// than the default to keep Newton-Raphson in the right basin.
+  /// @return A tensor of shape (*shape, num_groups): the volume-averaged
+  /// field per cell per group, identical on every rank.
+  /// @throws ttnte::utils::runtime_error If this solution still carries
+  /// angular dependence, if `shape`/`n` sizes mismatch or any `n[d] <= 1`,
+  /// or if some grid point is not covered by any patch on any rank.
+  torch::Tensor regular_mesh_average(c10::SmallVector<int64_t, 3> shape,
+    c10::SmallVector<int64_t, 3> n, int64_t max_iter = 10, double tol = 1e-8,
+    int64_t seed_resolution = cad::DEFAULT_INVERSE_MAP_SEED_RESOLUTION) const
+  {
+    if (has_angular_dependence_) {
+      throw utils::runtime_error(*this, error_context("regular_mesh_average"),
+        "This solution must be spatial-only -- call compute_scalar_flux() "
+        "first");
+    }
+    if (shape.size() != n.size()) {
+      throw utils::runtime_error(*this, error_context("regular_mesh_average"),
+        "`shape` and `n` must have the same length");
+    }
+    int64_t phys_dim = static_cast<int64_t>(shape.size());
+    for (int64_t d = 0; d < phys_dim; d++) {
+      if (n[d] <= 1) {
+        throw utils::runtime_error(*this, error_context("regular_mesh_average"),
+          "Every entry of `n` must be > 1");
+      }
+    }
+
+    constexpr double bbox_padding = 5e-5;
+    auto options = torch::TensorOptions().dtype(torch::kFloat64);
+
+    // -- Global bounding box: local min/max over this rank's own patches,
+    // combined across ranks via one iallreduce(MIN)/iallreduce(MAX) (tiny,
+    // phys_dim-sized -- no geometry crosses ranks).
+    torch::Tensor local_min =
+      torch::full({phys_dim}, std::numeric_limits<double>::infinity(), options);
+    torch::Tensor local_max = torch::full(
+      {phys_dim}, -std::numeric_limits<double>::infinity(), options);
+    for (const auto& block : mesh_->get_blocks()) {
+      torch::Tensor bbox = block->get_bbox().to(options);
+      local_min = torch::minimum(local_min, bbox[0]);
+      local_max = torch::maximum(local_max, bbox[1]);
+    }
+
+    torch::Tensor global_min = local_min.clone();
+    torch::Tensor global_max = local_max.clone();
+    if (comm_.size() > 1) {
+      comm_
+        .iallreduce(local_min.data_ptr<double>(), global_min.data_ptr<double>(),
+          phys_dim, parallel::MPIOp::MIN)
+        .wait();
+      comm_
+        .iallreduce(local_max.data_ptr<double>(), global_max.data_ptr<double>(),
+          phys_dim, parallel::MPIOp::MAX)
+        .wait();
+    }
+
+    // -- Build the regular grid: per-axis (shape[d], n[d]) sub-point arrays
+    // (one independent linspace per cell, not one grid-wide linspace), then
+    // their ND tensor product gives every physical sample point.
+    std::vector<torch::Tensor> axis_flat;
+    axis_flat.reserve(phys_dim);
+    for (int64_t d = 0; d < phys_dim; d++) {
+      torch::Tensor edges = torch::linspace(global_min[d].item<double>(),
+        global_max[d].item<double>(), shape[d] + 1, options);
+      torch::Tensor left = edges.narrow(0, 0, shape[d]);
+      torch::Tensor width = edges.diff();
+      torch::Tensor t = torch::linspace(0.0, 1.0, n[d], options);
+      torch::Tensor axis_points =
+        left.unsqueeze(1) + width.unsqueeze(1) * t.unsqueeze(0);
+      axis_flat.push_back(axis_points.flatten());
+    }
+
+    std::vector<torch::Tensor> grids = torch::meshgrid(axis_flat, "ij");
+    torch::Tensor points =
+      torch::stack(grids, -1); // (L0, ..., L_{d-1}, phys_dim)
+    int64_t total_points = points.numel() / phys_dim;
+    torch::Tensor flat_points = points.reshape({total_points, phys_dim});
+
+    // -- Determine num_groups (even if this rank owns zero local patches).
+    int64_t local_num_groups = 0;
+    if (!local_fields_.empty()) {
+      const auto& [any_gid, any_field] = *local_fields_.begin();
+      typename Mesh::BlockTypePtr any_block;
+      for (const auto& b : mesh_->get_blocks()) {
+        if (b->get_gid() == any_gid) {
+          any_block = b;
+          break;
+        }
+      }
+      torch::Tensor dense = any_field.to_dense();
+      local_num_groups = dense.size(any_block->get_ndim());
+    }
+    int64_t num_groups = local_num_groups;
+    if (comm_.size() > 1) {
+      int64_t global_num_groups = 0;
+      comm_
+        .iallreduce(
+          &local_num_groups, &global_num_groups, 1, parallel::MPIOp::MAX)
+        .wait();
+      num_groups = global_num_groups;
+    }
+
+    // -- For each of this rank's own local patches: bbox-filter candidate
+    // grid points, inverse-map, and evaluate locally.
+    torch::Tensor local_residual = torch::full(
+      {total_points}, std::numeric_limits<double>::infinity(), options);
+    torch::Tensor local_values =
+      torch::zeros({total_points, num_groups}, options);
+
+    for (const auto& block : mesh_->get_blocks()) {
+      torch::Tensor padded_bbox = block->get_bbox(bbox_padding).to(options);
+      torch::Tensor bbox_min = padded_bbox[0];
+      torch::Tensor bbox_max = padded_bbox[1];
+
+      torch::Tensor in_bbox =
+        torch::logical_and((flat_points >= bbox_min.unsqueeze(0)).all(-1),
+          (flat_points <= bbox_max.unsqueeze(0)).all(-1));
+      torch::Tensor candidate_idx = in_bbox.nonzero().squeeze(-1);
+      if (candidate_idx.numel() == 0) {
+        continue;
+      }
+
+      torch::Tensor candidate_points =
+        flat_points.index_select(0, candidate_idx);
+      auto imr = block->inverse_map(
+        candidate_points, max_iter, tol, std::nullopt, seed_resolution);
+
+      torch::Tensor converged_local_idx = imr.converged.nonzero().squeeze(-1);
+      if (converged_local_idx.numel() == 0) {
+        continue;
+      }
+
+      torch::Tensor converged_global_idx =
+        candidate_idx.index_select(0, converged_local_idx);
+      torch::Tensor converged_coords =
+        imr.coords.index_select(0, converged_local_idx);
+      torch::Tensor converged_residual =
+        imr.residual.index_select(0, converged_local_idx);
+
+      torch::Tensor values = evaluate_field_at_points(
+        block, local_fields_.at(block->get_gid()), converged_coords);
+
+      local_residual.index_copy_(0, converged_global_idx, converged_residual);
+      local_values.index_copy_(0, converged_global_idx, values);
+    }
+
+    // -- Resolve ownership across ranks: MIN residual, then SUM the
+    // winner-only contribution.
+    torch::Tensor global_residual = local_residual;
+    if (comm_.size() > 1) {
+      global_residual = torch::empty_like(local_residual);
+      comm_
+        .iallreduce(local_residual.data_ptr<double>(),
+          global_residual.data_ptr<double>(), total_points,
+          parallel::MPIOp::MIN)
+        .wait();
+    }
+
+    if (torch::isinf(global_residual).any().item<bool>()) {
+      throw utils::runtime_error(*this, error_context("regular_mesh_average"),
+        "At least one grid point is not covered by any patch on any rank");
+    }
+
+    torch::Tensor is_winner = (local_residual <= global_residual)
+                                .unsqueeze(-1)
+                                .to(local_values.dtype());
+    torch::Tensor contribution = local_values * is_winner;
+
+    torch::Tensor global_values = contribution;
+    if (comm_.size() > 1) {
+      global_values = torch::empty_like(contribution);
+      comm_
+        .iallreduce(contribution.data_ptr<double>(),
+          global_values.data_ptr<double>(), total_points * num_groups,
+          parallel::MPIOp::SUM)
+        .wait();
+    }
+
+    // -- Composite trapezoidal integration per cell: reshape the flat
+    // per-point values back into (shape_0, n_0, ..., shape_{d-1}, n_{d-1},
+    // num_groups) and weight/sum only the per-axis sub-point dimensions.
+    c10::SmallVector<int64_t, 8> full_shape;
+    full_shape.reserve(2 * phys_dim + 1);
+    for (int64_t d = 0; d < phys_dim; d++) {
+      full_shape.push_back(shape[d]);
+      full_shape.push_back(n[d]);
+    }
+    full_shape.push_back(num_groups);
+    torch::Tensor reshaped_values = global_values.reshape(full_shape);
+
+    // Composite trapezoidal weight per axis: 1/2 at the two ends, 1
+    // elsewhere; the combined ND weight is the outer product across axes.
+    torch::Tensor weight;
+    double normalization = 1.0;
+    for (int64_t d = 0; d < phys_dim; d++) {
+      torch::Tensor w = torch::ones({n[d]}, options);
+      w[0] = 0.5;
+      w[n[d] - 1] = 0.5;
+      normalization *= static_cast<double>(n[d] - 1);
+
+      c10::SmallVector<int64_t, 8> w_shape(2 * phys_dim + 1, 1);
+      w_shape[2 * d + 1] = n[d];
+      torch::Tensor w_broadcast = w.reshape(w_shape);
+      weight = weight.defined() ? weight * w_broadcast : w_broadcast;
+    }
+
+    torch::Tensor weighted = reshaped_values * weight;
+
+    std::vector<int64_t> sum_dims;
+    sum_dims.reserve(phys_dim);
+    for (int64_t d = 0; d < phys_dim; d++) {
+      sum_dims.push_back(2 * d + 1);
+    }
+    // Summing the sub-point axes leaves the cell axes and num_groups in
+    // their original relative order.
+    torch::Tensor cell_sums = weighted.sum(sum_dims);
+
+    return cell_sums / normalization;
+  }
+
+  // =================================================================
+  // Public getters / setters
+  /// @return The label of the solution.
+  const Label& get_label() const noexcept { return label_; }
+  /// @return The converged k-eigenvalue, if set.
+  std::optional<double> get_k_eff() const noexcept { return k_eff_; }
+  /// @return GID -> owning rank, for every GID in the whole mesh. Delegates
+  /// to mesh_'s own gid2rank_ -- see Mesh::get_gid2rank().
+  const std::unordered_map<int64_t, int>& get_gid2rank() const noexcept
+  {
+    return mesh_->get_gid2rank();
+  }
+
+  /// @brief Get this rank's own local field for a GID (no MPI). Call
+  /// .to_dense() on the result for a dense tensor.
+  /// @param gid Global ID of the mesh block.
+  /// @throws ttnte::utils::runtime_error If GID is not local to this rank.
+  const linalg::State& get_local_field(int64_t gid) const
+  {
+    auto it = local_fields_.find(gid);
+    if (it == local_fields_.end()) {
+      throw utils::runtime_error(*this, error_context("get_local_field"),
+        "GID " + std::to_string(gid) + " is not local to this rank");
+    }
+    return it->second;
+  }
+};
+
+} // namespace ttnte::driver

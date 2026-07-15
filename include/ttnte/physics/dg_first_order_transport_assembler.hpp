@@ -43,6 +43,9 @@ protected:
   BoundaryOps outflow_ops_;
   /// Inflow boundary operator.
   BoundaryOps inflow_ops_;
+  /// Outgoing partial-current reduction operator per face (only defined for
+  /// INTERNAL faces -- see NeighborCoupling::current_op).
+  BoundaryOps current_ops_;
   /// Source vector for fixed source problems.
   linalg::State source_;
 
@@ -143,6 +146,7 @@ public:
     conditions.reserve(2 * NumDim);
     outflow_ops_.reserve(2 * NumDim);
     inflow_ops_.reserve(2 * NumDim);
+    current_ops_.reserve(2 * NumDim);
 
     for (int64_t dim = 0; dim < NumDim; dim++) {
       for (bool is_upper : {false, true}) {
@@ -156,6 +160,7 @@ public:
         // Pass them to outflow and inflow
         outflow_ops_.push_back(std::get<0>(boundary_tuple));
         inflow_ops_.push_back(std::get<1>(boundary_tuple));
+        current_ops_.push_back(std::get<2>(boundary_tuple));
 
         // Save the boundary condition
         conditions.push_back(
@@ -201,6 +206,7 @@ public:
               coupling.fid = face_idx;
               coupling.connection = conn;
               coupling.boundary_op = inflow_ops_[face_idx];
+              coupling.current_op = current_ops_[face_idx];
               coupling.dim = static_cast<size_t>(dim);
               coupling.is_upper = is_upper;
               coupling.recv_buffer = linalg::State();
@@ -246,6 +252,9 @@ public:
   const BoundaryOps& get_outflow_ops() const noexcept { return outflow_ops_; }
   /// @return The inflow boundary operators for each boundary.
   const BoundaryOps& get_inflow_ops() const noexcept { return inflow_ops_; }
+  /// @return The outgoing partial-current reduction operators for each
+  /// boundary (only defined for INTERNAL faces).
+  const BoundaryOps& get_current_ops() const noexcept { return current_ops_; }
   /// @return Get the fixed source.
   const linalg::State& get_source() const noexcept { return source_; }
 

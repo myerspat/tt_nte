@@ -1,4 +1,6 @@
 #include "ttnte/math/quadrature_set.hpp"
+#include "ttnte/linalg/operator.hpp"
+#include "ttnte/linalg/ops.hpp"
 #include "ttnte/python/numpy.hpp"
 #include <numbers>
 
@@ -18,6 +20,80 @@ void QuadratureSet::to_(const torch::ScalarType& dtype)
 void QuadratureSet::to_(const torch::Device& device)
 {
   to_(torch::TensorOptions().device(device));
+}
+
+linalg::State QuadratureSet::integrate(
+  const linalg::State& state, double eps, int64_t max_rank) const
+{
+  return std::visit(
+    [&](const auto& engine) -> linalg::State {
+      using EngineType = std::decay_t<decltype(engine)>;
+
+      if constexpr (std::is_same_v<EngineType, linalg::TTEngine>) {
+        // The quadrature set's own weights may live on a different device
+        // than `state` -- e.g. angular quadrature data is deliberately kept
+        // on CPU (it's tiny) while the solved state is GPU-resident under
+        // some MemoryPolicy. Guard against that mismatch by moving the
+        // weights to match `state`'s own device/dtype -- a no-op (no copy)
+        // if they already coincide, which callers that expect to call this
+        // every iteration should arrange up front (e.g.
+        // TransportDriver::solve_eigenvalue() pre-moves angular_qset_ to
+        // the solve's device before its outer loop) rather than relying on
+        // this per-call guard to do the transfer repeatedly.
+        auto device = engine.get_device();
+        auto dtype = engine.get_dtype();
+
+        // Build one weight core per angular dimension: shape (1, 1, n, 1) so
+        // that applying it via mv() reduces that core's m-mode from n down
+        // to 1.
+        linalg::TTEngine::Tensors weight_cores;
+        int64_t num_angular_cores;
+
+        if (is_tensor_product_) {
+          const auto& product_qset =
+            static_cast<const ProductQuadrature&>(*this);
+          for (const auto& weights : product_qset.get_factored_weights()) {
+            weight_cores.push_back(
+              weights.to(device, dtype).reshape({1, 1, -1, 1}));
+          }
+          num_angular_cores = static_cast<int64_t>(weight_cores.size());
+        } else {
+          weight_cores.push_back(
+            get_weights().to(device, dtype).reshape({1, 1, -1, 1}));
+          num_angular_cores = 1;
+        }
+
+        const auto& m_modes = engine.get_m_modes();
+        if (static_cast<int64_t>(m_modes.size()) <= num_angular_cores) {
+          throw utils::runtime_error("ttnte::math::QuadratureSet::integrate",
+            "The given State does not have enough cores for this "
+            "quadrature's angular dimensions");
+        }
+        c10::SmallVector<int64_t, 6> rest_modes(
+          m_modes.begin() + num_angular_cores, m_modes.end());
+
+        // Identity operator over the remaining (e.g. space + energy) cores.
+        linalg::TTEngine identity_op =
+          linalg::TTEngine::ones(rest_modes, device, dtype).diagonalize();
+
+        linalg::Operator op(linalg::TTEngine(weight_cores).kron(identity_op));
+        linalg::State result = linalg::mv(op, state);
+
+        // Fold the now-trivial (size-1) angular core(s) into the rest of the
+        // chain.
+        linalg::TTEngine result_tt = result.as_tt();
+        for (int64_t i = 0; i < num_angular_cores; i++) {
+          result_tt.contract_rank_dim_(0);
+        }
+        result_tt.round_(eps, max_rank);
+
+        return linalg::State(std::move(result_tt));
+      } else {
+        throw utils::runtime_error("ttnte::math::QuadratureSet::integrate",
+          "This State format is not supported yet");
+      }
+    },
+    state.get_variant());
 }
 
 QuadratureSet1D::Ptr QuadratureSet1D::gauss_legendre(

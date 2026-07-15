@@ -182,6 +182,54 @@ def research_reactor(is_anisotropic: bool = False, device=None, dtype=None):
         return [fuel.label, water.label], xs_server
 
 
+def u235(device=None, dtype=None):
+    """
+    One-group heterogeneous XSs from Tables 9 (b, refl) of the `analytical benchmark test set
+    for criticality code verification <https://www-sciencedirec
+    t-com.proxy.lib.umich.edu/science/article/pii/S0149197002000987?fr=RR-2&ref=pd
+    f_download&rr=94263cf04882e830>`_. The XS set include ``"U-235"`` and ``"H2O"``.
+
+    Parameters
+    ----------
+    device: torch.device or None, default=None
+        The device to put the server on. If it is none then we use the default.
+    dtype: torch.dtype or None, default=None
+        The data type for the server. If it is none then we use the default.
+
+    Returns
+    -------
+    ttnte.xs.MaterialLabel or list of ttnte.xs.Material
+        The labels for the materials (U-235 then H2O).
+    ttnte.xs.Server
+        XS data server object.
+    """
+    device = torch.get_default_device() if device == None else device
+    dtype = torch.get_default_dtype() if dtype == None else dtype
+
+    u235 = Material("U-235")
+    u235.chi = torch.tensor([1.0], device=device, dtype=dtype)
+    u235.total = torch.tensor([0.32640], device=device, dtype=dtype)
+    u235.nu_fission = torch.tensor([2.707308 * 0.065280], device=device, dtype=dtype)
+    u235.fission = torch.tensor([0.065280], device=device, dtype=dtype)
+    u235.scatter_gtg = torch.tensor([[[0.248064]]], device=device, dtype=dtype)
+    u235.finalize()
+
+    water = Material("H2O")
+    water.chi = torch.zeros(1, device=device, dtype=dtype)
+    water.total = torch.tensor([0.32640])
+    water.nu_fission = torch.zeros(1, device=device, dtype=dtype)
+    water.fission = torch.zeros(1, device=device, dtype=dtype)
+    water.scatter_gtg = torch.tensor([[[0.293760]]])
+    water.finalize()
+
+    xs_server = Server()
+    xs_server.add_material(u235)
+    xs_server.add_material(water)
+    xs_server.finalize()
+
+    return [u235.label, water.label], xs_server
+
+
 def c5g7(device=None, dtype=None):
     """
     XSs for the `seven-group C5G7 neutronics benchmark <https://www.oecd-nea.org

@@ -1,6 +1,5 @@
 #include "ttnte/parallel/communicator.hpp"
 #include "ttnte/parallel/mpi_types.hpp"
-#include <cstddef>
 #include <mpi.h>
 
 namespace {

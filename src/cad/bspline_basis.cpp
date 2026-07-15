@@ -104,9 +104,14 @@ BSplineBasis BSplineBasis::clone() const
 
 torch::Tensor BSplineBasis::find_spans(const torch::Tensor& u) const
 {
-  // Find start of span threshold index in knotvector
-  auto span_idxs =
-    torch::searchsorted(knotvector_.to(u.options()), u, false, true) - 1;
+  // Find start of span threshold index in knotvector. searchsorted's value
+  // tensor must be contiguous -- callers often pass a sliced/strided view
+  // (e.g. one parametric column of a larger points tensor), which would
+  // otherwise silently trigger a one-time PyTorch performance warning and
+  // an extra internal copy on every call anyway.
+  auto span_idxs = torch::searchsorted(
+                     knotvector_.to(u.options()), u.contiguous(), false, true) -
+                   1;
   return torch::clamp(span_idxs, degree_, get_size() - 1);
 }
 

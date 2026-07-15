@@ -1,0 +1,54 @@
+#pragma once
+
+#include "ttnte/linalg/format_type.hpp"
+#include "ttnte/linalg/linear_system.hpp"
+#include <memory>
+namespace ttnte::solvers {
+
+/// @brief Common interface for anything that can solve a set of local linear
+/// systems -- a DDSolver (domain decomposition) or a bare LocalSolver (e.g.
+/// AMEnSolver, for a single-patch problem), interchangeably from the
+/// caller's perspective.
+class Solver {
+public:
+  // =================================================================
+  // Public types
+  using Ptr = std::shared_ptr<Solver>;
+  using Systems = std::vector<linalg::LinearSystem::Ptr>;
+
+  virtual ~Solver() = default;
+
+  // =================================================================
+  // Public methods
+  /// @brief Register the systems this solver is responsible for.
+  virtual void init(const Systems& local_systems) = 0;
+  /// @brief Block until one-time worker-thread setup has completed. No-op by
+  /// default.
+  virtual void wait_for_thread_init() {}
+  /// @brief Advance the solve by one call (semantics are solver-specific).
+  virtual void step() = 0;
+  /// @brief Release any solver-held resources (e.g. GPU memory). No-op by
+  /// default.
+  virtual void finalize() {}
+  /// @brief Generic hook for an external convergence signal. No-op by
+  /// default -- solvers with their own internal convergence signal (e.g.
+  /// DDSolver) should leave this unoverridden; solvers without one (e.g.
+  /// LocalSolver) use it to drive their own forcing.
+  virtual void update_convergence_criteria(double error) {}
+
+  // =================================================================
+  // Public getters / setters
+  virtual const Systems& get_local_systems() const = 0;
+  virtual void set_local_systems(const Systems& local_systems) = 0;
+  /// @return The tensor format this solver represents state in.
+  virtual linalg::FormatType get_state_format() = 0;
+  /// @return The current truncation tolerance of the solver.
+  virtual double get_eps() const { return 0.0; }
+  /// @return The maximum rank.
+  virtual int64_t get_max_rank() const
+  {
+    return std::numeric_limits<int64_t>::max();
+  }
+};
+
+} // namespace ttnte::solvers

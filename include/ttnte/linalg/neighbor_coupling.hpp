@@ -25,6 +25,13 @@ struct NeighborCoupling {
   mesh::NeighborInfo connection;
   /// Inflow operator assembled with n_mode=1 at the boundary spatial core.
   Operator boundary_op;
+  /// Reduces a boundary-narrowed angular-flux State to the outgoing partial
+  /// current at this face (angular core(s) folded away via the (Omega . n)_+
+  /// upwind mask times the angular quadrature weights; identity over the
+  /// already boundary-narrowed spatial dimensions and energy). Used only by
+  /// LocalSolver::postsolve() as a Schwarz convergence indicator -- not part
+  /// of the actual PDE operator, unlike boundary_op.
+  Operator current_op;
   /// Physical dimension index of the INTERNAL face (0, 1, ..., NumDim-1).
   size_t dim;
   /// True if the face is the upper face along dim, false if lower.

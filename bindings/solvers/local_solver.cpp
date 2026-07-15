@@ -1,4 +1,5 @@
 #include "ttnte/solvers/local_solver.hpp"
+#include "ttnte/solvers/solver.hpp"
 #include <torch/extension.h>
 
 namespace py = pybind11;
@@ -17,13 +18,21 @@ public:
       local_system          /* Argument(s) */
     );
   }
+
+  // LocalSolver leaves get_state_format() unimplemented (pure virtual on
+  // Solver), so the trampoline must override it too to remain concrete.
+  ttnte::linalg::FormatType get_state_format() override
+  {
+    PYBIND11_OVERRIDE_PURE(
+      ttnte::linalg::FormatType, LocalSolver, get_state_format);
+  }
 };
 
 void register_LocalSolver(py::module_& m)
 {
   using namespace ttnte::solvers;
 
-  py::class_<LocalSolver, PyLocalSolver, std::shared_ptr<LocalSolver>>(
+  py::class_<LocalSolver, Solver, PyLocalSolver, std::shared_ptr<LocalSolver>>(
     m, "LocalSolver")
     // =================================================================
     // Public methods
@@ -32,11 +41,5 @@ void register_LocalSolver(py::module_& m)
     .def("presolve", &LocalSolver::presolve, py::arg("local_system"),
       py::call_guard<py::gil_scoped_release>())
     .def("postsolve", &LocalSolver::postsolve, py::arg("local_system"),
-      py::arg("x"), py::call_guard<py::gil_scoped_release>())
-
-    // =================================================================
-    // Public getters / setters
-    .def_property("eps", &LocalSolver::get_eps, &LocalSolver::set_eps)
-    .def_property(
-      "max_rank", &LocalSolver::get_max_rank, &LocalSolver::set_max_rank);
+      py::arg("x"), py::call_guard<py::gil_scoped_release>());
 }

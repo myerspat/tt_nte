@@ -57,5 +57,6 @@ void register_Mesh(py::module_& m, const std::string& typestr)
     .def_property("label", &Mesh::get_label, &Mesh::set_label)
     .def_property_readonly("num_blocks", &Mesh::get_num_blocks)
     .def_property_readonly("blocks", &Mesh::get_blocks)
-    .def_property_readonly("bbox", &Mesh::get_bbox);
+    .def_property_readonly("bbox", &Mesh::get_bbox)
+    .def_property_readonly("gid2rank", &Mesh::get_gid2rank);
 }

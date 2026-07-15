@@ -554,8 +554,6 @@ class AxesStyle(SerializableStyle):
     labels_off: bool = False
 
     # --- Interactive Controls ---
-    box: bool = False
-    box_args: dict | None = None
     viewport: Sequence[float] = (0.0, 0.0, 0.2, 0.2)
 
 

@@ -331,22 +331,12 @@ protected:
   /// Caching struct for format specific data.
   BackendCache<cad::Patch, DGAssemblerConfig, Fmt, NumDim> cache_;
 
-public:
+private:
   // =================================================================
-  // Public constructors
-  DGFirstOrderTransportBackend(const cad::Patch::Ptr& block,
-    const math::QuadratureSet::Ptr& angular_qset,
-    const xs::Server::Ptr& xs_server,
-    const DGTransportAssemblerConfig& config = DGTransportAssemblerConfig())
-    : DGFirstOrderTransportBackend(block, angular_qset,
-        xs_server->get_material(block->get_fill_id()), config)
-  {}
-
-  DGFirstOrderTransportBackend(const cad::Patch::Ptr& block,
-    const math::QuadratureSet::Ptr& angular_qset, const xs::Material& material,
-    const DGTransportAssemblerConfig& config = DGTransportAssemblerConfig())
-    : DGBackend<cad::Patch, DGTransportAssemblerConfig>(block, config),
-      angular_qset_(angular_qset), material_(&material), cache_(block, config)
+  // Private methods
+  /// @brief Shared initialization of spatial_qset_/quad_points_ from the
+  /// block's own basis -- purely geometric, no material/xs dependency.
+  void init_spatial_quadrature_()
   {
     // Sanity check the number of dimensions
     TORCH_CHECK(block_->get_ndim() == NumDim,
@@ -357,8 +347,8 @@ public:
     math::ProductQuadrature::Quads spatial_quads;
 
     auto options = c10::TensorOptions()
-                     .device(block->get_device())
-                     .dtype(block->get_dtype());
+                     .device(block_->get_device())
+                     .dtype(block_->get_dtype());
 
     // Iterate through each dimension
     for (const auto& basis : block_->get_basis()) {
@@ -384,6 +374,101 @@ public:
     spatial_qset_ = math::ProductQuadrature::create(spatial_quads);
   }
 
+  /// @brief Build the raw (Omega . n)_+/- upwind mask. For NumDim == 1 this
+  /// is angular-only. For NumDim > 1 it also carries the face's own
+  /// tangential-dimension dependence (the outward normal varies pointwise
+  /// along a curved IGA boundary), evaluated at FACE QUADRATURE points --
+  /// i.e. cores [2, NumDim+1) are NOT yet expressed in the DOF/control-point
+  /// basis; see project_boundary_mask() for that step. Factored out of
+  /// assemble_interface_boundary_operator() (which continues on to project
+  /// this against the DG basis and integrate over the face) so that method
+  /// and assemble_boundary_operators()'s current-reduction operator (which
+  /// instead just folds in the angular quadrature weights, for
+  /// LocalSolver::postsolve()'s Schwarz convergence check) share this
+  /// construction without duplicating the ordinate/TT-cross logic.
+  /// @param normal Outward normal at this boundary face, per dimension --
+  /// varies pointwise along the face for a curved IGA patch, not a single
+  /// fixed direction.
+  /// @param is_outflow True for (Omega . n)_+ (outflow), false for
+  /// (Omega . n)_- (inflow).
+  auto assemble_upwind_mask(
+    const typename Return<Fmt, NumDim>::VectorType& normal, bool is_outflow)
+    -> ReturnType;
+
+  /// @brief Project a mask's tangential (face-quadrature) cores -- indices
+  /// [2, NumDim+1) -- onto the DG basis, turning them into proper DOF-space
+  /// (m=n=ctrlpts) matrix cores. This is the exact treatment
+  /// assemble_interface_boundary_operator() applies when building B_out/B_in;
+  /// factored out here so assemble_boundary_operators()'s current-reduction
+  /// operator can apply the identical projection to its own angular-weighted
+  /// mask without duplicating the einsum logic (only NumDim > 1 has
+  /// tangential cores to project at all -- see assemble_upwind_mask()).
+  /// Angular cores (indices 0, 1) are left untouched.
+  /// @param mask Angular(+face-tangential-quadrature) mask -- e.g. the raw
+  /// output of assemble_upwind_mask(), optionally with apply_angular_weights()
+  /// already applied.
+  /// @param basis Per-tangential-dim DG basis matrices.
+  /// @param mapping Per-tangential-dim quadrature-weighted affine mapping.
+  auto project_boundary_mask(linalg::TTEngine mask, const ReturnType& basis,
+    const ReturnType& mapping) -> ReturnType;
+
+public:
+  // =================================================================
+  // Public constructors
+  DGFirstOrderTransportBackend(const cad::Patch::Ptr& block,
+    const math::QuadratureSet::Ptr& angular_qset,
+    const xs::Server::Ptr& xs_server,
+    const DGTransportAssemblerConfig& config = DGTransportAssemblerConfig())
+    : DGFirstOrderTransportBackend(block, angular_qset,
+        xs_server->get_material(block->get_fill_id()), config)
+  {}
+
+  DGFirstOrderTransportBackend(const cad::Patch::Ptr& block,
+    const math::QuadratureSet::Ptr& angular_qset, const xs::Material& material,
+    const DGTransportAssemblerConfig& config = DGTransportAssemblerConfig())
+    : DGBackend<cad::Patch, DGTransportAssemblerConfig>(block, config),
+      angular_qset_(angular_qset), material_(&material), cache_(block, config)
+  {
+    init_spatial_quadrature_();
+  }
+
+  /// @brief Construct a backend with no material -- only valid for the
+  /// purely-geometric methods (assemble_basis(), assemble_integral_mapping(),
+  /// assemble_jacobian(), ...) that never touch get_material(). Intended for
+  /// cheaply recomputing spatial integration weights on demand (e.g.
+  /// TransportSolution::compute_errors()) without needing an
+  /// xs::Server/Material.
+  DGFirstOrderTransportBackend(const cad::Patch::Ptr& block,
+    const math::QuadratureSet::Ptr& angular_qset,
+    const DGTransportAssemblerConfig& config = DGTransportAssemblerConfig())
+    : DGBackend<cad::Patch, DGTransportAssemblerConfig>(block, config),
+      angular_qset_(angular_qset), material_(nullptr), cache_(block, config)
+  {
+    init_spatial_quadrature_();
+  }
+
+  /// @brief Construct a backend with no material and EXTERNALLY supplied
+  /// quadrature points, bypassing init_spatial_quadrature_()'s
+  /// self-derivation from this block's own knot vector. Only valid for
+  /// assemble_basis() (spatial_qset_ is left unset, so
+  /// assemble_integral_mapping() and anything depending on it is not valid
+  /// on an instance built this way). Intended for evaluating a DIFFERENT
+  /// patch's basis -- e.g. a differently-refined (more knot spans and/or
+  /// higher polynomial degree) reference solution sharing the same
+  /// parametric domain -- at another patch's own quadrature points, so the
+  /// two can be compared pointwise (see
+  /// TransportSolution::compute_errors()).
+  DGFirstOrderTransportBackend(const cad::Patch::Ptr& block,
+    const math::QuadratureSet::Ptr& angular_qset, Tensors quad_points,
+    const DGTransportAssemblerConfig& config = DGTransportAssemblerConfig())
+    : DGBackend<cad::Patch, DGTransportAssemblerConfig>(block, config),
+      angular_qset_(angular_qset), material_(nullptr), cache_(block, config)
+  {
+    TORCH_CHECK(block_->get_ndim() == NumDim,
+      "CAD patch dimension mismatch with backend template configuration");
+    quad_points_ = std::move(quad_points);
+  }
+
   // =================================================================
   // Public methods
   auto assemble_ordinates() -> Return<Fmt, NumDim>::VectorType;
@@ -398,8 +483,8 @@ public:
   linalg::Operator assemble_loss_operator();
   linalg::Operator assemble_scatter_operator();
   linalg::Operator assemble_fission_operator();
-  std::tuple<linalg::Operator, linalg::Operator> assemble_boundary_operators(
-    size_t dim, bool is_upper);
+  std::tuple<linalg::Operator, linalg::Operator, linalg::Operator>
+  assemble_boundary_operators(size_t dim, bool is_upper);
   auto assemble_outflow_boundary_operator(const ReturnType& basis,
     const typename Return<Fmt, NumDim>::VectorType& normal,
     const ReturnType& mapping) -> ReturnType;

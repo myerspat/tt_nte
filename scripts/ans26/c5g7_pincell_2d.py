@@ -181,4 +181,5 @@ if __name__ == "__main__":
         )
     )
 
-    k = driver.solve_eigenvalue(strategy, tol=1e-6, max_iter=500, verbose=True)
+    # Run DD eigenvalue solver
+    result = driver.solve_eigenvalue(strategy, tol=1e-6, max_iter=500, verbose=True)

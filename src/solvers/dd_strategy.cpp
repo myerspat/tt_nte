@@ -7,8 +7,7 @@ namespace ttnte::solvers {
 // =================================================================
 // Protected constructors
 DDStrategy::DDStrategy(DDSolverConfig config)
-  : config_(std::move(config)),
-    tt_config_(std::make_shared<linalg::TTConfig>(config_.rounding))
+  : config_(std::move(config)), tt_config_(std::make_shared<linalg::TTConfig>())
 {
   if (config_.use_gpu && !torch::cuda::is_available()) {
     throw utils::runtime_error("ttnte::solvers::DDStrategy::DDStrategy",

@@ -1,6 +1,7 @@
 # Define the relative filenames
 set(SOLVERS_BINDINGS_REL
     bindings.cpp
+    solver.cpp
     solver_configs.cpp
     dd_strategy.cpp
     memory_policy.cpp

@@ -3,6 +3,7 @@
 #include "ttnte/cad/patch.hpp"
 #include "ttnte/mesh/mesh.hpp"
 #include "ttnte/solvers/dd_strategy.hpp"
+#include "ttnte/solvers/solver.hpp"
 #include <torch/extension.h>
 
 namespace py = pybind11;
@@ -17,7 +18,7 @@ static void register_DDSolver_impl(py::module_& m, const std::string& typestr)
 
   register_Label<DDSolver>(m, class_name);
 
-  py::class_<DDSolver, SolverPtr>(m, class_name.c_str())
+  py::class_<DDSolver, ttnte::solvers::Solver, SolverPtr>(m, class_name.c_str())
     // =================================================================
     // Public constructors
     .def(py::init([](std::shared_ptr<ttnte::mesh::Mesh<BlockType>> mesh,
@@ -39,6 +40,7 @@ static void register_DDSolver_impl(py::module_& m, const std::string& typestr)
       "finalize", &DDSolver::finalize, py::call_guard<py::gil_scoped_release>())
     .def("is_initialized", &DDSolver::is_initialized)
     .def("is_finalized", &DDSolver::is_finalized)
+    .def("is_converged", &DDSolver::is_converged)
 
     // =================================================================
     // Public getters / setters

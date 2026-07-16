@@ -1285,14 +1285,15 @@ linalg::Operator DGFirstOrderTransportBackend<cad::Patch, Fmt,
 }
 
 template<FormatType Fmt, int64_t NumDim>
-std::tuple<linalg::Operator, linalg::Operator> DGFirstOrderTransportBackend<
-  cad::Patch, Fmt, NumDim>::assemble_boundary_operators(size_t dim,
-  bool is_upper)
+std::tuple<linalg::Operator, linalg::Operator, linalg::Operator>
+DGFirstOrderTransportBackend<cad::Patch, Fmt,
+  NumDim>::assemble_boundary_operators(size_t dim, bool is_upper)
 {
   // Return nothing if the boundary is degenerate
   if (block_->get_boundary_info(dim, is_upper).get_type() ==
       BoundaryType::DEGENERATE) {
-    return std::make_tuple(linalg::Operator(), linalg::Operator());
+    return std::make_tuple(
+      linalg::Operator(), linalg::Operator(), linalg::Operator());
   }
 
   if constexpr (Fmt == FormatType::TENSOR_TRAIN && NumDim > 1) {
@@ -1438,6 +1439,47 @@ std::tuple<linalg::Operator, linalg::Operator> DGFirstOrderTransportBackend<
       return linalg::TTEngine(std::move(B_cores), false);
     };
 
+    // Build the current-reduction operator: the (Omega . n)_+ outflow
+    // upwind mask folded with the angular quadrature weights (reusing
+    // apply_angular_weights(), the same helper assemble_scattering_kernel()
+    // uses), then its tangential (face-quadrature) cores projected onto the
+    // DG basis via project_boundary_mask() -- the exact same treatment
+    // B_out/B_in get below. This projection is required, not optional: for
+    // NumDim > 1, assemble_upwind_mask()'s tangential cores live in a
+    // face-quadrature-point basis, not the DOF/control-point basis
+    // inject_basis_and_energy()'s identity cores use below -- kron-ing the
+    // two together without first reconciling them into the same basis would
+    // double-represent that spatial axis (once from the mask, once from the
+    // identity), producing an operator with too many TT-cores. Applying the
+    // result to a boundary-narrowed angular-flux state and reducing the
+    // angular core(s) away yields the outgoing partial current at this
+    // face, spatially(+energy) resolved -- used only as a Schwarz
+    // convergence indicator (LocalSolver::postsolve()), not part of the
+    // actual PDE operator. Only needed for INTERNAL boundaries (the only
+    // case a NeighborCoupling exists for).
+    linalg::Operator current_op;
+    if (condition == BoundaryType::INTERNAL) {
+      linalg::TTEngine current_mask =
+        assemble_upwind_mask(normal, /*is_outflow=*/true);
+      current_mask = apply_angular_weights(current_mask, {0, 1});
+      current_mask =
+        project_boundary_mask(std::move(current_mask), basis, mapping);
+
+      // Trivial 1x1 "identity" for the narrowed dim -- unlike B_out/B_in's
+      // target_core (which selects the boundary index out of the full,
+      // non-narrowed state), this operator is applied to a state already
+      // narrowed to size 1 along `dim` (see LocalSolver::postsolve()), so no
+      // selection is needed, just a pass-through.
+      auto trivial_core = torch::ones({1, 1, 1, 1}, options);
+
+      current_mask = inject_basis_and_energy(current_mask, trivial_core);
+      // Angular cores are left reduced (m=1, from apply_angular_weights) --
+      // deliberately NOT diagonalized like B_out/B_in below -- since
+      // applying this operator is meant to integrate the angular dependence
+      // away, not preserve it.
+      current_op = linalg::Operator(std::move(current_mask));
+    }
+
     // Make final trains
     B_out = inject_basis_and_energy(std::move(B_out), target_core)
               .diagonalize({0, 1});
@@ -1448,12 +1490,12 @@ std::tuple<linalg::Operator, linalg::Operator> DGFirstOrderTransportBackend<
       if (condition == BoundaryType::INTERNAL) {
         B_in->diagonalize_({0, 1});
       }
-      return std::make_tuple(
-        linalg::Operator(std::move(B_out)), linalg::Operator(std::move(*B_in)));
+      return std::make_tuple(linalg::Operator(std::move(B_out)),
+        linalg::Operator(std::move(*B_in)), std::move(current_op));
     }
 
-    return std::make_tuple(
-      linalg::Operator(std::move(B_out)), linalg::Operator());
+    return std::make_tuple(linalg::Operator(std::move(B_out)),
+      linalg::Operator(), linalg::Operator());
 
   } else if constexpr (Fmt == FormatType::TENSOR_TRAIN && NumDim == 1) {
     const auto& options =
@@ -1504,6 +1546,22 @@ std::tuple<linalg::Operator, linalg::Operator> DGFirstOrderTransportBackend<
       return linalg::TTEngine(std::move(B_cores), false);
     };
 
+    // Build the current-reduction operator -- see the NumDim > 1 branch
+    // above for the full rationale; only needed for INTERNAL boundaries.
+    linalg::Operator current_op;
+    if (condition == BoundaryType::INTERNAL) {
+      linalg::TTEngine current_mask =
+        assemble_upwind_mask({normal}, /*is_outflow=*/true);
+      current_mask = apply_angular_weights(current_mask, {0});
+
+      c10::SmallVector<int64_t, 6> rest_modes = {
+        1, material_->get_num_groups()};
+      linalg::TTEngine identity_op = linalg::TTEngine::ones(
+        rest_modes, current_mask.get_device(), current_mask.get_dtype())
+                                       .diagonalize();
+      current_op = linalg::Operator(current_mask.kron(identity_op));
+    }
+
     // Make final trains
     B_out =
       inject_basis_and_energy(std::move(B_out), target_core).diagonalize({0});
@@ -1514,12 +1572,12 @@ std::tuple<linalg::Operator, linalg::Operator> DGFirstOrderTransportBackend<
       if (condition == BoundaryType::INTERNAL) {
         B_in->diagonalize_({0});
       }
-      return std::make_tuple(
-        linalg::Operator(std::move(B_out)), linalg::Operator(std::move(*B_in)));
+      return std::make_tuple(linalg::Operator(std::move(B_out)),
+        linalg::Operator(std::move(*B_in)), std::move(current_op));
     }
 
-    return std::make_tuple(
-      linalg::Operator(std::move(B_out)), linalg::Operator());
+    return std::make_tuple(linalg::Operator(std::move(B_out)),
+      linalg::Operator(), linalg::Operator());
   }
 
   throw utils::runtime_error("ttnte::physics::DIGAFirstOrderTransportBackend::"
@@ -1680,10 +1738,9 @@ DGFirstOrderTransportBackend<cad::Patch, Fmt,
 }
 
 template<FormatType Fmt, int64_t NumDim>
-typename Return<Fmt, NumDim>::Type DGFirstOrderTransportBackend<cad::Patch, Fmt,
-  NumDim>::assemble_interface_boundary_operator(const ReturnType& basis,
-  const typename Return<Fmt, NumDim>::VectorType& normal,
-  const ReturnType& mapping, bool is_outflow)
+typename Return<Fmt, NumDim>::Type
+DGFirstOrderTransportBackend<cad::Patch, Fmt, NumDim>::assemble_upwind_mask(
+  const typename Return<Fmt, NumDim>::VectorType& normal, bool is_outflow)
 {
   if constexpr (Fmt == FormatType::TENSOR_TRAIN && NumDim > 1) {
     // Get the ordinates in TT format
@@ -1702,38 +1759,10 @@ typename Return<Fmt, NumDim>::Type DGFirstOrderTransportBackend<cad::Patch, Fmt,
       config_->rounding, config_->cross, config_->max_dense_size);
 
     // Compute the outflow/inflow dot(ordinates, normal)
-    linalg::TTEngine B =
-      static_cast<double>(0.5) *
-      (ando + (is_outflow ? ndo : -ndo))
-        .round(config_->rounding.eps, config_->rounding.max_rank);
+    return static_cast<double>(0.5) *
+           (ando + (is_outflow ? ndo : -ndo))
+             .round(config_->rounding.eps, config_->rounding.max_rank);
 
-    // Apply the basis
-    for (size_t i = 0; i < NumDim - 1; i++) {
-      auto& B_core = B[i + 2];
-      int64_t rl_b = basis[i].size(0);
-      int64_t m = basis[i].size(1);
-      int64_t n = basis[i].size(2);
-
-      B_core = torch::einsum("abcd,ebfg->aebfdg", {B_core, basis[i]})
-                 .reshape({B_core.size(0) * rl_b, m, n, -1});
-    }
-    B.round_(config_->rounding.eps, config_->rounding.max_rank);
-
-    // Compute the outer product with the mapped basis
-    for (size_t i = 0; i < NumDim - 1; i++) {
-      auto& B_core = B[i + 2];
-      int64_t rl_b = basis[i].size(0);
-      int64_t m = B_core.size(2);
-      int64_t n = basis[i].size(2);
-
-      auto mapped_basis = basis[i] * mapping[i];
-
-      B_core = torch::einsum("abcd,ebfg->aecfdg", {B_core, mapped_basis})
-                 .reshape({B_core.size(0) * rl_b, m, n, -1});
-    }
-    B.round_(config_->rounding.eps, config_->rounding.max_rank);
-
-    return B;
   } else if constexpr (Fmt == FormatType::TENSOR_TRAIN && NumDim == 1) {
     // Get ordinates
     torch::Tensor ordinates = assemble_ordinates()[0][0];
@@ -1741,10 +1770,67 @@ typename Return<Fmt, NumDim>::Type DGFirstOrderTransportBackend<cad::Patch, Fmt,
     // Compute dot(ordinates, normal)
     torch::Tensor ndo = ordinates * normal[0][0];
 
-    // Get either the inflow or outflow angular component of the boundary
-    // operator
     return linalg::TTEngine(
       {torch::clamp(is_outflow ? ndo : -ndo, 0).reshape({1, -1, 1, 1})}, false);
+  }
+
+  throw utils::runtime_error(
+    "ttnte::physics::DIGAFirstOrderTransportBackend::assemble_upwind_mask",
+    "This method does not support this format yet");
+}
+
+template<FormatType Fmt, int64_t NumDim>
+typename Return<Fmt, NumDim>::Type
+DGFirstOrderTransportBackend<cad::Patch, Fmt, NumDim>::project_boundary_mask(
+  linalg::TTEngine mask, const ReturnType& basis, const ReturnType& mapping)
+{
+  if constexpr (Fmt == FormatType::TENSOR_TRAIN && NumDim > 1) {
+    // Apply the basis
+    for (size_t i = 0; i < NumDim - 1; i++) {
+      auto& core = mask[i + 2];
+      int64_t rl_b = basis[i].size(0);
+      int64_t m = basis[i].size(1);
+      int64_t n = basis[i].size(2);
+
+      core = torch::einsum("abcd,ebfg->aebfdg", {core, basis[i]})
+               .reshape({core.size(0) * rl_b, m, n, -1});
+    }
+    mask.round_(config_->rounding.eps, config_->rounding.max_rank);
+
+    // Compute the outer product with the mapped basis
+    for (size_t i = 0; i < NumDim - 1; i++) {
+      auto& core = mask[i + 2];
+      int64_t rl_b = basis[i].size(0);
+      int64_t m = core.size(2);
+      int64_t n = basis[i].size(2);
+
+      auto mapped_basis = basis[i] * mapping[i];
+
+      core = torch::einsum("abcd,ebfg->aecfdg", {core, mapped_basis})
+               .reshape({core.size(0) * rl_b, m, n, -1});
+    }
+    mask.round_(config_->rounding.eps, config_->rounding.max_rank);
+
+    return mask;
+  }
+
+  throw utils::runtime_error(
+    "ttnte::physics::DIGAFirstOrderTransportBackend::project_boundary_mask",
+    "This method is only valid for FormatType::TENSOR_TRAIN with NumDim > 1");
+}
+
+template<FormatType Fmt, int64_t NumDim>
+typename Return<Fmt, NumDim>::Type DGFirstOrderTransportBackend<cad::Patch, Fmt,
+  NumDim>::assemble_interface_boundary_operator(const ReturnType& basis,
+  const typename Return<Fmt, NumDim>::VectorType& normal,
+  const ReturnType& mapping, bool is_outflow)
+{
+  if constexpr (Fmt == FormatType::TENSOR_TRAIN && NumDim > 1) {
+    linalg::TTEngine B = assemble_upwind_mask(normal, is_outflow);
+    return project_boundary_mask(std::move(B), basis, mapping);
+
+  } else if constexpr (Fmt == FormatType::TENSOR_TRAIN && NumDim == 1) {
+    return assemble_upwind_mask(normal, is_outflow);
   }
 
   throw utils::runtime_error("ttnte::physics::DIGAFirstOrderTransportBackend::"

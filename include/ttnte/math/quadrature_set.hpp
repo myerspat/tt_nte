@@ -1,8 +1,10 @@
 #pragma once
 
+#include "ttnte/linalg/state.hpp"
 #include "ttnte/utils/exception.hpp"
 #include <c10/util/SmallVector.h>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <numbers>
 #include <torch/extension.h>
@@ -54,6 +56,25 @@ public:
   void to_(const torch::Device& device, const torch::ScalarType& dtype);
   void to_(const torch::ScalarType& dtype);
   void to_(const torch::Device& device);
+
+  /// @brief Integrates a State along this quadrature's leading angular core(s)
+  /// (1 core for a plain QuadratureSet1D, 2 for a tensor-product
+  /// ProductQuadrature), weighted by this quadrature's own weights. Dispatches
+  /// on the State's underlying format; this is a generic reduction over
+  /// quadrature dimensions and does not know what the resulting quantity
+  /// represents physically (e.g. scalar flux) — that interpretation belongs to
+  /// the caller.
+  /// @param state State whose leading core(s) match this quadrature's
+  /// angular DOF layout.
+  /// @param eps Rounding tolerance applied after the contraction (format
+  /// dependent; e.g. TT-rounding for a tensor-train state).
+  /// @param max_rank Rounding max rank applied after the contraction (format
+  /// dependent).
+  /// @return A new State with the angular core(s) removed.
+  /// @throws ttnte::utils::runtime_error If the State's format is not yet
+  /// supported by this method.
+  linalg::State integrate(const linalg::State& state, double eps = 1e-10,
+    int64_t max_rank = std::numeric_limits<int64_t>::max()) const;
 
   // =================================================================
   // Public Getters / Setters

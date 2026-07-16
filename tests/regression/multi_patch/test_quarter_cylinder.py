@@ -21,6 +21,7 @@ from ttnte.solvers import (
     MemoryPolicy,
     AMEnSolver,
     BlockJacobiStrategy,
+    IGADDSolver,
     ExecMode,
     CommMode,
 )
@@ -120,7 +121,7 @@ def test_reflected_pu235_cylinder(device, memory_policy, dtype):
     mesh.set_axis_aligned_conditions(
         BCPlane(x_min=True, y_min=True),
         BoundaryType.REFLECTIVE,
-        tol=1e-6,
+        tol=1e-9,
     )
     mesh.finalize()
 
@@ -174,7 +175,6 @@ def test_reflected_pu235_cylinder(device, memory_policy, dtype):
     config = DDSolverConfig(
         tol=inner_tol,
         max_iter=50,
-        eps=eps,
         use_gpu=True if device == "cuda" else False,
         memory_policy=memory_policy,
         exec_mode=ExecMode.ASYNC,
@@ -183,9 +183,11 @@ def test_reflected_pu235_cylinder(device, memory_policy, dtype):
     )
     strategy = BlockJacobiStrategy(config)
     strategy.set_local_solver(
-        AMEnSolver(nswp=2, eps=eps, kickrank=2, local_iterations=60, resets=4)
+        AMEnSolver(nswp=2, eps=eps, kickrank=2, local_iterations=50, resets=4)
     )
+    dd_solver = IGADDSolver(driver.mesh, strategy)
 
     # Run solver
-    k = driver.solve_eigenvalue(strategy, tol=outer_tol, max_iter=100)
+    result = driver.solve_eigenvalue(dd_solver, tol=outer_tol, max_iter=100)
+    k = result.k_eff
     assert 1e5 * abs(1 - k) < 20

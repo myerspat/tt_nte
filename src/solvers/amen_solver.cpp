@@ -13,6 +13,7 @@ void AMEnSolver::solve(const linalg::LinearSystem::Ptr& local_system)
     // Run AMEn solver
     x = linalg::amen_solve(A, b, x0, nswp_, eps_, max_rank_, max_full_,
       kickrank_, kick2_, local_iterations_, resets_, verbose_, preconditioner_);
+    x.round_(eps_, max_rank_);
   } else {
     x = linalg::State::zeros(linalg::FormatType::TENSOR_TRAIN,
       A.as_tt().get_n_modes(), A.get_device(), A.get_dtype());

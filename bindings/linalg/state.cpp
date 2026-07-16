@@ -35,6 +35,7 @@ void register_State(py::module_& m)
     .def(
       "defined", &State::defined, "Check if the underlying data is allocated")
     .def("as_tt", &State::as_tt, py::return_value_policy::reference_internal)
+    .def("to_dense", &State::to_dense, py::call_guard<py::gil_scoped_release>())
 
     .def("to_buffer", &State::to_buffer, py::arg("buffer"),
       py::call_guard<py::gil_scoped_release>())

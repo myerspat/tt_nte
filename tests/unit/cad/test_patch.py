@@ -3,7 +3,7 @@ from itertools import product
 import pytest
 import torch
 import numpy as np
-from igakit.cad import refine
+from igakit.cad import refine, line
 
 from ttnte.cad.surfaces import circle
 from ttnte.cad import Patch, BSplineBasis
@@ -513,3 +513,202 @@ def test_patch_knot_insert_inplace(device, dtype):
         c_inplace.evaluate([u, v]),
         result.evaluate([u, v]),
     )
+
+
+def _rational_2d_patch(device, dtype):
+    rc = 4.279960
+    return Patch.from_igakit(
+        refine(circle(rc), 10, 4), device=torch.device(device), dtype=dtype
+    )
+
+
+def _bspline_1d_patch(device, dtype):
+    return Patch.from_igakit(
+        refine(line((0, 0), (3, 1)), 6, 3), device=torch.device(device), dtype=dtype
+    )
+
+
+def _bspline_2d_patch(device, dtype):
+    nu, nv, p = 6, 5, 2
+    kv_u = torch.cat([torch.zeros(p), torch.linspace(0, 1, nu - p + 1), torch.ones(p)])
+    kv_v = torch.cat([torch.zeros(p), torch.linspace(0, 1, nv - p + 1), torch.ones(p)])
+    xs = torch.linspace(0, 3, nu)
+    ys = torch.linspace(0, 2, nv)
+    X, Y = torch.meshgrid(xs, ys, indexing="ij")
+    Z = 0.3 * torch.sin(X) * torch.cos(Y)
+    ctrlpts = torch.stack([X, Y, Z], dim=-1).to(device=device, dtype=dtype)
+
+    patch = Patch(
+        ctrlpts,
+        [
+            BSplineBasis(kv_u.to(device=device, dtype=dtype), p),
+            BSplineBasis(kv_v.to(device=device, dtype=dtype), p),
+        ],
+        is_rational=False,
+    )
+    patch.finalize()
+    return patch
+
+
+def _tols(dtype):
+    """(atol, rtol, inverse_map tol) scaled for the dtype's native precision."""
+    if dtype == torch.float32:
+        return 1e-4, 1e-4, 1e-4
+    return 1e-8, 1e-8, 1e-8
+
+
+def _check_jacobian(patch, ndim, device, dtype):
+    atol, rtol, _ = _tols(dtype)
+    torch.manual_seed(0)
+    n = 6
+    u = torch.rand(n, ndim, device=device, dtype=dtype) * 0.8 + 0.1
+
+    # evaluate(coords, 0) must agree with the existing evaluate(coords).
+    torch.testing.assert_close(
+        patch.evaluate(u), patch.evaluate(u, 0), atol=atol, rtol=rtol
+    )
+
+    jac_batch = patch.evaluate_jacobian(u)
+    assert jac_batch.shape[0] == n
+
+    # Cross-check against the tensor-product evaluate_all_jacobian() per point.
+    for i in range(n):
+        pt = [u[i, d : d + 1] for d in range(ndim)]
+        jac_grid = patch.evaluate_all_jacobian(pt).reshape(jac_batch.shape[1:])
+        torch.testing.assert_close(jac_batch[i], jac_grid, atol=atol, rtol=rtol)
+
+    # Cross-check against a central finite difference (float32 forward-mode
+    # finite differences are inherently noisier, so use a looser tolerance
+    # than the analytic-vs-analytic checks above).
+    eps = 1e-6 if dtype == torch.float64 else 1e-3
+    fd_atol = atol if dtype == torch.float64 else 1e-2
+    fd_jac = torch.zeros_like(jac_batch)
+    for d in range(ndim):
+        up = u.clone()
+        up[:, d] += eps
+        um = u.clone()
+        um[:, d] -= eps
+        fd_jac[:, :, d] = (patch.evaluate(up) - patch.evaluate(um)) / (2 * eps)
+    torch.testing.assert_close(jac_batch, fd_jac, atol=fd_atol, rtol=fd_atol)
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
+def test_evaluate_jacobian_rational_2d(device, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    patch = _rational_2d_patch(device, dtype)
+    assert patch.is_rational()
+    _check_jacobian(patch, 2, device, dtype)
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
+def test_evaluate_jacobian_bspline_1d(device, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    patch = _bspline_1d_patch(device, dtype)
+    assert not patch.is_rational()
+    _check_jacobian(patch, 1, device, dtype)
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
+def test_evaluate_jacobian_bspline_2d(device, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    patch = _bspline_2d_patch(device, dtype)
+    assert not patch.is_rational()
+    _check_jacobian(patch, 2, device, dtype)
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
+def test_inverse_map_round_trip(device, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    patch = _rational_2d_patch(device, dtype)
+    torch.manual_seed(42)
+    atol, rtol, tol = _tols(dtype)
+
+    n = 25
+    u_true = torch.rand(n, 2, device=device, dtype=dtype) * 0.9 + 0.05
+    targets = patch.evaluate(u_true)
+
+    result = patch.inverse_map(targets, tol=tol)
+    assert bool(result.converged.all())
+
+    recovered = patch.evaluate(result.coords)
+    torch.testing.assert_close(recovered, targets, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
+def test_inverse_map_out_of_domain_does_not_converge(device, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    patch = _rational_2d_patch(device, dtype)
+    far_target = torch.tensor([[1e4, 1e4]], device=device, dtype=dtype)
+
+    result = patch.inverse_map(far_target, max_iter=50)
+    assert not bool(result.converged.item())
+
+
+def _check_evaluate_field_matches_geometry(patch, device, dtype, seed):
+    """evaluate_field() applied to this patch's OWN (unweighted) control points must
+    recover exactly what evaluate() gives -- the strongest available correctness check,
+    since it exercises the full basis contraction (and, for rational patches, the NURBS
+    quotient rule) against genuinely varying per-channel coefficients rather than a
+    synthetic field."""
+    atol, rtol, _ = _tols(dtype)
+    torch.manual_seed(seed)
+    u = torch.rand(8, patch.ndim, device=device, dtype=dtype) * 0.8 + 0.1
+
+    direct = patch.evaluate(u)
+    via_field = patch.evaluate_field(patch.ctrlpts, u)
+    torch.testing.assert_close(via_field, direct, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
+def test_evaluate_field_matches_geometry_rational_2d(device, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    patch = _rational_2d_patch(device, dtype)
+    assert patch.is_rational()
+    _check_evaluate_field_matches_geometry(patch, device, dtype, seed=10)
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
+def test_evaluate_field_matches_geometry_bspline_1d(device, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    patch = _bspline_1d_patch(device, dtype)
+    assert not patch.is_rational()
+    _check_evaluate_field_matches_geometry(patch, device, dtype, seed=11)
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
+def test_evaluate_field_matches_geometry_bspline_2d(device, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    patch = _bspline_2d_patch(device, dtype)
+    assert not patch.is_rational()
+    _check_evaluate_field_matches_geometry(patch, device, dtype, seed=12)
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
+def test_evaluate_field_reproduces_constant(device, dtype):
+    """A constant field should evaluate to that same constant everywhere -- for a
+    rational patch this specifically exercises that the NURBS quotient's
+    numerator/denominator correctly cancel the shared weight factor (partition of
+    unity)."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    patch = _rational_2d_patch(device, dtype)
+    atol, rtol, _ = _tols(dtype)
+
+    ctrlpts_shape = [patch.get_ctrlpts_size(d) for d in range(patch.ndim)]
+    field = torch.full((*ctrlpts_shape, 1), 3.5, device=device, dtype=dtype)
+
+    torch.manual_seed(13)
+    u = torch.rand(6, patch.ndim, device=device, dtype=dtype) * 0.8 + 0.1
+    result = patch.evaluate_field(field, u)
+    expected = torch.full((6, 1), 3.5, device=device, dtype=dtype)
+    torch.testing.assert_close(result, expected, atol=atol, rtol=rtol)

@@ -80,3 +80,19 @@ jobs:
         # Use mpirun to launch 2 processes for the parallel tests
         mpirun -n 2 pytest --with-mpi tests/unit/parallel
         mpirun -n 2 pytest --with-mpi tests/regression/multi_patch/test_quarter_cylinder.py tests/regression/multi_patch/test_slab.py
+
+  trigger-vnv:
+    # Only after every build matrix entry above succeeds on a push to develop
+    # (not on pull_request builds) -- kicks off the V&V suite in ttnte-vnv
+    # immediately instead of waiting for its weekly schedule.
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch VNV run in ttnte-vnv
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.VNV_DISPATCH_TOKEN }}
+          repository: myerspat/ttnte-vnv
+          event-type: ttnte-develop-push
+          client-payload: '{"sha": "${{ github.sha }}"}'

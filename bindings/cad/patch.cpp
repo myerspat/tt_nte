@@ -11,7 +11,13 @@ void register_Patch(py::module_& m)
 {
   using Basis = std::vector<ttnte::cad::BSplineBasis>;
   using Patch = ttnte::cad::Patch;
+  using InverseMapResult = ttnte::cad::InverseMapResult;
   register_Label<ttnte::mesh::MeshBlock<Patch>>(m, "Patch");
+
+  py::class_<InverseMapResult>(m, "InverseMapResult")
+    .def_readonly("coords", &InverseMapResult::coords)
+    .def_readonly("residual", &InverseMapResult::residual)
+    .def_readonly("converged", &InverseMapResult::converged);
 
   auto py_class =
     py::class_<Patch, std::shared_ptr<Patch>>(m, "Patch")
@@ -40,14 +46,33 @@ void register_Patch(py::module_& m)
       // =================================================================
       // Public methods
       .def("is_rational", &Patch::is_rational)
-      .def("evaluate",
-        static_cast<torch::Tensor (Patch::*)(const torch::Tensor&)>(
-          &Patch::evaluate),
-        py::arg("local_coords"))
       .def(
         "evaluate",
-        [](Patch& self, const std::vector<torch::Tensor>& local_coords) {
+        [](const Patch& self, const torch::Tensor& local_coords,
+          int64_t derivative_order) {
+          return self.evaluate(local_coords, derivative_order);
+        },
+        py::arg("local_coords"), py::arg("derivative_order") = 0)
+      .def(
+        "evaluate",
+        [](const Patch& self, const std::vector<torch::Tensor>& local_coords) {
           return self.evaluate(c10::SmallVector<torch::Tensor, 3>(
+            local_coords.begin(), local_coords.end()));
+        },
+        py::arg("local_coords"))
+      .def(
+        "evaluate_jacobian", &Patch::evaluate_jacobian, py::arg("local_coords"))
+      .def("inverse_map", &Patch::inverse_map, py::arg("physical_coords"),
+        py::arg("max_iter") = 10, py::arg("tol") = 1e-8,
+        py::arg("initial_guess") = py::none(),
+        py::arg("seed_resolution") =
+          ttnte::cad::DEFAULT_INVERSE_MAP_SEED_RESOLUTION)
+      .def("evaluate_field", &Patch::evaluate_field, py::arg("field"),
+        py::arg("points"))
+      .def(
+        "evaluate_all_jacobian",
+        [](const Patch& self, const std::vector<torch::Tensor>& local_coords) {
+          return self.evaluate_all_jacobian(c10::SmallVector<torch::Tensor, 3>(
             local_coords.begin(), local_coords.end()));
         },
         py::arg("local_coords"))
@@ -107,13 +132,16 @@ void register_Patch(py::module_& m)
 
       // =================================================================
       // Public overloads
-      .def("__call__",
-        static_cast<torch::Tensor (Patch::*)(const torch::Tensor&)>(
-          &Patch::evaluate),
-        py::arg("local_coords"))
       .def(
         "__call__",
-        [](Patch& self, const std::vector<torch::Tensor>& local_coords) {
+        [](const Patch& self, const torch::Tensor& local_coords,
+          int64_t derivative_order = 0) {
+          return self.evaluate(local_coords, derivative_order);
+        },
+        py::arg("local_coords"), py::arg("derivative_order") = 0)
+      .def(
+        "__call__",
+        [](const Patch& self, const std::vector<torch::Tensor>& local_coords) {
           return self.evaluate(c10::SmallVector<torch::Tensor, 3>(
             local_coords.begin(), local_coords.end()));
         },

@@ -1,4 +1,5 @@
 #include "ttnte/solvers/local_solver.hpp"
+#include "ttnte/linalg/ops.hpp"
 
 namespace ttnte::solvers {
 
@@ -55,16 +56,26 @@ void LocalSolver::postsolve(
 {
   const auto& x0 = sys->get_state();
 
-  // Compute per-coupling boundary convergence error: compare the face of x
-  // with the face of x0 along each internal boundary dimension. A rough
-  // rounding is applied to the diff to keep its rank manageable — only a
+  // Compute per-coupling Schwarz convergence error: compare the OUTGOING
+  // partial current (the boundary-narrowed angular flux reduced via
+  // coupling.current_op -- the (Omega . n)_+ upwind mask times the angular
+  // quadrature weights) at the face of x with the face of x0 along each
+  // internal boundary dimension. Falls back to the raw angular-flux face
+  // if current_op isn't defined (not yet built for every format). A rough
+  // rounding is applied to the diff to keep its rank manageable -- only a
   // convergence indicator is needed, not a precise residual.
   for (auto& coupling : sys->get_couplings()) {
     const size_t bdim = static_cast<size_t>(x.ndimension()) -
                         coupling.connection.mapping.flip.size() - 2 +
                         coupling.dim;
-    auto face_new = x.narrow(bdim, coupling.is_upper ? -1 : 0, 1);
-    auto face_old = x0.narrow(bdim, coupling.is_upper ? -1 : 0, 1);
+    linalg::State face_new = x.narrow(bdim, coupling.is_upper ? -1 : 0, 1);
+    linalg::State face_old = x0.narrow(bdim, coupling.is_upper ? -1 : 0, 1);
+
+    if (coupling.current_op.defined()) {
+      face_new = linalg::mv(coupling.current_op, face_new);
+      face_old = linalg::mv(coupling.current_op, face_old);
+    }
+
     linalg::State diff = face_new - face_old;
     diff.round_(get_eps(), get_max_rank());
     const double n_diff = diff.norm();
@@ -75,6 +86,18 @@ void LocalSolver::postsolve(
 
   // Update the linear system
   sys->set_state(std::move(x));
+}
+
+void LocalSolver::init(const Systems& local_systems)
+{
+  local_systems_ = local_systems;
+}
+
+void LocalSolver::step()
+{
+  for (auto& sys : local_systems_) {
+    solve(sys);
+  }
 }
 
 } // namespace ttnte::solvers

@@ -155,84 +155,8 @@ void Patch::finalize_impl()
   }
 }
 
-torch::Tensor Patch::evaluate(const torch::Tensor& local_coords)
-{
-  is_finalized_or_error("evaluate");
-
-  // Check input
-  if (local_coords.ndimension() != 2) {
-    throw utils::runtime_error(
-      *this, error_context("evaluate"), "`local_coords` must be 2-dimensional");
-  } else if (local_coords.size(1) != basis_.size()) {
-    throw utils::runtime_error(*this, error_context("evaluate"),
-      "The second dimension of `local_coords` should be size " +
-        std::to_string(basis_.size()));
-  }
-
-  // Apply one basis at a time
-  int64_t n = local_coords.size(0);
-  int64_t phys_d = ctrlptsw_.size(-1);
-  auto phys_coords = ctrlptsw_.to(local_coords.options());
-
-  for (size_t d = 0; d < basis_.size(); d++) {
-    const auto& b = basis_[d];
-    const auto& p = b.get_degree();
-    const auto& u = local_coords.select(1, d);
-
-    // Find spans for each coordinate
-    auto spans = b.find_spans(u);
-
-    // Gather indices: spans - p + j
-    auto j_range = torch::arange(p + 1, spans.options()).unsqueeze(0);
-    auto idx = spans.unsqueeze(1) - p + j_range;
-
-    if (d == 0) {
-      // Ending shape: [N_1, ..., N_D, phys_dims] -> [n, N_2, ..., N_D,
-      // phys_dims]
-      auto shape = phys_coords.sizes().vec();
-      shape[0] = -1;
-
-      // Flatten the rest of the dimensions: [b.get_size(), -1]
-      auto phys_coords_flat = phys_coords.view({phys_coords.size(0), -1});
-
-      // Multiply by basis functions and sum across the p + 1 dimension after
-      // embedding to create [n, p + 1, -1]
-      // [n, 1, p + 1] @ [n, p + 1, m] -> [n, 1, m]
-      phys_coords = torch::matmul(b.evaluate(u, spans).unsqueeze(1),
-        torch::embedding(phys_coords_flat, idx));
-
-      // Reshape to inject our batch dimension: [N_points, N_2, ..., phys_dims]
-      phys_coords = phys_coords.view(shape);
-
-    } else {
-      // Ending shape: [n, N_d, ..., N_D, phys_dims]
-      // -> [n, N_(d + 1), ..., N_D, phys_dims]
-      auto shape = phys_coords.sizes().vec();
-      shape.erase(shape.begin() + 1);
-
-      // Note n_b = b.get_size()
-      int64_t n_b = phys_coords.size(1);
-
-      // Reshape to expose the target dimension
-      auto phys_coords_flat = phys_coords.view({n, n_b, -1});
-
-      // Multiply by basis functions and sum
-      // [n, 1, p + 1] @ [n, p + 1, m] -> [n, 1, m]
-      phys_coords = torch::matmul(b.evaluate(u, spans).unsqueeze(1),
-        torch::gather(phys_coords_flat, /*dim=*/1,
-          idx.unsqueeze(2).expand({n, p + 1, phys_coords_flat.size(-1)})));
-
-      // Reshape back: [N_points, N_{d+1}, ..., phys_dims]
-      phys_coords = phys_coords.view(shape);
-    }
-  }
-
-  return is_rational_ ? phys_coords.slice(1, 0, -1) / phys_coords.slice(1, -1)
-                      : phys_coords;
-}
-
 torch::Tensor Patch::evaluate(
-  const c10::SmallVector<torch::Tensor, 3>& local_coords)
+  const c10::SmallVector<torch::Tensor, 3>& local_coords) const
 {
   is_finalized_or_error("evaluate");
 
@@ -295,25 +219,305 @@ torch::Tensor Patch::evaluate(
                       : phys_coords;
 }
 
-// void Patch::pack(std::vector<int64_t>& meta_buffer,
-//   std::vector<torch::Tensor>& payload_buffer) const
-// {
-//   // Fill the meta data buffer first
-//   meta_buffer.push_back(label_.to_int());                 // Patch label
-//   meta_buffer.push_back(static_cast<int64_t>(is_valid_)); // Is valid Boolean
-//   meta_buffer.push_back(
-//     static_cast<int64_t>(is_rational_)); // Is rational Boolean
-//   meta_buffer.push_back(basis_.size());  // Number of parametric dimensions
-//
-//   // Iterate through the basis
-//   for (const auto& b : basis_) {
-//     b.pack(meta_buffer, payload_buffer);
-//   }
-//
-//   // Add the control point information
-//   meta_buffer.push_back(ctrlptsw_.numel()); // Number of control points
-//   payload_buffer.push_back(ctrlptsw_.flatten().contiguous());
-// }
+torch::Tensor Patch::evaluate(
+  const torch::Tensor& local_coords, int64_t derivative_order) const
+{
+  is_finalized_or_error("evaluate");
+
+  if (local_coords.ndimension() != 2) {
+    throw utils::runtime_error(
+      *this, error_context("evaluate"), "`local_coords` must be 2-dimensional");
+  } else if (local_coords.size(1) != basis_.size()) {
+    throw utils::runtime_error(*this, error_context("evaluate"),
+      "The second dimension of `local_coords` should be size " +
+        std::to_string(basis_.size()));
+  }
+  if (derivative_order < 0) {
+    throw utils::runtime_error(*this, error_context("evaluate"),
+      "`derivative_order` must be greater than or equal to 0");
+  }
+
+  int64_t n = local_coords.size(0);
+  int64_t ndim = get_ndim();
+
+  // Contract ctrlptsw_ against, for each dimension, a single requested
+  // derivative order (0 unless overridden in `dim_orders`). Returns the raw
+  // (undivided, weight channel included if rational) numerator.
+  auto contract = [&](const c10::SmallVector<int64_t, 3>& dim_orders) {
+    auto phys_coords = ctrlptsw_.to(local_coords.options());
+
+    for (size_t d = 0; d < basis_.size(); d++) {
+      const auto& b = basis_[d];
+      const auto& p = b.get_degree();
+      const auto& u = local_coords.select(1, d);
+
+      auto spans = b.find_spans(u);
+      auto j_range = torch::arange(p + 1, spans.options()).unsqueeze(0);
+      auto idx = spans.unsqueeze(1) - p + j_range;
+
+      // Basis values for exactly the requested order at this dimension.
+      auto order = dim_orders[d];
+      auto evals = b.evaluate(u, spans, order);
+      auto weight = order == 0 ? evals : evals.select(1, order);
+
+      if (d == 0) {
+        auto shape = phys_coords.sizes().vec();
+        shape[0] = -1;
+
+        auto phys_coords_flat = phys_coords.view({phys_coords.size(0), -1});
+        phys_coords = torch::matmul(
+          weight.unsqueeze(1), torch::embedding(phys_coords_flat, idx));
+        phys_coords = phys_coords.view(shape);
+
+      } else {
+        auto shape = phys_coords.sizes().vec();
+        shape.erase(shape.begin() + 1);
+
+        int64_t n_b = phys_coords.size(1);
+        auto phys_coords_flat = phys_coords.view({n, n_b, -1});
+
+        phys_coords = torch::matmul(weight.unsqueeze(1),
+          torch::gather(phys_coords_flat, /*dim=*/1,
+            idx.unsqueeze(2).expand({n, p + 1, phys_coords_flat.size(-1)})));
+        phys_coords = phys_coords.view(shape);
+      }
+    }
+
+    return phys_coords; // (n, phys_d [+1 if rational]), not yet divided
+  };
+
+  c10::SmallVector<int64_t, 3> zero_orders(ndim, 0);
+
+  if (derivative_order == 0) {
+    auto A = contract(zero_orders);
+    return is_rational_ ? A.slice(1, 0, -1) / A.slice(1, -1) : A;
+  }
+
+  // Per-dimension derivative order actually used, clamped to each
+  // dimension's degree -- matches evaluate_all_basis()'s convention.
+  c10::SmallVector<int64_t, 3> orders(ndim);
+  for (int64_t d = 0; d < ndim; d++) {
+    orders[d] = std::min(derivative_order, basis_[d].get_degree());
+  }
+
+  // Slot 0 is the value; slots thereafter are, in turn, each dimension's
+  // 1st..orders[d]-th derivative (all other dimensions at order 0).
+  c10::SmallVector<torch::Tensor, 6> slots;
+  slots.push_back(contract(zero_orders));
+
+  for (int64_t d = 0; d < ndim; d++) {
+    for (int64_t k = 1; k <= orders[d]; k++) {
+      auto dim_orders = zero_orders;
+      dim_orders[d] = k;
+      slots.push_back(contract(dim_orders));
+    }
+  }
+  auto stacked = torch::stack(slots, /*dim=*/-1); // (n, phys_d[+1], slots)
+
+  if (!is_rational_) {
+    return stacked;
+  }
+
+  // NURBS quotient-rule correction: R^(k) = (A^(k) - sum_{i=1}^{k}
+  // binom(k,i) * W^(i) * R^(k-i)) / W^(0), applied per physical channel
+  // (the weight channel is included too -- it trivially corrects to a
+  // constant 1 with all derivatives 0, and is stripped from the return).
+  auto W = stacked.select(1, -1); // (n, slots)
+  auto W0 = W.select(-1, 0);      // (n,)
+
+  auto result = stacked.clone();
+  result.select(-1, 0).div_(W0.unsqueeze(-1));
+
+  int64_t pos = 1;
+  for (int64_t d = 0; d < ndim; d++) {
+    for (int64_t k = 1; k <= orders[d]; k++) {
+      int64_t k_idx = pos + k - 1;
+      auto Ak = stacked.select(-1, k_idx);
+      auto sum_term = torch::zeros_like(Ak);
+
+      for (int64_t i = 1; i <= k; i++) {
+        int64_t binom = linalg::binomial.get(k, i);
+        int64_t i_idx = pos + i - 1;
+        int64_t k_minus_i_idx = (k == i) ? 0 : pos + (k - i) - 1;
+
+        auto Wi = W.select(-1, i_idx);
+        auto R_k_minus_i = result.select(-1, k_minus_i_idx);
+        sum_term.addcmul_(Wi.unsqueeze(-1), R_k_minus_i, binom);
+      }
+
+      result.select(-1, k_idx).copy_((Ak - sum_term) / W0.unsqueeze(-1));
+    }
+    pos += orders[d];
+  }
+
+  return result.slice(1, 0, -1);
+}
+
+torch::Tensor Patch::evaluate_jacobian(const torch::Tensor& local_coords) const
+{
+  int64_t ndim = get_ndim();
+  auto full = evaluate(local_coords, 1); // (n, phys_d, 1 + ndim)
+  return full.slice(-1, 1, 1 + ndim);
+}
+
+InverseMapResult Patch::inverse_map(const torch::Tensor& physical_coords,
+  int64_t max_iter, double tol, std::optional<torch::Tensor> initial_guess,
+  int64_t seed_resolution) const
+{
+  is_finalized_or_error("inverse_map");
+
+  if (physical_coords.ndimension() != 2) {
+    throw utils::runtime_error(*this, error_context("inverse_map"),
+      "`physical_coords` must be 2-dimensional");
+  }
+
+  int64_t ndim = get_ndim();
+  int64_t n = physical_coords.size(0);
+  auto options = physical_coords.options();
+
+  torch::Tensor u;
+  if (initial_guess.has_value()) {
+    u = initial_guess.value().clone();
+
+  } else {
+    // Coarse-grid closest-point search for a starting guess, mirroring the
+    // legacy ttnte/iga/mesh.py inverse_map()'s coarse-mesh seeding (but at
+    // `seed_resolution` instead of that legacy code's fixed low resolution
+    // -- see DEFAULT_INVERSE_MAP_SEED_RESOLUTION's comment).
+    c10::SmallVector<torch::Tensor, 3> grid_axes(ndim);
+    for (int64_t d = 0; d < ndim; d++) {
+      grid_axes[d] = torch::linspace(0, 1, seed_resolution, options);
+    }
+
+    auto grid_phys = evaluate(grid_axes); // (res, ..., res, phys_d)
+    int64_t phys_d = grid_phys.size(-1);
+    auto grid_phys_flat = grid_phys.reshape({-1, phys_d}); // (res^ndim, phys_d)
+
+    std::vector<torch::Tensor> mesh = torch::meshgrid(
+      std::vector<torch::Tensor>(grid_axes.begin(), grid_axes.end()), "ij");
+    std::vector<torch::Tensor> mesh_flat;
+    mesh_flat.reserve(ndim);
+    for (auto& m : mesh) {
+      mesh_flat.push_back(m.reshape({-1}));
+    }
+    auto grid_params = torch::stack(mesh_flat, -1); // (res^ndim, ndim)
+
+    // (n, res^ndim): squared distance from each target to each grid point.
+    auto dists = (grid_phys_flat.unsqueeze(0) - physical_coords.unsqueeze(1))
+                   .pow(2)
+                   .sum(-1);
+    auto closest = dists.argmin(-1); // (n,)
+    u = grid_params.index_select(0, closest);
+  }
+
+  torch::Tensor residual;
+  torch::Tensor converged;
+
+  for (int64_t iter = 0; iter < max_iter; iter++) {
+    auto F = evaluate(u) - physical_coords; // (n, phys_d)
+    residual = F.norm(2, -1);               // (n,)
+    converged = residual < tol;
+
+    if (converged.all().item<bool>()) {
+      break;
+    }
+
+    // Least-squares Newton step: delta = argmin_d || J @ d + F ||. Solving
+    // via lstsq (QR with pivoting on CPU) rather than forming the normal
+    // equations avoids squaring the condition number and degrades
+    // gracefully (rather than throwing) for rank-deficient Jacobians, e.g.
+    // when a candidate point sits far outside this patch's valid domain.
+    auto J = evaluate_jacobian(u); // (n, phys_d, ndim)
+    auto delta =
+      -std::get<0>(torch::linalg_lstsq(J, F.unsqueeze(-1),
+                     /*rcond=*/std::nullopt, /*driver=*/std::nullopt))
+         .squeeze(-1); // (n, ndim)
+
+    auto mask = torch::logical_not(converged).unsqueeze(-1);
+    u = torch::where(mask, (u + delta).clamp(0.0, 1.0), u);
+  }
+
+  return InverseMapResult {
+    std::move(u), std::move(residual), std::move(converged)};
+}
+
+torch::Tensor Patch::evaluate_field(
+  const torch::Tensor& field, const torch::Tensor& points) const
+{
+  is_finalized_or_error("evaluate_field");
+
+  if (points.ndimension() != 2) {
+    throw utils::runtime_error(
+      *this, error_context("evaluate_field"), "`points` must be 2-dimensional");
+  } else if (points.size(1) != static_cast<int64_t>(basis_.size())) {
+    throw utils::runtime_error(*this, error_context("evaluate_field"),
+      "The second dimension of `points` should be size " +
+        std::to_string(basis_.size()));
+  }
+
+  int64_t n = points.size(0);
+
+  // Same per-dimension basis contraction evaluate(Tensor, 0) uses on
+  // ctrlptsw_, applied directly to an arbitrary `coeffs` tensor instead --
+  // this is purely a function of this patch's own (already-finalized,
+  // read-only) basis, with no geometric validity constraints of its own.
+  auto contract = [&](const torch::Tensor& coeffs) -> torch::Tensor {
+    auto values = coeffs.to(points.options());
+
+    for (size_t d = 0; d < basis_.size(); d++) {
+      const auto& b = basis_[d];
+      const auto& p = b.get_degree();
+      const auto& u = points.select(1, d);
+
+      auto spans = b.find_spans(u);
+      auto j_range = torch::arange(p + 1, spans.options()).unsqueeze(0);
+      auto idx = spans.unsqueeze(1) - p + j_range;
+      auto weight = b.evaluate(u, spans);
+
+      if (d == 0) {
+        auto shape = values.sizes().vec();
+        shape[0] = -1;
+
+        auto values_flat = values.view({values.size(0), -1});
+        values = torch::matmul(
+          weight.unsqueeze(1), torch::embedding(values_flat, idx));
+        values = values.view(shape);
+
+      } else {
+        auto shape = values.sizes().vec();
+        shape.erase(shape.begin() + 1);
+
+        int64_t n_b = values.size(1);
+        auto values_flat = values.view({n, n_b, -1});
+
+        values = torch::matmul(weight.unsqueeze(1),
+          torch::gather(values_flat, /*dim=*/1,
+            idx.unsqueeze(2).expand({n, p + 1, values_flat.size(-1)})));
+        values = values.view(shape);
+      }
+    }
+
+    return values; // (n, num_channels)
+  };
+
+  if (!is_rational_) {
+    return contract(field);
+  }
+
+  // NURBS quotient rule: `field`'s DOF coefficients are coefficients of the
+  // RATIONAL basis R_i(u) = N_i(u) * w_i / sum_j N_j(u) * w_j (the same
+  // basis assemble_basis() builds and the solve operates against) -- so
+  // sum_i R_i(u) * field_i is recovered by contracting the plain B-spline
+  // basis against the WEIGHTED field, divided by the weight function
+  // contracted the same way (mirrors how ctrlptsw_ stores geometry
+  // pre-weighted, so evaluate()'s own quotient rule needs no separate
+  // pre-weighting step -- field, unlike ctrlptsw_, arrives unweighted).
+  torch::Tensor weights = get_weights();
+  torch::Tensor weighted_field = field * weights.unsqueeze(-1);
+  torch::Tensor numerator = contract(weighted_field);
+  torch::Tensor denominator = contract(weights.unsqueeze(-1));
+  return numerator / denominator;
+}
 
 std::string Patch::to_string_impl() const
 {
@@ -994,7 +1198,7 @@ torch::Tensor Patch::get_bbox_impl(double epsilon) const
 
   // Find the minimum point and maximum bounding the whole patch
   // epsilon is a little buffer
-  auto flat_view = ctrlpts.view({-1, ctrlpts.size(-1)});
+  auto flat_view = ctrlpts.reshape({-1, ctrlpts.size(-1)});
   auto min_point = std::get<0>(flat_view.min(0)) - epsilon;
   auto max_point = std::get<0>(flat_view.max(0)) + epsilon;
 

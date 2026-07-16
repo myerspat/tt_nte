@@ -440,6 +440,12 @@ public:
   /// @return The compression ratio.
   double get_compression() const;
 
+  /// @brief Convert the state to a full dense tensor, dispatching on its
+  /// underlying format.
+  /// @throws ttnte::utils::runtime_error If the state's format does not yet
+  /// support dense conversion.
+  torch::Tensor to_dense() const;
+
   /// @brief Check if the state is represented by a Tensor Train engine.
   bool is_tt() const { return std::holds_alternative<TTEngine>(get_variant()); }
 

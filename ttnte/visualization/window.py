@@ -1,3 +1,4 @@
+import importlib.util
 import os
 
 import vtk
@@ -9,7 +10,8 @@ from ttnte.visualization.style import ScreenshotStyle, PlotterStyle
 
 def init_plotter(style: PlotterStyle, jupyter_backend="static"):
     """"""
-    pv.set_jupyter_backend(jupyter_backend)
+    if importlib.util.find_spec("IPython") is not None:
+        pv.set_jupyter_backend(jupyter_backend)
     os.environ["EGL_LOG_LEVEL"] = "fatal"
     vtk.vtkLogger.SetStderrVerbosity(vtk.vtkLogger.VERBOSITY_OFF)
     vtk.vtkObject.GlobalWarningDisplayOff()

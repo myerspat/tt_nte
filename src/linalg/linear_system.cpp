@@ -24,10 +24,14 @@ LinearSystem::LinearSystem(Operator interior_op,
     options = options.pinned_memory(true);
   }
 
-  // Compute flat buffer size: interior_op + boundary_ops + [state] + [source]
+  // Compute flat buffer size: interior_op + boundary_ops + current_ops +
+  // [state] + [source]
   int64_t total = interior_op_.get_numel();
   for (const auto& c : couplings_) {
     total += c.boundary_op.get_numel();
+    if (c.current_op.defined()) {
+      total += c.current_op.get_numel();
+    }
   }
   if (state_.defined()) {
     state_is_static_ = true;
@@ -57,8 +61,12 @@ LinearSystem::LinearSystem(Operator interior_op,
   };
 
   pack(interior_op_);
-  for (auto& c : couplings_)
+  for (auto& c : couplings_) {
     pack(c.boundary_op);
+    if (c.current_op.defined()) {
+      pack(c.current_op);
+    }
+  }
   if (state_.defined())
     pack(state_);
   if (source_ && source_->buffer_size() > 0) {
@@ -135,6 +143,9 @@ void LinearSystem::transfer_buffer(
   unpack(interior_op_);
   for (auto& c : couplings_) {
     unpack(c.boundary_op);
+    if (c.current_op.defined()) {
+      unpack(c.current_op);
+    }
   }
   if (state_is_static_)
     unpack(state_);

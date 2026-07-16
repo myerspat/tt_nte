@@ -12,6 +12,8 @@ void register_Communicator(py::module_& m)
     .value("DEFAULT", MPITag::DEFAULT)
     .value("PARTITION_ID_MAP", MPITag::PARTITION_ID_MAP)
     .value("ROUTING_TABLE", MPITag::ROUTING_TABLE)
+    .value("SOLUTION_GATHER_SIZE", MPITag::SOLUTION_GATHER_SIZE)
+    .value("SOLUTION_GATHER_DATA", MPITag::SOLUTION_GATHER_DATA)
     .export_values();
 
   py::enum_<DataType>(m, "DataType")

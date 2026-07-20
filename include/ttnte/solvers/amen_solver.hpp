@@ -1,12 +1,15 @@
 #pragma once
 
+#include "ttnte/linalg/amen/amen_config.hpp"
 #include "ttnte/linalg/format_type.hpp"
 #include "ttnte/solvers/local_solver.hpp"
 #include "ttnte/utils/exception.hpp"
 
 namespace ttnte::solvers {
 
-/// @brief The AMEn local solver which calls torchTT's implementation.
+/// @brief The AMEn local solver. Dispatches to either ttnte's own native
+/// AMEn implementation (`AMEnBackend::NATIVE`, the default) or the vendored
+/// torchTT implementation (`AMEnBackend::TORCHTT`), see `backend_`.
 class AMEnSolver : public LocalSolver {
 public:
   // =================================================================
@@ -39,17 +42,28 @@ protected:
   /// Show output.
   bool verbose_;
   /// What preconditioner to use.
-  int preconditioner_;
+  linalg::AMEnPreconditioner preconditioner_;
+  /// Which AMEn implementation to dispatch to.
+  linalg::AMEnBackend backend_;
+  /// Tuning knobs specific to `AMEnBackend::NATIVE`.
+  linalg::AMEnNativeOptions native_opts_;
+  /// True once `native_opts_.rank_freeze_eps` has triggered (sticky --
+  /// never resets).
+  bool rank_frozen_ = false;
 
   // =================================================================
   // Protected constructors
   AMEnSolver(int nswp = 22, double eps = 1e-10, double eps_forcing = 0.01,
     int max_rank = std::numeric_limits<int>::max(), int max_full = 500,
     int kickrank = 4, int kick2 = 0, int local_iterations = 40, int resets = 2,
-    bool verbose = false, int preconditioner = 0)
+    bool verbose = false,
+    linalg::AMEnPreconditioner preconditioner = linalg::AMEnPreconditioner::NONE,
+    linalg::AMEnBackend backend = linalg::AMEnBackend::NATIVE,
+    linalg::AMEnNativeOptions native_opts = linalg::AMEnNativeOptions{})
     : nswp_(nswp), eps_(eps), max_rank_(max_rank), max_full_(max_full),
       kickrank_(kickrank), kick2_(kick2), local_iterations_(local_iterations),
-      resets_(resets), verbose_(verbose), preconditioner_(preconditioner)
+      resets_(resets), verbose_(verbose), preconditioner_(preconditioner),
+      backend_(backend), native_opts_(native_opts)
   {
     if (nswp_ < 1 || eps_ < 0 || max_rank_ < 1 || max_full < 0 ||
         kickrank < 0 || kick2 < 0 || local_iterations_ < 1 || resets_ < 1) {
@@ -59,9 +73,19 @@ protected:
         "must be greater than or equal to 0");
     }
 
-    if (preconditioner < 0 || preconditioner > 2) {
+    if (preconditioner == linalg::AMEnPreconditioner::RANK1 &&
+        backend != linalg::AMEnBackend::NATIVE) {
       throw utils::runtime_error("ttnte::solvers::AMEnSolver::AMEnSolver",
-        "`prec` is either 0, 1, or 2");
+        "`AMEnPreconditioner::RANK1` is only supported with "
+        "`AMEnBackend::NATIVE` -- the torchTT backend has no rank-1 "
+        "preconditioner");
+    }
+
+    if (native_opts.rank_freeze_eps > 0 &&
+        backend != linalg::AMEnBackend::NATIVE) {
+      throw utils::runtime_error("ttnte::solvers::AMEnSolver::AMEnSolver",
+        "`rank_freeze_eps` is only supported with `AMEnBackend::NATIVE` -- "
+        "the torchTT backend has no zero-enrichment code path");
     }
 
     eps_floor_ = eps;
@@ -84,11 +108,25 @@ public:
 
   /// @brief Update min_error_ (via LocalSolver), then force eps_ toward
   /// eps_floor_ as min_error_ improves: eps_ = max(eps_floor_, eps_forcing_ *
-  /// min_error_).
+  /// min_error_). Once eps_ drops to or below
+  /// `native_opts_.rank_freeze_eps` (if enabled), permanently disables
+  /// enrichment for every subsequent solve() call -- see `rank_freeze_eps`'s
+  /// doc comment. Since this runs strictly after the solve() call whose
+  /// error triggered it, that solve already completed as a normal,
+  /// enrichment-active AMEn solve with its usual post-solve round; freezing
+  /// only affects solve() calls from this point on.
   void update_convergence_criteria(double error) override
   {
     LocalSolver::update_convergence_criteria(error);
     eps_ = std::max(eps_floor_, eps_forcing_ * min_error_);
+
+    if (!rank_frozen_ && native_opts_.rank_freeze_eps > 0 &&
+        eps_ <= native_opts_.rank_freeze_eps) {
+      rank_frozen_ = true;
+      kickrank_ = 0;
+      kick2_ = 0;
+      native_opts_.als_residual_rank = 0;
+    }
   }
 
   // =================================================================
@@ -100,6 +138,9 @@ public:
   {
     return static_cast<int64_t>(max_rank_);
   }
+  /// @return Whether rank freezing (`native_opts_.rank_freeze_eps`) has
+  /// triggered.
+  bool is_rank_frozen() const noexcept { return rank_frozen_; }
 
   /// @return Always FormatType::TENSOR_TRAIN.
   linalg::FormatType get_state_format() override final

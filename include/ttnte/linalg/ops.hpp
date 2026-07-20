@@ -249,7 +249,10 @@ inline State amen_solve(const Operator& A, const State& b,
   std::optional<State> x0 = std::nullopt, int nswp = 22, double eps = 1e-10,
   int max_rank = std::numeric_limits<int>::max(), int max_full = 500,
   int kickrank = 4, int kick2 = 0, int local_iterations = 40, int resets = 2,
-  bool verbose = false, int preconditioner = 0)
+  bool verbose = false,
+  AMEnPreconditioner preconditioner = AMEnPreconditioner::NONE,
+  AMEnBackend backend = AMEnBackend::NATIVE,
+  AMEnNativeOptions native_opts = AMEnNativeOptions{})
 {
   std::optional<TTEngine> x0_engine = std::nullopt;
   if (x0.has_value()) {
@@ -258,7 +261,8 @@ inline State amen_solve(const Operator& A, const State& b,
 
   TTEngine result =
     amen_solve(A.as_tt(), b.as_tt(), x0_engine, nswp, eps, max_rank, max_full,
-      kickrank, kick2, local_iterations, resets, verbose, preconditioner);
+      kickrank, kick2, local_iterations, resets, verbose, preconditioner,
+      backend, native_opts);
 
   return State(std::move(result));
 }

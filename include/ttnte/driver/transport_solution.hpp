@@ -772,12 +772,46 @@ public:
       torch::Tensor values = evaluate_field_at_points(
         block, local_fields_.at(block->get_gid()), converged_coords);
 
-      local_residual.index_copy_(0, converged_global_idx, converged_residual);
-      local_values.index_copy_(0, converged_global_idx, values);
+      // Only accept this block's contribution where it strictly improves on
+      // whatever this rank has already recorded for the same point. Points
+      // exactly on a shared patch boundary (e.g. two ruled patches meeting at
+      // a seam) can be valid, converged candidates for more than one LOCAL
+      // block -- without this check, whichever block happens to be last in
+      // mesh_->get_blocks() iteration order would silently clobber an
+      // earlier, equally-valid entry via index_copy_. Using strict `<`
+      // (not `<=`) means the first block to claim a point keeps it on an
+      // exact tie, which is deterministic and, critically, mirrors the
+      // cross-rank tie-break below so a point's winner doesn't depend on how
+      // many ranks the mesh happens to be split across.
+      torch::Tensor current_residual =
+        local_residual.index_select(0, converged_global_idx);
+      torch::Tensor improves = converged_residual < current_residual;
+      torch::Tensor improve_local_idx = improves.nonzero().squeeze(-1);
+      if (improve_local_idx.numel() == 0) {
+        continue;
+      }
+      torch::Tensor improve_global_idx =
+        converged_global_idx.index_select(0, improve_local_idx);
+
+      local_residual.index_copy_(0, improve_global_idx,
+        converged_residual.index_select(0, improve_local_idx));
+      local_values.index_copy_(
+        0, improve_global_idx, values.index_select(0, improve_local_idx));
     }
 
-    // -- Resolve ownership across ranks: MIN residual, then SUM the
-    // winner-only contribution.
+    // -- Resolve ownership across ranks: MIN residual, then a deterministic
+    // rank tie-break so exactly one rank contributes per point. A plain
+    // `local_residual <= global_residual` comparison (the previous approach)
+    // lets EVERY rank that exactly ties the global minimum count as a
+    // winner -- and exact ties are the common case right at a shared patch
+    // boundary, where two neighboring patches' inverse_map both converge to
+    // a near-zero (sometimes bit-identical) residual. When those patches
+    // happen to live on different ranks, the winner-only SUM below would
+    // then add both patches' field values together instead of picking one,
+    // producing a sharp, rank-distribution-dependent artifact exactly at
+    // patch interfaces. Breaking ties by lowest rank makes the winner -- and
+    // therefore the averaged output -- independent of how the mesh happens
+    // to be partitioned.
     torch::Tensor global_residual = local_residual;
     if (comm_.size() > 1) {
       global_residual = torch::empty_like(local_residual);
@@ -793,9 +827,23 @@ public:
         "At least one grid point is not covered by any patch on any rank");
     }
 
-    torch::Tensor is_winner = (local_residual <= global_residual)
-                                .unsqueeze(-1)
-                                .to(local_values.dtype());
+    torch::Tensor is_winner;
+    if (comm_.size() > 1) {
+      auto rank_options = torch::TensorOptions().dtype(torch::kInt32);
+      torch::Tensor candidate_rank = torch::where(local_residual <= global_residual,
+        torch::full({total_points}, comm_.rank(), rank_options),
+        torch::full({total_points}, comm_.size(), rank_options));
+      torch::Tensor winning_rank = torch::empty_like(candidate_rank);
+      comm_
+        .iallreduce(candidate_rank.data_ptr<int32_t>(),
+          winning_rank.data_ptr<int32_t>(), total_points, parallel::MPIOp::MIN)
+        .wait();
+      is_winner = (winning_rank == comm_.rank()).unsqueeze(-1).to(local_values.dtype());
+    } else {
+      is_winner = (local_residual <= global_residual)
+                    .unsqueeze(-1)
+                    .to(local_values.dtype());
+    }
     torch::Tensor contribution = local_values * is_winner;
 
     torch::Tensor global_values = contribution;

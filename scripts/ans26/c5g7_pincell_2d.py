@@ -177,7 +177,7 @@ if __name__ == "__main__":
             kickrank=6,
             local_iterations=200,
             resets=4,
-            rmax=500,
+            max_rank=500,
         )
     )
 

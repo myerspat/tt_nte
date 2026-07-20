@@ -185,6 +185,12 @@ public:
     double k_error = std::numeric_limits<double>::max();
     inner_solver->update_convergence_criteria(error);
 
+    for (const auto& sys : local_systems) {
+      const auto& x = sys->get_state();
+      std::cout << "GID: " << sys->get_gid()
+                << ", Discretization: " << x.as_tt().get_m_modes() << std::endl;
+    }
+
     // Temporarily move the angular quadrature set (deliberately often
     // CPU-resident, since it's tiny) to match the local systems' own
     // device/dtype for the duration of the solve, since
@@ -321,10 +327,17 @@ public:
       k_error = std::abs(k_global - k_prev);
       k_prev = k_global;
 
+      for (const auto& sys : local_systems) {
+        const auto& x = sys->get_state();
+        std::cout << "GID: " << sys->get_gid()
+                  << ", Ranks: " << x.as_tt().get_ranks()
+                  << ", Compression: " << x.get_compression() << std::endl;
+      }
+
       if (verbose) {
         std::cout << "-- (" << i << "): k = " << std::fixed
                   << std::setprecision(6) << k_global
-                  << ", k Error (pcm) = " << std::fixed << std::setprecision(6)
+                  << ", k Error = " << std::fixed << std::setprecision(6)
                   << k_error << ", Scalar Flux L2 Error = " << std::fixed
                   << std::setprecision(10) << error
                   << ", Elapsed Time = " << std::fixed << std::setprecision(3)

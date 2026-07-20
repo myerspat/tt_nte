@@ -1,4 +1,5 @@
 #include "ttnte/linalg/tt_ops.hpp"
+#include "ttnte/linalg/amen/amen_sweep.hpp"
 #include "ttnte/linalg/matrix_ops.hpp"
 #include "ttnte/python/torchtt.hpp"
 #include "ttnte/utils/exception.hpp"
@@ -325,11 +326,20 @@ TTEngine amen_mm(const linalg::TTEngine& a, const linalg::TTEngine& b, int nswp,
     a, b, nswp, x0, eps, max_rank, kickrank, kick2, verbose);
 }
 
-TTEngine amen_solve(const linalg::TTEngine& A, const linalg::TTEngine& b,
+namespace {
+
+TTEngine amen_solve_torchtt(const linalg::TTEngine& A, const linalg::TTEngine& b,
   std::optional<linalg::TTEngine> x0, int nswp, double eps, int max_rank,
   int max_full, int kickrank, int kick2, int local_iterations, int resets,
-  bool verbose, int preconditioner)
+  bool verbose, AMEnPreconditioner preconditioner)
 {
+  if (preconditioner == AMEnPreconditioner::RANK1) {
+    throw utils::runtime_error("ttnte::linalg::amen_solve",
+      "`AMEnPreconditioner::RANK1` is only supported with "
+      "`AMEnBackend::NATIVE` -- the torchTT backend has no rank-1 "
+      "preconditioner");
+  }
+
   // Get cores for each portion
   std::vector<torch::Tensor> A_cores(
     A.get_cores().begin(), A.get_cores().end());
@@ -403,9 +413,41 @@ TTEngine amen_solve(const linalg::TTEngine& A, const linalg::TTEngine& b,
 
   auto x_cores = torchtt::amen_solve(A_cores, b_cores, x0_cores, N, rA, rb, rx0,
     nswp, eps, max_rank, max_full, kickrank, kick2, local_iterations, resets,
-    verbose, preconditioner);
+    verbose, static_cast<int>(preconditioner));
 
   return TTEngine(TTEngine::Tensors(x_cores.cbegin(), x_cores.cend()), true);
+}
+
+} // namespace
+
+TTEngine amen_solve(const linalg::TTEngine& A, const linalg::TTEngine& b,
+  std::optional<linalg::TTEngine> x0, int nswp, double eps, int max_rank,
+  int max_full, int kickrank, int kick2, int local_iterations, int resets,
+  bool verbose, AMEnPreconditioner preconditioner, AMEnBackend backend,
+  AMEnNativeOptions native_opts)
+{
+  if (backend == AMEnBackend::TORCHTT) {
+    return amen_solve_torchtt(A, b, x0, nswp, eps, max_rank, max_full, kickrank,
+      kick2, local_iterations, resets, verbose, preconditioner);
+  }
+
+  return amen_solve_native(A, b, x0, nswp, eps, max_rank, max_full, kickrank,
+    kick2, local_iterations, resets, verbose, preconditioner, native_opts);
+}
+
+TTEngine amen_solve_native(const linalg::TTEngine& A, const linalg::TTEngine& b,
+  std::optional<linalg::TTEngine> x0, int nswp, double eps, int max_rank,
+  int max_full, int kickrank, int kick2, int local_iterations, int resets,
+  bool verbose, AMEnPreconditioner preconditioner,
+  const AMEnNativeOptions& native_opts)
+{
+  // No device-specific branching needed here: every device-specific tuning
+  // decision already lives one layer down, inside amen_sweep's own
+  // primitives (FoldedLocalOperator, gmres_solve's CPU/GPU strategy split,
+  // qless_orthogonalize) -- see amen_solve_dispatch's doc comment.
+  return amen::amen_solve_dispatch(A, b, x0, nswp, eps, max_rank, max_full,
+    kickrank, kick2, local_iterations, resets, verbose, preconditioner,
+    native_opts, "ttnte::linalg::amen_solve_native");
 }
 
 TTEngine function_interpolate(

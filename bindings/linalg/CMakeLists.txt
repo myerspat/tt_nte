@@ -6,12 +6,25 @@ set(LINALG_SRC_REL
     state.cpp
     tt_engine.cpp
     matrix_ops.cpp
-    tt_ops.cpp)
+    tt_ops.cpp
+    amen/qless_tsqr.cpp
+    amen/rank1_preconditioner.cpp
+    amen/local_preconditioner.cpp
+    amen/local_operator.cpp
+    amen/gmres_local.cpp
+    amen/phi_recursions.cpp
+    amen/amen_sweep.cpp)
+
+if(USE_CUDA)
+  list(APPEND LINALG_SRC_REL amen/gmres_kernels.cu)
+endif()
 
 # Relevant files from bindings/linalg
 set(LINALG_BINDINGS_REL
     bindings.cpp
     format_type.cpp
+    amen_config.cpp
+    amen_internal.cpp
     operator.cpp
     state.cpp
     tt_engine.cpp

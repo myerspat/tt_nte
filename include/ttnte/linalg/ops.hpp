@@ -62,6 +62,25 @@ inline State mv(const Operator& a, const State& b)
     a.get_variant(), b.get_variant());
 }
 
+/// @brief Compute the direct sum (TT addition) of several states in a single
+/// allocation pass per core, instead of folding them together one at a time
+/// with repeated `operator+=` calls. See `direct_sum(const
+/// std::vector<TTEngine>&)` for why this matters. Unrounded -- callers should
+/// round the result themselves.
+/// @param states The states to sum; each must hold a TTEngine with the same
+/// number of cores, matching modes, and shared device/dtype.
+/// @return The (unrounded) State sum of `states`.
+inline State direct_sum(const std::vector<State>& states)
+{
+  std::vector<TTEngine> engines;
+  engines.reserve(states.size());
+  for (const auto& state : states) {
+    engines.push_back(state.as_tt());
+  }
+
+  return State(direct_sum(engines));
+}
+
 /// @brief Perform an element-wise division with two tensor trains using AMEn.
 /// This calls the torchTT implementation `torchtt._division.amen_divide()` in
 /// Python.
@@ -252,17 +271,16 @@ inline State amen_solve(const Operator& A, const State& b,
   bool verbose = false,
   AMEnPreconditioner preconditioner = AMEnPreconditioner::NONE,
   AMEnBackend backend = AMEnBackend::NATIVE,
-  AMEnNativeOptions native_opts = AMEnNativeOptions{})
+  AMEnNativeOptions native_opts = AMEnNativeOptions {})
 {
   std::optional<TTEngine> x0_engine = std::nullopt;
   if (x0.has_value()) {
     x0_engine = x0->as_tt();
   }
 
-  TTEngine result =
-    amen_solve(A.as_tt(), b.as_tt(), x0_engine, nswp, eps, max_rank, max_full,
-      kickrank, kick2, local_iterations, resets, verbose, preconditioner,
-      backend, native_opts);
+  TTEngine result = amen_solve(A.as_tt(), b.as_tt(), x0_engine, nswp, eps,
+    max_rank, max_full, kickrank, kick2, local_iterations, resets, verbose,
+    preconditioner, backend, native_opts);
 
   return State(std::move(result));
 }

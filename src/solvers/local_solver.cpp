@@ -1,5 +1,6 @@
 #include "ttnte/solvers/local_solver.hpp"
 #include "ttnte/linalg/ops.hpp"
+#include <vector>
 
 namespace ttnte::solvers {
 
@@ -12,23 +13,23 @@ LocalSolver::presolve(const linalg::LinearSystem::Ptr& sys) const
   linalg::Operator A = sys->get_interior_op();
   linalg::State x0 = sys->get_state();
 
-  // Accumulate boundary contributions into a separate state so that
-  // combining with the source uses the binary operator+ (which allocates a
-  // fresh StateData), avoiding aliasing with EigenSource::state_ through the
-  // shallow-copy State handle.
-  linalg::State boundary_sum;
-  bool has_boundary = false;
+  // Gather boundary contributions and sum them in one batched pass (see
+  // linalg::direct_sum) rather than folding them together one at a time --
+  // that would reallocate and copy the full, ever-growing set of cores at
+  // every step. The result is a fresh State (not aliased with any
+  // coupling.recv_buffer or EigenSource::state_), so it's safe to combine
+  // with the source below via the binary operator+.
+  std::vector<linalg::State> boundary_terms;
   for (auto& coupling : sys->get_couplings()) {
     if (coupling.recv_buffer.defined()) {
-      if (boundary_sum.defined()) {
-        boundary_sum += coupling.recv_buffer;
-      } else {
-        boundary_sum = std::move(coupling.recv_buffer);
-      }
+      boundary_terms.push_back(std::move(coupling.recv_buffer));
       coupling.recv_buffer = linalg::State();
-      has_boundary = true;
     }
   }
+
+  const bool has_boundary = !boundary_terms.empty();
+  linalg::State boundary_sum =
+    has_boundary ? linalg::direct_sum(boundary_terms) : linalg::State();
 
   // Build the RHS: fission/fixed source + boundary.
   // When boundary is present, use binary operator+ so the result owns fresh

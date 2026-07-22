@@ -24,6 +24,7 @@ from ttnte.solvers import (
     AMEnSolver,
     BlockJacobiStrategy,
     ExecMode,
+    IGADDSolver,
     CommMode,
 )
 
@@ -102,7 +103,7 @@ if __name__ == "__main__":
     for fill, surface in zip([fills[0], fills[-2], fills[-2]], fuel + water):
         mesh.add_block(
             Patch.from_igakit(
-                refine(surface, 10, 2), device=cpu, dtype=dtype, fill=fill
+                refine(surface, 12, 2), device=cpu, dtype=dtype, fill=fill
             )
         )
 
@@ -153,33 +154,62 @@ if __name__ == "__main__":
     # Run the assembler
     driver.assemble(qset, config)
 
+    for s in driver.mesh.blocks:
+        assembler = driver.get_assembler(s.gid)
+        output = f"GID: {s.gid}\n"
+
+        H = assembler.interior_loss_op.as_tt()
+        output += f"  H: Ranks {H.ranks}, CR: {H.compression}\n"
+        S = assembler.scatter_op.as_tt()
+        output += f"  S: Ranks {S.ranks}, CR: {S.compression}\n"
+
+        if assembler.fission_op.defined():
+            F = assembler.fission_op.as_tt()
+            output += f"  F: Ranks {F.ranks}, CR: {F.compression}\n"
+
+        for op in assembler.inflow_ops:
+            Bin = op.as_tt()
+            output += f"  Bin: Ranks {Bin.ranks}, CR: {Bin.compression}\n"
+
+        for op in assembler.outflow_ops:
+            Bout = op.as_tt()
+            output += f"  Bout: Ranks {Bout.ranks}, CR: {Bout.compression}\n"
+
+        print(output, end="")
+
     # Warmup GPUs
     warmup_all_gpus()
 
     # Create Block-Jacobi DD strategy
+    outer_tol = 1e-4
+    inner_tol = 5e-5
+    eps = 1e-5
+
     config = DDSolverConfig(
-        tol=5e-7,
+        tol=inner_tol,
+        tol_forcing=0.1,
         max_iter=100,
-        eps=5e-8,
         use_gpu=True,
         memory_policy=MemoryPolicy.RESIDENT,
         exec_mode=ExecMode.ASYNC,
         comm_mode=CommMode.ASYNC,
         verbose=True,
     )
-    config.inner_forcing = 0.1
-    config.eps_forcing = 0.01
     strategy = BlockJacobiStrategy(config)
     strategy.set_local_solver(
         AMEnSolver(
-            nswp=10,
-            eps=5e-8,
-            kickrank=6,
+            nswp=2,
+            eps=eps,
+            eps_forcing=0.01,
+            kickrank=4,
             local_iterations=200,
             resets=4,
             max_rank=500,
         )
     )
+    dd_solver = IGADDSolver(driver.mesh, strategy)
 
     # Run DD eigenvalue solver
-    result = driver.solve_eigenvalue(strategy, tol=1e-6, max_iter=500, verbose=True)
+    result = driver.solve_eigenvalue(
+        dd_solver, tol=outer_tol, max_iter=500, verbose=True
+    )

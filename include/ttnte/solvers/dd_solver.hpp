@@ -17,6 +17,7 @@
 #include "ttnte/utils/exception.hpp"
 #include "ttnte/utils/label.hpp"
 
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <memory>
 #include <optional>
 #include <string>
@@ -223,6 +224,19 @@ public:
       // Tighten TT truncation eps (this step()'s Schwarz tol is fixed --
       // see the snapshot above)
       strategy_->update_convergence_criteria(error);
+
+      // Release the CUDA caching allocator's unused cached blocks every
+      // Schwarz iteration. AMEn's per-core local-subproblem sizes vary from
+      // one iteration to the next as TT ranks adapt, which defeats the
+      // caching allocator's block reuse and otherwise lets "reserved" GPU
+      // memory ratchet up far past what's ever simultaneously live (see the
+      // GPU-memory investigation report). Measured cost is within run-to-run
+      // noise (~2% on a short benchmark) -- negligible next to the several
+      // seconds each Schwarz iteration's AMEn local solves take.
+      if (cfg.use_gpu && torch::cuda::is_available()) {
+        torch::cuda::synchronize();
+        c10::cuda::CUDACachingAllocator::emptyCache();
+      }
 
       // Check if the interfaces converged
       if (verbose) {

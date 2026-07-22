@@ -11,6 +11,7 @@ from ttnte.linalg import (
     amen_mm,
     amen_mv,
     amen_solve,
+    direct_sum,
 )
 
 test_params = [
@@ -147,6 +148,88 @@ def test_matrix_matrix_operations(device, dtype):
     torch.testing.assert_close(
         C_amen.to_dense(interleave=False).squeeze(), C_expected, rtol=1e-3, atol=1e-4
     )
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
+def test_direct_sum_vector(device, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    modes = [3, 4, 2]
+    num_terms = 5
+    rtol, atol = (1e-8, 1e-10) if dtype == torch.float64 else (1e-4, 1e-5)
+
+    dense_terms = [
+        torch.randn(*modes, device=device, dtype=dtype) for _ in range(num_terms)
+    ]
+    tt_terms = [TTEngine.from_dense(d, eps=1e-12) for d in dense_terms]
+
+    tt_sum = direct_sum(tt_terms)
+    dense_expected = sum(dense_terms)
+    torch.testing.assert_close(
+        tt_sum.to_dense().squeeze(), dense_expected, rtol=rtol, atol=atol
+    )
+
+    # Should agree with what pairwise `+` (repeated binary addition) produces.
+    tt_pairwise = tt_terms[0]
+    for term in tt_terms[1:]:
+        tt_pairwise = tt_pairwise + term
+    torch.testing.assert_close(
+        tt_sum.to_dense().squeeze(),
+        tt_pairwise.to_dense().squeeze(),
+        rtol=rtol,
+        atol=atol,
+    )
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
+def test_direct_sum_matrix(device, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    m_modes = [3, 2]
+    n_modes = [2, 3]
+    num_terms = 4
+    rtol, atol = (1e-8, 1e-10) if dtype == torch.float64 else (1e-4, 1e-5)
+
+    dense_terms = [
+        torch.randn(*m_modes, *n_modes, device=device, dtype=dtype)
+        for _ in range(num_terms)
+    ]
+    tt_terms = [
+        TTEngine.from_dense(
+            d, m_modes=m_modes, n_modes=n_modes, is_interleaved=False, eps=1e-12
+        )
+        for d in dense_terms
+    ]
+
+    tt_sum = direct_sum(tt_terms)
+    dense_expected = sum(dense_terms)
+    torch.testing.assert_close(
+        tt_sum.to_dense(interleave=False).squeeze(),
+        dense_expected,
+        rtol=rtol,
+        atol=atol,
+    )
+
+
+def test_direct_sum_single_term():
+    modes = [3, 4]
+    dense = torch.randn(*modes, dtype=torch.float64)
+    tt = TTEngine.from_dense(dense, eps=1e-12)
+
+    tt_sum = direct_sum([tt])
+    torch.testing.assert_close(tt_sum.to_dense().squeeze(), dense)
+
+
+def test_direct_sum_single_core():
+    # A single-core TT is a raw tensor with no bond dimensions to embed into;
+    # summing should reduce to plain elementwise addition.
+    dense_terms = [torch.randn(5, dtype=torch.float64) for _ in range(3)]
+    tt_terms = [TTEngine.from_dense(d) for d in dense_terms]
+
+    tt_sum = direct_sum(tt_terms)
+    torch.testing.assert_close(tt_sum.to_dense().squeeze(), sum(dense_terms))
 
 
 @pytest.mark.parametrize("device, dtype", test_params)

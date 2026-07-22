@@ -22,6 +22,12 @@ void register_tt_ops(py::module_& m)
     "Compute an exact matrix-vector product in TT format.",
     py::call_guard<py::gil_scoped_release>());
 
+  m.def("direct_sum", &direct_sum, py::arg("tts"),
+    "Compute the direct sum (TT addition) of several tensor trains in a "
+    "single batched pass, instead of folding them together one at a time "
+    "with repeated binary addition.",
+    py::call_guard<py::gil_scoped_release>());
+
   // =================================================================
   // Element-Wise Operations & Fast Approximations (2024 Arxiv)
   // =================================================================
@@ -106,16 +112,15 @@ void register_tt_ops(py::module_& m)
     py::arg("verbose") = false,
     py::arg("preconditioner") = AMEnPreconditioner::NONE,
     py::arg("backend") = AMEnBackend::NATIVE,
-    py::arg("native_opts") = AMEnNativeOptions{},
+    py::arg("native_opts") = AMEnNativeOptions {},
     "Solve a linear system A @ x = b in TT format using AMEn.",
     py::call_guard<py::gil_scoped_release>());
 
-  m.def("amen_solve_native",
-    &amen_solve_native, py::arg("A"), py::arg("b"), py::arg("x0"),
-    py::arg("nswp"), py::arg("eps"), py::arg("max_rank"), py::arg("max_full"),
-    py::arg("kickrank"), py::arg("kick2"), py::arg("local_iterations"),
-    py::arg("resets"), py::arg("verbose"), py::arg("preconditioner"),
-    py::arg("native_opts"),
+  m.def("amen_solve_native", &amen_solve_native, py::arg("A"), py::arg("b"),
+    py::arg("x0"), py::arg("nswp"), py::arg("eps"), py::arg("max_rank"),
+    py::arg("max_full"), py::arg("kickrank"), py::arg("kick2"),
+    py::arg("local_iterations"), py::arg("resets"), py::arg("verbose"),
+    py::arg("preconditioner"), py::arg("native_opts"),
     "Solve a linear system A @ x = b in TT format using ttnte's native AMEn "
     "implementation (exposed directly for testing/benchmarking).",
     py::call_guard<py::gil_scoped_release>());

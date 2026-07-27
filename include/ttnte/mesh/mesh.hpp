@@ -518,9 +518,12 @@ public:
   /// Euclidean axes.
   /// @param bcplanes Which planes are set with the boundary condition.
   /// @param type The boundary condition type.
+  /// @param spec Optional fixed source spec, applied to every matched face
+  /// (only meaningful when `type == BoundaryType::INCIDENT`).
   /// @param tol The tolerance for geometric comparisons.
   void set_axis_aligned_conditions(const physics::BCPlane& bcplanes,
-    const physics::BoundaryType& type, double tol = 1e-8)
+    const physics::BoundaryType& type,
+    std::optional<physics::FixedSource> spec = std::nullopt, double tol = 1e-8)
   {
     // Lock class from multiple threads calling
     std::lock_guard<std::mutex> lock(mesh_mutex);
@@ -551,11 +554,19 @@ public:
               if (i < active_planes.size() && active_planes[i] &&
                   std::abs(bbox_center[d].item<double>() - bbox_acc[0][d]) <
                     tol) {
-                bptr->set_boundary_type(dim, is_upper, type);
+                if (spec.has_value()) {
+                  bptr->set_boundary_source(dim, is_upper, *spec);
+                } else {
+                  bptr->set_boundary_type(dim, is_upper, type);
+                }
               } else if (i + 1 < active_planes.size() && active_planes[i + 1] &&
                          std::abs(bbox_center[d].item<double>() -
                                   bbox_acc[1][d]) < tol) {
-                bptr->set_boundary_type(dim, is_upper, type);
+                if (spec.has_value()) {
+                  bptr->set_boundary_source(dim, is_upper, *spec);
+                } else {
+                  bptr->set_boundary_type(dim, is_upper, type);
+                }
               }
             }
           }

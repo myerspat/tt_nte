@@ -1285,6 +1285,298 @@ linalg::Operator DGFirstOrderTransportBackend<cad::Patch, Fmt,
 }
 
 template<FormatType Fmt, int64_t NumDim>
+linalg::State
+DGFirstOrderTransportBackend<cad::Patch, Fmt, NumDim>::assemble_source(
+  const FixedSource& spec)
+{
+  if constexpr (Fmt == FormatType::TENSOR_TRAIN) {
+    auto options = torch::TensorOptions()
+                     .device(block_->get_device())
+                     .dtype(block_->get_dtype());
+
+    // Angular "ones" cores (uniform-across-ordinates, for the isotropic
+    // branch, and the angle-doesn't-matter placeholder for the function
+    // branch's non-angular coordinate TTEngines) and the real angular VALUE
+    // cores (the function branch's angular coordinate TTEngines), sized per
+    // NumDim exactly like assemble_angular_integral()/assemble_ordinates().
+    linalg::TTEngine::Tensors angular_ones_cores;
+    linalg::TTEngine::Tensors angular_value_cores;
+    if constexpr (NumDim > 1) {
+      if (!angular_qset_->is_tensor_product()) {
+        throw utils::runtime_error(
+          "ttnte::physics::DGFirstOrderTransportBackend::assemble_source",
+          "The angular quadrature set must be a tensor product quadrature set");
+      }
+      auto angular_qset =
+        std::static_pointer_cast<math::ProductQuadrature>(angular_qset_);
+      const auto& quads = angular_qset->get_quads();
+      angular_ones_cores.push_back(
+        torch::ones({1, quads[0]->get_num_dofs(), 1, 1}, options));
+      angular_ones_cores.push_back(
+        torch::ones({1, quads[1]->get_num_dofs(), 1, 1}, options));
+      angular_value_cores.push_back(
+        quads[0]->get_points().reshape({1, -1, 1, 1}));
+      angular_value_cores.push_back(
+        quads[1]->get_points().reshape({1, -1, 1, 1}));
+    } else {
+      auto angular_qset =
+        std::static_pointer_cast<math::QuadratureSet1D>(angular_qset_);
+      angular_ones_cores.push_back(
+        torch::ones({1, angular_qset->get_num_dofs(), 1, 1}, options));
+      angular_value_cores.push_back(
+        angular_qset->get_points().reshape({1, -1, 1, 1}));
+    }
+
+    int64_t num_groups = material_->get_num_groups();
+    std::vector<linalg::TTEngine> terms;
+
+    // ---- Isotropic branch ----
+    if (spec.isotropic_strength.has_value()) {
+      TORCH_CHECK(spec.isotropic_strength->numel() == num_groups,
+        "FixedSource::isotropic_strength must have one entry per energy "
+        "group");
+
+      linalg::TTEngine isotropic(angular_ones_cores, false);
+
+      // Spatial load vector: mv(basis^T, mapping) -- NOT the mass-matrix-
+      // style mapped_basis (basis * mapping) used by
+      // assemble_fission_operator()/assemble_scatter_operator(); the raw
+      // (n=1) mapping already gives the correct (m=ctrlpts, n=1) shape for
+      // integrating a constant density against the DG test basis.
+      auto basis = assemble_basis();
+      auto mapping = assemble_integral_mapping();
+      linalg::TTEngine spatial = linalg::mm(basis.transpose(), mapping);
+      spatial.round_(config_->rounding.eps / static_cast<double>(NumDim + 1),
+        config_->rounding.max_rank);
+      isotropic.kron_(spatial);
+
+      // No angular normalization needed: angular quadrature weights are
+      // always normalized to sum to 1 (see QuadratureSet1D::gauss_legendre/
+      // gauss_chebyshev, `weights / weights.sum()`), not to
+      // get_weighting_factor() -- so a uniform per-direction value of Q
+      // already integrates (via qset.integrate(), which contracts against
+      // those sum-to-1 weights) to exactly Q, matching the physical-units
+      // convention directly.
+      isotropic.kron_(
+        spec.isotropic_strength->reshape({1, num_groups, 1, 1}).to(options));
+
+      terms.emplace_back(std::move(isotropic));
+    }
+
+    // ---- Arbitrary function (MMS or otherwise) branch ----
+    if (spec.function.has_value()) {
+      const auto& func = *spec.function;
+
+      // The assembler's own quad_points_ are parametric -- map through the
+      // patch's own geometry evaluation so the user's function is always
+      // called with PHYSICAL coordinates, not parametric ones.
+      torch::Tensor phys = block_->evaluate(quad_points_);
+      int64_t phys_dim = phys.size(-1);
+
+      linalg::TTEngine::Tensors spatial_ones_cores;
+      spatial_ones_cores.reserve(NumDim);
+      for (int64_t d = 0; d < NumDim; d++) {
+        spatial_ones_cores.push_back(
+          torch::ones({1, quad_points_[d].size(0), 1, 1}, options));
+      }
+      torch::Tensor energy_ones = torch::ones({1, num_groups, 1, 1}, options);
+      torch::Tensor energy_values =
+        torch::arange(num_groups, options).reshape({1, -1, 1, 1});
+
+      // Coordinate TTEngines, all sharing the same combined [angle, space
+      // (x NumDim), energy] core structure -- required so TT-cross can
+      // jointly sample every axis at the same multi-index (mirrors
+      // TTEngine::meshgrid()'s "each axis real in its own core, ones
+      // elsewhere" convention, generalized to the spatial coordinates,
+      // which -- for a curved patch -- aren't separable per parametric
+      // dimension the way the angular/energy axes are).
+      std::vector<linalg::TTEngine> xs;
+      xs.reserve(angular_value_cores.size() + phys_dim + 1);
+
+      for (size_t a = 0; a < angular_value_cores.size(); a++) {
+        linalg::TTEngine::Tensors cores;
+        for (size_t b = 0; b < angular_value_cores.size(); b++) {
+          cores.push_back(
+            b == a ? angular_value_cores[a] : angular_ones_cores[b]);
+        }
+        for (const auto& c : spatial_ones_cores) {
+          cores.push_back(c);
+        }
+        cores.push_back(energy_ones);
+        xs.emplace_back(std::move(cores), false);
+      }
+
+      for (int64_t k = 0; k < phys_dim; k++) {
+        linalg::TTEngine coord(angular_ones_cores, false);
+        linalg::TTEngine spatial_k =
+          linalg::TTEngine::from_dense(phys.select(-1, k).contiguous(),
+            config_->rounding.eps, config_->rounding.max_rank);
+        coord.kron_(spatial_k);
+        coord.kron_(energy_ones);
+        xs.push_back(std::move(coord));
+      }
+
+      {
+        linalg::TTEngine coord(angular_ones_cores, false);
+        for (const auto& c : spatial_ones_cores) {
+          coord.kron_(c);
+        }
+        coord.kron_(energy_values);
+        xs.push_back(std::move(coord));
+      }
+
+      linalg::TTEngine function_source = linalg::function_interpolate(func, xs,
+        config_->cross.eps, std::nullopt, config_->cross.nswp,
+        config_->cross.kick, config_->cross.max_rank, config_->cross.verbose);
+
+      // Weight by the Jacobian mapping (broadcast across angle/energy, real
+      // only in the spatial cores) -- same physical meaning as the
+      // isotropic branch's spatial load vector, just applied as a Hadamard
+      // product since function_source already carries angular/energy
+      // dependence.
+      auto basis = assemble_basis();
+      auto mapping = assemble_integral_mapping();
+      linalg::TTEngine mapping_full(angular_ones_cores, false);
+      mapping_full.kron_(mapping);
+      mapping_full.kron_(energy_ones);
+      function_source *= mapping_full;
+      function_source.round_(
+        config_->rounding.eps / static_cast<double>(NumDim + 2),
+        config_->rounding.max_rank);
+
+      // Project onto the DG basis: a Galerkin load vector, not a pointwise
+      // sample. Sandwich the spatial basis between angle/energy IDENTITY
+      // operators (diagonal, self-transpose) so the whole combined object
+      // can be contracted in one mm() against function_source, transposing
+      // only the (non-symmetric) spatial cores -- exactly the pattern
+      // TransportSolution::compute_error_terms() already uses to combine an
+      // angle/energy-identity with a spatial evaluation operator.
+      c10::SmallVector<int64_t, 6> angle_modes;
+      for (const auto& c : angular_ones_cores) {
+        angle_modes.push_back(c.size(1));
+      }
+      auto id_angle = linalg::TTEngine::ones(
+        angle_modes, block_->get_device(), block_->get_dtype())
+                        .diagonalize();
+      auto id_energy = linalg::TTEngine::ones(
+        {num_groups}, block_->get_device(), block_->get_dtype())
+                         .diagonalize();
+
+      linalg::TTEngine full_basis = id_angle;
+      full_basis.kron_(basis);
+      full_basis.kron_(id_energy);
+      full_basis.transpose_();
+
+      linalg::TTEngine projected = linalg::mm(full_basis, function_source);
+      projected.round_(config_->rounding.eps, config_->rounding.max_rank);
+
+      terms.emplace_back(std::move(projected));
+    }
+
+    linalg::TTEngine source =
+      terms.size() == 1 ? std::move(terms[0]) : linalg::direct_sum(terms);
+    source.round_(config_->rounding.eps, config_->rounding.max_rank);
+    return linalg::State(std::move(source));
+  }
+
+  throw utils::runtime_error(
+    "ttnte::physics::DGFirstOrderTransportBackend::assemble_source",
+    "This method does not support this format yet");
+}
+
+template<FormatType Fmt, int64_t NumDim>
+linalg::State
+DGFirstOrderTransportBackend<cad::Patch, Fmt, NumDim>::assemble_incident_source(
+  size_t dim, bool is_upper, const FixedSource& spec)
+{
+  if constexpr (Fmt == FormatType::TENSOR_TRAIN) {
+    if (spec.function.has_value()) {
+      throw utils::runtime_error(
+        "ttnte::physics::DGFirstOrderTransportBackend::"
+        "assemble_incident_source",
+        "Arbitrary-function incident boundary sources are not yet "
+        "supported -- only FixedSource::isotropic_strength can be "
+        "prescribed on a boundary face");
+    }
+    if (!spec.isotropic_strength.has_value()) {
+      throw utils::runtime_error(
+        "ttnte::physics::DGFirstOrderTransportBackend::"
+        "assemble_incident_source",
+        "FixedSource must define isotropic_strength for an INCIDENT "
+        "boundary face");
+    }
+
+    auto options = torch::TensorOptions()
+                     .device(block_->get_device())
+                     .dtype(block_->get_dtype());
+    int64_t num_groups = material_->get_num_groups();
+    TORCH_CHECK(spec.isotropic_strength->numel() == num_groups,
+      "FixedSource::isotropic_strength must have one entry per energy "
+      "group");
+
+    // Angular "ones" cores: an isotropic incident flux has the same value in
+    // every direction. inflow_ops_[face_idx] (built by
+    // assemble_boundary_operators()) already carries the (Omega . n) < 0
+    // upwind mask, so applying it to this uniform-in-angle State
+    // automatically zeroes the outgoing directions -- no incoming-only mask
+    // needs to be built here.
+    linalg::TTEngine::Tensors angular_ones_cores;
+    if constexpr (NumDim > 1) {
+      if (!angular_qset_->is_tensor_product()) {
+        throw utils::runtime_error(
+          "ttnte::physics::DGFirstOrderTransportBackend::"
+          "assemble_incident_source",
+          "The angular quadrature set must be a tensor product quadrature "
+          "set");
+      }
+      auto angular_qset =
+        std::static_pointer_cast<math::ProductQuadrature>(angular_qset_);
+      const auto& quads = angular_qset->get_quads();
+      angular_ones_cores.push_back(
+        torch::ones({1, quads[0]->get_num_dofs(), 1, 1}, options));
+      angular_ones_cores.push_back(
+        torch::ones({1, quads[1]->get_num_dofs(), 1, 1}, options));
+    } else {
+      auto angular_qset =
+        std::static_pointer_cast<math::QuadratureSet1D>(angular_qset_);
+      angular_ones_cores.push_back(
+        torch::ones({1, angular_qset->get_num_dofs(), 1, 1}, options));
+    }
+
+    // Spatial "ones" cores at every tangential control point: a raw NODAL
+    // representation (constant everywhere for an isotropic source), NOT an
+    // already basis-integrated load vector -- inflow_ops_[face_idx]'s own
+    // tangential cores (built via project_boundary_mask() in
+    // assemble_boundary_operators()) already perform the Galerkin
+    // test-function integration when applied, exactly the way the DAG's
+    // apply task applies coupling.boundary_op directly to a raw narrowed
+    // neighbor State (see configure_cpu_task.hpp). The sliced `dim` itself
+    // is narrowed to a single trivial point, matching inflow_op's own
+    // n_mode = 1 there (the same face-extraction-column convention used for
+    // INTERNAL faces).
+    linalg::TTEngine::Tensors spatial_cores;
+    spatial_cores.reserve(NumDim);
+    for (int64_t d = 0; d < NumDim; d++) {
+      int64_t n =
+        (static_cast<size_t>(d) == dim) ? 1 : block_->get_ctrlpts_size(d);
+      spatial_cores.push_back(torch::ones({1, n, 1, 1}, options));
+    }
+
+    linalg::TTEngine source(angular_ones_cores, false);
+    source.kron_(linalg::TTEngine(spatial_cores, false));
+    source.kron_(
+      spec.isotropic_strength->reshape({1, num_groups, 1, 1}).to(options));
+    source.round_(config_->rounding.eps, config_->rounding.max_rank);
+
+    return linalg::State(std::move(source));
+  }
+
+  throw utils::runtime_error(
+    "ttnte::physics::DGFirstOrderTransportBackend::assemble_incident_source",
+    "This method does not support this format yet");
+}
+
+template<FormatType Fmt, int64_t NumDim>
 std::tuple<linalg::Operator, linalg::Operator, linalg::Operator>
 DGFirstOrderTransportBackend<cad::Patch, Fmt,
   NumDim>::assemble_boundary_operators(size_t dim, bool is_upper)
@@ -1401,10 +1693,14 @@ DGFirstOrderTransportBackend<cad::Patch, Fmt,
     target_core[face_idx][face_idx] = 1.0;
     target_core.unsqueeze_(0).unsqueeze_(-1);
 
-    // INTERNAL inflow: face-extraction column (n_mode = 1, m_mode =
-    // num_ctrlpts)
+    // INTERNAL / INCIDENT inflow: face-extraction column (n_mode = 1,
+    // m_mode = num_ctrlpts) -- both apply their inflow operator to a State
+    // already narrowed to a single point in `dim` (a NeighborCoupling's
+    // recv_buffer for INTERNAL, a user-supplied incident-flux State for
+    // INCIDENT), folding it into the full local basis.
     torch::Tensor inflow_target_core;
-    if (condition == BoundaryType::INTERNAL) {
+    if (condition == BoundaryType::INTERNAL ||
+        condition == BoundaryType::INCIDENT) {
       inflow_target_core = torch::zeros({num_ctrlpts, 1}, options);
       inflow_target_core[face_idx][0] = 1.0;
       inflow_target_core.unsqueeze_(0).unsqueeze_(-1);
@@ -1487,7 +1783,8 @@ DGFirstOrderTransportBackend<cad::Patch, Fmt,
     if (condition != BoundaryType::VACUUM) {
       B_in = inject_basis_and_energy(std::move(*B_in), inflow_target_core);
 
-      if (condition == BoundaryType::INTERNAL) {
+      if (condition == BoundaryType::INTERNAL ||
+          condition == BoundaryType::INCIDENT) {
         B_in->diagonalize_({0, 1});
       }
       return std::make_tuple(linalg::Operator(std::move(B_out)),
@@ -1518,10 +1815,12 @@ DGFirstOrderTransportBackend<cad::Patch, Fmt,
     target_core[face_idx][face_idx] = 1.0;
     target_core.unsqueeze_(0).unsqueeze_(-1);
 
-    // INTERNAL inflow: face-extraction column (n_mode = 1, m_mode =
-    // num_ctrlpts)
+    // INTERNAL / INCIDENT inflow: face-extraction column (n_mode = 1,
+    // m_mode = num_ctrlpts) -- see the NumDim > 1 branch above for the full
+    // rationale.
     torch::Tensor inflow_target_core;
-    if (condition == BoundaryType::INTERNAL) {
+    if (condition == BoundaryType::INTERNAL ||
+        condition == BoundaryType::INCIDENT) {
       inflow_target_core = torch::zeros({num_ctrlpts, 1}, options);
       inflow_target_core[face_idx][0] = 1.0;
       inflow_target_core.unsqueeze_(0).unsqueeze_(-1);
@@ -1569,7 +1868,8 @@ DGFirstOrderTransportBackend<cad::Patch, Fmt,
     if (condition != BoundaryType::VACUUM) {
       B_in = inject_basis_and_energy(std::move(*B_in), inflow_target_core);
 
-      if (condition == BoundaryType::INTERNAL) {
+      if (condition == BoundaryType::INTERNAL ||
+          condition == BoundaryType::INCIDENT) {
         B_in->diagonalize_({0});
       }
       return std::make_tuple(linalg::Operator(std::move(B_out)),
@@ -1728,7 +2028,8 @@ DGFirstOrderTransportBackend<cad::Patch, Fmt,
     }
   }
 
-  if (condition == BoundaryType::INTERNAL) {
+  if (condition == BoundaryType::INTERNAL ||
+      condition == BoundaryType::INCIDENT) {
     return assemble_interface_boundary_operator(basis, normal, mapping, false);
   }
 

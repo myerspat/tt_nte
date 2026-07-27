@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ttnte/mesh/mesh_block_boundary.hpp"
+#include "ttnte/physics/fixed_source.hpp"
 #include "ttnte/utils/exception.hpp"
 #include "ttnte/utils/label.hpp"
 #include <memory>
@@ -39,6 +40,10 @@ protected:
   Boundaries boundaries_;
   /// The material or whatever that fills this region
   uint64_t fill_id_ = 0;
+  /// Optional fixed (volumetric) source attached directly to this block --
+  /// a per-problem external forcing term, not an intrinsic material
+  /// property, so it's attached per-block rather than keyed by fill_id.
+  std::optional<physics::FixedSource> source_ = std::nullopt;
   /// Global ID
   int64_t gid_;
 
@@ -234,6 +239,11 @@ public:
   Boundaries& get_boundary_info() { return boundaries_; }
   /// @return The fill ID.
   const uint64_t& get_fill_id() const noexcept { return fill_id_; }
+  /// @return This block's fixed source, if one has been attached.
+  const std::optional<physics::FixedSource>& get_fixed_source() const noexcept
+  {
+    return source_;
+  }
 
   /// @param label The new label.
   void inline set_label(const Label& label) { label_ = label; }
@@ -251,6 +261,8 @@ public:
   {
     fill_id_ = label.to_int();
   }
+  /// @param source The fixed (volumetric) source to attach to this block.
+  void set_source(physics::FixedSource source) { source_ = std::move(source); }
 
   /// @brief Set the boundary condition type for a boundary.
   /// @param dim The dimension to take the upper or lower face.
@@ -261,6 +273,21 @@ public:
   {
     boundaries_[dim * static_cast<size_t>(2) + static_cast<size_t>(is_upper)]
       .set_type(type);
+  }
+
+  /// @brief Prescribe a fixed incident flux on a boundary face -- sets the
+  /// face's type to `BoundaryType::INCIDENT` and attaches the source in one
+  /// call.
+  /// @param dim The dimension to take the upper or lower face.
+  /// @param is_upper Whether to take the upper or lower face.
+  /// @param source The prescribed incident source for this face.
+  void set_boundary_source(
+    size_t dim, bool is_upper, physics::FixedSource source)
+  {
+    auto& boundary =
+      boundaries_[dim * static_cast<size_t>(2) + static_cast<size_t>(is_upper)];
+    boundary.set_source(std::move(source));
+    boundary.set_type(physics::BoundaryType::INCIDENT);
   }
 
   /// @param new_gid The new global ID for this MeshBlock.

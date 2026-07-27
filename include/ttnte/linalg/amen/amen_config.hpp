@@ -122,22 +122,47 @@ struct AMEnNativeOptions {
   /// Once the solver's own adaptively-tightening truncation tolerance
   /// (`AMEnSolver::get_eps()`) drops to or below this value, permanently
   /// stop enrichment (`kickrank`/`kick2`/`als_residual_rank` forced to 0 for
-  /// the rest of the solve, regardless of `enrichment_mode`) and continue
-  /// as pure ALS -- same `nswp` budget, same local solves and
-  /// rank-truncation, just no more basis growth. Intended for a
-  /// domain-decomposition run that has already grown the TT rank to a good
-  /// working value over several block-Jacobi iterations and wants to
-  /// converge the residual further (e.g. toward machine precision) without
-  /// paying enrichment cost that isn't buying accuracy anymore. Once frozen,
-  /// a bond's rank can only hold steady or shrink -- it is bounded above by
-  /// whatever rank the warm start (the previous iteration's state) already
-  /// had, regardless of how rich the right-hand side becomes; `max_rank`
-  /// doesn't need retuning for this to hold, though it still bounds the cost
-  /// of the boundary/source-term accumulation feeding the right-hand side
-  /// (see `LocalSolver::presolve`).
+  /// the rest of the solve, regardless of `enrichment_mode`) and continue as
+  /// pure ALS -- same `nswp` budget, same local solves, but no more basis
+  /// growth *and* no more residual-based rank truncation either: each core's
+  /// solve keeps its full rank (bounded only by `max_rank`) instead of
+  /// re-evaluating the truncated residual at every candidate rank, since
+  /// there is no enrichment left to grow back into if that turns out to have
+  /// discarded something needed. Intended for a domain-decomposition run
+  /// that has already grown the TT rank to a good working value over several
+  /// block-Jacobi iterations and wants to converge the residual further
+  /// (e.g. toward machine precision) without paying enrichment/truncation
+  /// cost that isn't buying accuracy anymore. Once frozen, a bond's rank is
+  /// pinned at whatever rank the warm start (the previous iteration's state)
+  /// already had -- it can only shrink if `max_rank` is set below that;
+  /// `max_rank` still bounds the cost of the boundary/source-term
+  /// accumulation feeding the right-hand side (see `LocalSolver::presolve`).
   ///
   /// Disabled (0.0) by default -- freezing never triggers.
   double rank_freeze_eps = 0.0;
+  /// Proximal regularization weight for the per-core ALS solve: when active,
+  /// each core's local system `B x = rhs` is solved as `(B + w I) x = rhs +
+  /// w x_prev` instead (`w` = this field), damping the step toward the
+  /// previous iterate -- the standard remedy for ALS "swamping" (Tomasi &
+  /// Bro-style regularized ALS). Convergence bookkeeping (`max_res`, the
+  /// rank-truncation floor, the eps-forcing term) is still measured against
+  /// the true, unshifted residual `B x - rhs`; this only changes how the
+  /// step itself is computed, never what counts as converged.
+  ///
+  /// Only takes effect once enrichment is disabled (i.e. pure ALS -- either
+  /// `rank_freeze_eps` triggered, or the caller set zero enrichment
+  /// directly); ignored otherwise. Rationale: while enrichment is active,
+  /// rank is still adapting to reach the tightening truncation target, so
+  /// the local solves aren't structurally swamped -- damping them there
+  /// would just slow down otherwise-legitimate large corrections. The
+  /// swamping this targets shows up specifically once a frozen rank is asked
+  /// for a truncation tolerance tighter than it can represent: the per-core
+  /// solve becomes ill-conditioned enough that its residual *increases*
+  /// sweep-to-sweep instead of decreasing (confirmed via a real fixed-source
+  /// regression case).
+  ///
+  /// Disabled (0.0) by default.
+  double proximal_regularization = 0.0;
 };
 
 } // namespace ttnte::linalg

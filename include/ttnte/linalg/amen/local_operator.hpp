@@ -41,17 +41,26 @@ public:
   /// @param a_core The operator's core at this position, shape
   /// `[s, m, n, S]`.
   /// @param phi_right Right interface tensor, shape `[L, S, R]`.
+  /// @param regularization Proximal (Tikhonov-style) diagonal shift added by
+  /// `apply()`/`to_dense()`: `regularization * y` / `regularization * I`.
+  /// Zero (default) reproduces the original unregularized operator exactly.
+  /// Only meaningful when the operator is square (`l == r`, `m == n`,
+  /// `L == R`) -- see `AMEnNativeOptions::proximal_regularization`.
   static FoldedLocalOperator build(const torch::Tensor& phi_left,
-    const torch::Tensor& a_core, const torch::Tensor& phi_right);
+    const torch::Tensor& a_core, const torch::Tensor& phi_right,
+    double regularization = 0.0);
 
   /// @brief Apply the local operator to a candidate core.
   /// @param y Shape `[r, n, R]` (flattened or not; reshaped internally).
-  /// @return Shape `[l, m, L]`.
+  /// @return Shape `[l, m, L]`. Includes `+ regularization * y` when this
+  /// operator was built with a nonzero `regularization`.
   torch::Tensor apply(const torch::Tensor& y) const;
 
   /// @brief Materialize the local operator as a dense `[l*m*L, r*n*R]`
   /// matrix, for the small-local-problem direct-solve path. Computed via two
-  /// folded GEMMs rather than the baseline's tensordot chain.
+  /// folded GEMMs rather than the baseline's tensordot chain. Includes
+  /// `+ regularization * I` when this operator was built with a nonzero
+  /// `regularization`.
   torch::Tensor to_dense() const;
 
   int64_t l() const noexcept { return l_; }
@@ -69,6 +78,7 @@ private:
   torch::Tensor a_core_raw_;    // [s, m, n, S], kept for to_dense()
   torch::Tensor phi_right_raw_; // [L, S, R], kept for to_dense()
   int64_t l_ = 0, s_ = 0, r_ = 0, m_ = 0, n_ = 0, S_ = 0, R_ = 0, L_ = 0;
+  double regularization_ = 0.0;
 };
 
 } // namespace ttnte::linalg::amen

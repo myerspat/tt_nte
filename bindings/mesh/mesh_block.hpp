@@ -2,7 +2,10 @@
 
 #include "ttnte/mesh/mesh_block.hpp"
 #include "ttnte/mesh/mesh_block_boundary.hpp"
+#include "ttnte/physics/fixed_source.hpp"
 #include "ttnte/xs/material.hpp"
+#include <pybind11/functional.h>
+#include <pybind11/stl.h>
 #include <torch/extension.h>
 #include <vector>
 
@@ -55,6 +58,20 @@ void register_MeshBlock(py::class_<DerivedType, Options...>& py_class)
         return self.get_boundary_info(dim, is_upper);
       },
       py::arg("dim"), py::arg("is_upper"))
+    .def(
+      "set_boundary_type",
+      [](DerivedType& self, size_t dim, bool is_upper,
+        ttnte::physics::BoundaryType type) {
+        self.set_boundary_type(dim, is_upper, type);
+      },
+      py::arg("dim"), py::arg("is_upper"), py::arg("type"))
+    .def(
+      "set_boundary_source",
+      [](DerivedType& self, size_t dim, bool is_upper,
+        ttnte::physics::FixedSource source) {
+        self.set_boundary_source(dim, is_upper, std::move(source));
+      },
+      py::arg("dim"), py::arg("is_upper"), py::arg("source"))
     .def("get_boundary_info",
       [](DerivedType& self) {
         const auto& boundaries = self.get_boundary_info();
@@ -80,6 +97,11 @@ void register_MeshBlock(py::class_<DerivedType, Options...>& py_class)
       "fill_id", [](const DerivedType& self) { return self.get_fill_id(); },
       [](DerivedType& self, const uint64_t& fill_id) {
         self.set_fill_id(fill_id);
+      })
+    .def_property(
+      "source", [](const DerivedType& self) { return self.get_fixed_source(); },
+      [](DerivedType& self, ttnte::physics::FixedSource source) {
+        self.set_source(std::move(source));
       })
 
     .def_property_readonly(

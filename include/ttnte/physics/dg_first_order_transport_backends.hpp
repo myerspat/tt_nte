@@ -2,10 +2,12 @@
 
 #include "ttnte/cad/patch.hpp"
 #include "ttnte/linalg/operator.hpp"
+#include "ttnte/linalg/state.hpp"
 #include "ttnte/linalg/tt_engine.hpp"
 #include "ttnte/math/quadrature_set.hpp"
 #include "ttnte/physics/assembly_configs.hpp"
 #include "ttnte/physics/boundary_types.hpp"
+#include "ttnte/physics/fixed_source.hpp"
 #include "ttnte/xs/server.hpp"
 #include <c10/util/SmallVector.h>
 
@@ -483,6 +485,32 @@ public:
   linalg::Operator assemble_loss_operator();
   linalg::Operator assemble_scatter_operator();
   linalg::Operator assemble_fission_operator();
+  /// @brief Assemble a fixed-source RHS vector (space x angle x energy) from
+  /// a FixedSource spec: an isotropic contribution (physical-unit strength,
+  /// used directly as the uniform per-direction value -- the angular
+  /// quadrature's weights are always normalized to sum to 1, not to
+  /// weighting_factor(), so no extra normalization is needed), an arbitrary
+  /// `function(coords)` contribution evaluated at physical-space/angle/
+  /// energy sample points via TT-cross, or both (combined via direct_sum).
+  /// @param spec The source specification for this block.
+  /// @return The assembled source State.
+  linalg::State assemble_source(const FixedSource& spec);
+  /// @brief Assemble a prescribed incident-flux RHS contribution for one
+  /// boundary face (`BoundaryType::INCIDENT`). Builds a raw nodal (not
+  /// basis-projected) State over the tangential control points, narrowed to
+  /// a single point along `dim` -- the same convention a NeighborCoupling's
+  /// recv_buffer uses -- so it can be applied through
+  /// `assemble_boundary_operators()`'s own inflow operator exactly the way
+  /// the DAG's apply task applies `coupling.boundary_op` to a received
+  /// neighbor State (the Galerkin test-function integration happens inside
+  /// that operator, not here).
+  /// @param dim The dimension of the face.
+  /// @param is_upper Whether the face is at the upper or lower end of `dim`.
+  /// @param spec The source specification for this face. Only
+  /// `isotropic_strength` is currently supported; `function` throws.
+  /// @return The assembled incident-source State.
+  linalg::State assemble_incident_source(
+    size_t dim, bool is_upper, const FixedSource& spec);
   std::tuple<linalg::Operator, linalg::Operator, linalg::Operator>
   assemble_boundary_operators(size_t dim, bool is_upper);
   auto assemble_outflow_boundary_operator(const ReturnType& basis,

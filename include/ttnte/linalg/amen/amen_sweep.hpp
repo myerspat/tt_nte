@@ -55,6 +55,10 @@ namespace ttnte::linalg::amen {
 /// @param use_gpu_batched_gmres Whether local solves on CUDA tensors use
 /// the fixed-budget "batched" GPU GMRES strategy (see `gmres_solve`'s
 /// `prefer_incremental`) rather than the incremental CPU-style strategy.
+/// @param proximal_regularization See
+/// `AMEnNativeOptions::proximal_regularization`. Only actually applied while
+/// enrichment is disabled (pure ALS) -- ignored otherwise, regardless of the
+/// value passed.
 /// @return The solution's TT cores, same convention as `x_cores`.
 std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
   std::vector<torch::Tensor> b_cores, std::vector<torch::Tensor> x_cores,
@@ -63,7 +67,8 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
   int resets, bool verbose, AMEnPreconditioner preconditioner,
   int tsqr_block_size, bool use_qless_tsqr, AMEnEnrichmentMode mode,
   int64_t als_residual_rank, bool use_local_forcing,
-  double gmres_forcing_ceiling, bool use_gpu_batched_gmres);
+  double gmres_forcing_ceiling, bool use_gpu_batched_gmres,
+  double proximal_regularization = 0.0);
 
 /// @brief Shared TTEngine-level wrapper around `amen_sweep`: validates
 /// shapes, optionally applies the rank-1 preconditioner, converts to/from
@@ -87,9 +92,9 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
 /// @param caller Fully-qualified call site, used in error messages.
 /// @return The solution as a `TTEngine` TT-vector.
 TTEngine amen_solve_dispatch(const TTEngine& A, const TTEngine& b,
-  std::optional<TTEngine> x0, int nswp, double eps, int max_rank,
-  int max_full, int kickrank, int kick2, int local_iterations, int resets,
-  bool verbose, AMEnPreconditioner preconditioner,
-  const AMEnNativeOptions& native_opts, const char* caller);
+  std::optional<TTEngine> x0, int nswp, double eps, int max_rank, int max_full,
+  int kickrank, int kick2, int local_iterations, int resets, bool verbose,
+  AMEnPreconditioner preconditioner, const AMEnNativeOptions& native_opts,
+  const char* caller);
 
 } // namespace ttnte::linalg::amen

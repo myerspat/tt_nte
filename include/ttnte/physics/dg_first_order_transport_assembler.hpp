@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ttnte/cad/patch.hpp"
+#include "ttnte/linalg/ops.hpp"
 #include "ttnte/linalg/source.hpp"
 #include "ttnte/physics/assembly_configs.hpp"
 #include "ttnte/physics/dg_assembler.hpp"
@@ -9,6 +10,7 @@
 #include <c10/util/SmallVector.h>
 #include <memory>
 #include <variant>
+#include <vector>
 
 namespace ttnte::physics {
 
@@ -139,7 +141,18 @@ public:
       [](auto* backend) { return backend->assemble_fission_operator(); },
       get_backend_variant(this->config_.fission_fmt));
 
-    // TODO: Add something for fixed source problems when the time comes
+    // Build the volumetric/MMS source, if one was attached to this block,
+    // and any per-face prescribed-incident-flux contributions (folded into
+    // the same RHS below, alongside the volumetric term).
+    std::vector<linalg::State> source_terms;
+    const auto& fixed_source_spec = this->block_->get_fixed_source();
+    if (fixed_source_spec.has_value() && fixed_source_spec->defined()) {
+      source_terms.push_back(std::visit(
+        [&](auto* backend) {
+          return backend->assemble_source(*fixed_source_spec);
+        },
+        get_backend_variant(this->config_.source_fmt)));
+    }
 
     // Build outflow and inflow boundary operators
     c10::SmallVector<BoundaryType, 6> conditions;
@@ -163,9 +176,38 @@ public:
         current_ops_.push_back(std::get<2>(boundary_tuple));
 
         // Save the boundary condition
-        conditions.push_back(
-          this->block_->get_boundary_info(dim, is_upper).get_type());
+        const auto& binfo = this->block_->get_boundary_info(dim, is_upper);
+        conditions.push_back(binfo.get_type());
+
+        // Prescribed incident-flux boundary: a fixed, known value, not this
+        // patch's own unknown -- fold its contribution into the RHS once
+        // here at assembly time (unlike INTERNAL couplings, it is never
+        // re-exchanged over the course of the DD sweep).
+        if (binfo.get_type() == BoundaryType::INCIDENT) {
+          const auto& incident_spec = binfo.get_source();
+          if (incident_spec.has_value() && incident_spec->defined()) {
+            linalg::State incident_state = std::visit(
+              [dim, is_upper, &incident_spec](auto* backend) {
+                return backend->assemble_incident_source(
+                  dim, is_upper, *incident_spec);
+              },
+              get_backend_variant(this->config_.source_fmt));
+
+            linalg::State incident_rhs =
+              linalg::mv(inflow_ops_.back(), incident_state);
+            incident_rhs.round_(
+              this->config_.rounding.eps, this->config_.rounding.max_rank);
+            source_terms.push_back(std::move(incident_rhs));
+          }
+        }
       }
+    }
+
+    if (!source_terms.empty()) {
+      source_ = source_terms.size() == 1 ? std::move(source_terms[0])
+                                         : linalg::direct_sum(source_terms);
+      source_.round_(
+        this->config_.rounding.eps, this->config_.rounding.max_rank);
     }
 
     // Combine the operators on the left hand side
@@ -184,7 +226,8 @@ public:
         lhs += outflow_op;
         lhs.round_(inner_eps, this->config_.rounding.max_rank);
       }
-      if (inflow_op.defined() && conditions[i] != BoundaryType::INTERNAL) {
+      if (inflow_op.defined() && conditions[i] != BoundaryType::INTERNAL &&
+          conditions[i] != BoundaryType::INCIDENT) {
         lhs -= inflow_op;
         lhs.round_(inner_eps, this->config_.rounding.max_rank);
       }
@@ -218,11 +261,33 @@ public:
       }
     }
 
+    // A fixed source on a fissile fill would need combined subcritical-
+    // multiplication support (fixed source + fission_op_ applied to the
+    // current iterate every outer iteration, with no 1/k rescale) that
+    // doesn't exist yet -- fail loudly here rather than silently dropping
+    // the fixed source (EigenSource takes priority below) or silently
+    // solving with a stale/never-updated EigenSource (solve_fixed_source()
+    // never calls EigenSource::update()/scale(), those are only driven by
+    // solve_eigenvalue()'s own loop).
+    if (fission_op_.defined() && source_.defined()) {
+      throw utils::runtime_error(error_context("assemble"),
+        "A fixed source is attached to a block with a fissile fill. "
+        "Combined fixed-source + fissile (subcritical multiplication) "
+        "problems are not yet supported -- remove the fixed source or use "
+        "a non-fissile fill.");
+    }
+
     // Wrap fission operator in an EigenSource so the flat buffer carries it
     // to the device in one DMA transfer; nullptr for non-fissile problems.
+    // A fixed source (volumetric and/or boundary-incident, accumulated into
+    // source_ above) is wrapped in a plain Source instead -- its state is
+    // already static, so to_buffer()/from_buffer() carry it through the same
+    // flat-buffer DMA transfer with no per-iteration update.
     linalg::Source::Ptr source = nullptr;
     if (fission_op_.defined()) {
       source = linalg::EigenSource::create(fission_op_);
+    } else if (source_.defined()) {
+      source = linalg::Source::create(source_);
     }
 
     // Setup the linear system and return

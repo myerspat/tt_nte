@@ -69,8 +69,16 @@ void BSplineBasis::finalize(const torch::Tensor& knotvector_view)
 
 void BSplineBasis::normalize_knotvector()
 {
-  knotvector_ =
-    (knotvector_ - knotvector_[0]) / knotvector_[knotvector_.size(0) - 1];
+  // Map [knotvector_[0], knotvector_[-1]] -> [0, 1]. Dividing by the raw
+  // last-knot value (instead of the span width `last - first`) is only
+  // correct when the knot vector already starts at 0 (e.g. every patch built
+  // directly from a [0, 1]-domain curve) -- it silently mis-scales any
+  // knot vector sliced from an interior sub-domain (igakit's
+  // `NURBS.slice()` preserves absolute parameter values rather than
+  // renormalizing, so e.g. a curve sliced to [1/3, 2/3] hits this case).
+  torch::Tensor start = knotvector_[0];
+  torch::Tensor width = knotvector_[knotvector_.size(0) - 1] - start;
+  knotvector_ = (knotvector_ - start) / width;
 }
 
 BSplineBasis& BSplineBasis::to_(

@@ -74,6 +74,12 @@ private:
   /// survives clear_assemblers (needed by get_solution()'s TransportSolution
   /// to compute scalar flux after solve_eigenvalue()).
   math::QuadratureSet::Ptr angular_qset_;
+  /// The assembler config passed to assemble(), retained (like
+  /// angular_qset_) so the TransportSolution this driver produces can build
+  /// fresh assemblers on demand -- e.g. compute_patch_balances()/
+  /// patch_balance_table()/global_balance() when the caller doesn't already
+  /// have one (say, clear_assemblers=true was used).
+  physics::DGTransportAssemblerConfig config_;
 
   // States
   bool is_distributed_ = false;
@@ -117,6 +123,7 @@ public:
   {
     patch_data_.clear();
     angular_qset_ = angular_qset;
+    config_ = config;
 
     for (const auto& block : mesh_->get_blocks()) {
       const int64_t gid = block->get_gid();
@@ -372,8 +379,8 @@ public:
     // Build the TransportSolution holding the raw angular flux per local
     // patch; call TransportSolution::compute_scalar_flux() on the result to
     // get a spatial-only field suitable for plotting/averaging.
-    auto solution =
-      Solution::create(Communicator::world(), mesh_, angular_qset_, k_global);
+    auto solution = Solution::create(Communicator::world(), mesh_,
+      angular_qset_, xs_server_, config_, k_global);
     for (const auto& sys : local_systems) {
       solution->add_local_patch(sys->get_gid(), sys->get_state());
     }
@@ -491,6 +498,13 @@ public:
       inner_solver->update_convergence_criteria(error);
 
       if (verbose) {
+        for (const auto& sys : local_systems) {
+          const auto& x = sys->get_state();
+          std::cout << "GID: " << sys->get_gid()
+                    << ", Ranks: " << x.as_tt().get_ranks()
+                    << ", Compression: " << x.get_compression() << std::endl;
+        }
+
         std::cout << "-- (" << i << "): Scalar Flux L2 Error = " << std::fixed
                   << std::setprecision(10) << error
                   << ", Elapsed Time = " << std::fixed << std::setprecision(3)
@@ -517,8 +531,8 @@ public:
     // Build the TransportSolution holding the raw angular flux per local
     // patch; call TransportSolution::compute_scalar_flux() on the result to
     // get a spatial-only field suitable for plotting/averaging.
-    auto solution =
-      Solution::create(Communicator::world(), mesh_, angular_qset_);
+    auto solution = Solution::create(
+      Communicator::world(), mesh_, angular_qset_, xs_server_, config_);
     for (const auto& sys : local_systems) {
       solution->add_local_patch(sys->get_gid(), sys->get_state());
     }
@@ -697,6 +711,26 @@ public:
   void set_label(const std::string& label)
   {
     label_ = Label::from_string(label);
+  }
+
+  /// @brief GID -> this rank's own local patch assembler, NumDim-erased
+  /// (base-class handle), for every patch whose assembler hasn't been
+  /// cleared. Pass to TransportSolution::compute_patch_balances()/
+  /// patch_balance_table()/global_balance() so those methods don't need the
+  /// full TransportDriver -- only each local patch's assembler.
+  /// @throws Nothing -- patches with a cleared assembler are simply omitted;
+  /// callers see TransportSolution's own clear error message if one of
+  /// their local GIDs is missing.
+  std::unordered_map<int64_t, typename Solution::AssemblerPtr> get_assemblers()
+    const
+  {
+    std::unordered_map<int64_t, typename Solution::AssemblerPtr> result;
+    for (const auto& [gid, data] : patch_data_) {
+      if (data.assembler) {
+        result.emplace(gid, data.assembler);
+      }
+    }
+    return result;
   }
 };
 

@@ -10,7 +10,6 @@ from ttnte.solvers import (
 )
 from ttnte.linalg import Operator, State, LinearSystem, TTEngine, Source
 from ttnte.task import TaskGraph, TaskScheduler
-from ttnte.parallel import StreamPool
 
 test_params = [
     (False, MemoryPolicy.OUT_OF_CORE, torch.float32),
@@ -90,17 +89,23 @@ def test_build_compute_dag(use_gpu, memory_policy, dtype):
             # Only the operators remain on GPU
             ls.transfer_buffer(device)
 
-        strategy.build_gpu_compute_dag(dag, ls, StreamPool.instance())
+        strategy.build_gpu_compute_dag(dag, ls)
         assert len(dag) == (
             1 if strategy.config.memory_policy == MemoryPolicy.RESIDENT else 3
         )
+
+        # TaskScheduler builds its own GPU stream pool sized to num_threads
+        # and has each worker thread claim one stream (see
+        # StreamPool.claim_for_this_thread()).
+        scheduler = TaskScheduler(4)
 
     else:
         strategy.build_cpu_compute_dag(dag, ls)
         assert len(dag) == 1
 
+        scheduler = TaskScheduler()
+
     # Execute the dag
-    scheduler = TaskScheduler()
     scheduler.execute(dag)
 
     # Get the solution vector

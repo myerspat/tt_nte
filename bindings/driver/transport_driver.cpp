@@ -81,6 +81,12 @@ static void register_TransportDriver_impl(
       py::arg("gid"))
     .def("get_system", &TransportDriver::get_system,
       "Return the linear system for a mesh block GID.", py::arg("gid"))
+    .def("get_assemblers", &TransportDriver::get_assemblers,
+      "Return GID -> this rank's own local patch assembler, for every "
+      "patch whose assembler hasn't been cleared. Pass to "
+      "TransportSolution.compute_patch_balances()/patch_balance_table()/"
+      "global_balance() (requires clear_assemblers=False when solving).",
+      py::call_guard<py::gil_scoped_release>())
 
     // =================================================================
     // Public getters / setters

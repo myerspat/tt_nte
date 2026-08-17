@@ -5,6 +5,7 @@ set(PHYSICS_BINDINGS_REL
     boundary_types.cpp
     assembly_configs.cpp
     fixed_source.cpp
+    particle_balance.cpp
     dg_first_order_transport_backends.cpp
     dg_assembler.cpp
     dg_first_order_transport_assembler.cpp)

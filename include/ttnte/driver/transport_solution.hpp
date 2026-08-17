@@ -7,11 +7,16 @@
 #include "ttnte/mesh/mesh.hpp"
 #include "ttnte/parallel/communicator.hpp"
 #include "ttnte/physics/assembly_configs.hpp"
+#include "ttnte/physics/dg_assembler.hpp"
+#include "ttnte/physics/dg_first_order_transport_assembler.hpp"
 #include "ttnte/physics/dg_first_order_transport_backends.hpp"
+#include "ttnte/physics/particle_balance.hpp"
 #include "ttnte/utils/exception.hpp"
 #include "ttnte/utils/label.hpp"
+#include "ttnte/xs/server.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -36,8 +41,20 @@ public:
   using Mesh = mesh::Mesh<BlockType>;
   using Label = utils::Label<TransportSolution>;
   using Ptr = std::shared_ptr<TransportSolution>;
+  /// NumDim-erased assembler handle -- TransportSolution isn't templated on
+  /// NumDim (unlike TransportDriver/its Assembler type), so
+  /// compute_patch_balances()/patch_balance_table()/global_balance() accept
+  /// this base-class Ptr instead (see TransportDriver::get_assemblers()).
+  using AssemblerBase =
+    physics::DGAssembler<BlockType, physics::DGTransportAssemblerConfig>;
+  using AssemblerPtr = typename AssemblerBase::Ptr;
 
 private:
+  /// Per-face header width in pack_patch_balance()'s flat row layout: dim,
+  /// is_upper, type, neighbor_gid, neighbor_dim, neighbor_is_upper,
+  /// has_incoming.
+  static constexpr size_t BALANCE_FACE_HEADER_WIDTH = 7;
+
   // =================================================================
   // Private data
   Label label_;
@@ -55,6 +72,16 @@ private:
   /// copied, for local-only geometry access (e.g. regular_mesh_average(),
   /// gather_plot_data()). No non-local geometry is ever held here.
   typename Mesh::Ptr mesh_;
+  /// The XS server used to assemble the originating solve, retained (like
+  /// angular_qset_) so make_assembler() can build a fresh assembler on
+  /// demand for compute_patch_balances()/patch_balance_table()/
+  /// global_balance() when the caller doesn't already have one.
+  xs::Server::Ptr xs_server_;
+  /// The assembler config used to assemble the originating solve, retained
+  /// for the same reason as xs_server_ -- a fresh assembler must be rounded
+  /// at the ORIGINAL solve's tolerance so its source_ matches what the real
+  /// solve actually saw.
+  physics::DGTransportAssemblerConfig config_;
   /// Communicator for MPI reductions/gathers.
   parallel::Communicator comm_;
   /// Whether local_fields_ still carries angular dependence (true for what
@@ -187,15 +214,335 @@ private:
     return block->evaluate_field(reshaped, points);
   }
 
+  /// @brief Every GID in the whole mesh, sorted -- the index into
+  /// patch_balance_table()/global_balance()'s packed reduction buffer.
+  /// mesh_->get_gid2rank() is global metadata, so this is computable on
+  /// every rank without any communication, even one that owns zero local
+  /// patches.
+  std::vector<int64_t> all_gids_sorted() const
+  {
+    std::vector<int64_t> gids;
+    gids.reserve(mesh_->get_gid2rank().size());
+    for (const auto& [gid, rank] : mesh_->get_gid2rank()) {
+      gids.push_back(gid);
+    }
+    std::sort(gids.begin(), gids.end());
+    return gids;
+  }
+
+  /// @brief Pack one patch's PatchBalance into a flat row of doubles, so
+  /// every rank's own local patches can be combined into one
+  /// globally-consistent table via a single iallreduce(SUM) instead of a
+  /// variable-size gatherv (the codebase's existing pattern for
+  /// variable-count cross-rank data, e.g. ttnte.mesh._gather.
+  /// gather_mesh_patches(), isn't needed here: num_groups and the per-patch
+  /// face count are uniform across the whole mesh -- NumDim is one
+  /// compile-time value for the whole originating TransportDriver -- and
+  /// exactly one rank owns, and therefore contributes a nonzero row for,
+  /// each GID; every other rank's row for that GID is all zero).
+  /// Row layout: [fixed_source(G) | fission_source(G) | absorption(G) |
+  /// scatter_in(G) | scatter_out(G) | leakage(G) | face_0 | face_1 | ...],
+  /// each face block being [dim, is_upper, type, neighbor_gid (-1 if
+  /// unset), neighbor_dim (-1 if unset), neighbor_is_upper (0/1, undefined
+  /// if unset), has_incoming (0/1), outgoing(G), incoming(G) (0-filled if
+  /// unset)] -- BALANCE_FACE_HEADER_WIDTH + 2*G doubles per face.
+  static void pack_patch_balance(const physics::PatchBalance& pb,
+    int64_t num_groups, size_t num_faces, double* row)
+  {
+    size_t g = static_cast<size_t>(num_groups);
+    auto put = [&](const torch::Tensor& t, size_t offset) {
+      torch::Tensor flat = t.to(torch::kFloat64).contiguous().reshape({-1});
+      if (static_cast<size_t>(flat.numel()) != g) {
+        throw utils::runtime_error(
+          "ttnte::driver::TransportSolution::pack_patch_balance",
+          "A balance tensor has " + std::to_string(flat.numel()) +
+            " entries, expected exactly num_groups (" + std::to_string(g) +
+            ")");
+      }
+      std::memcpy(row + offset, flat.data_ptr<double>(), sizeof(double) * g);
+    };
+
+    put(pb.fixed_source, 0 * g);
+    put(pb.fission_source, 1 * g);
+    put(pb.absorption, 2 * g);
+    put(pb.scatter_in, 3 * g);
+    put(pb.scatter_out, 4 * g);
+    put(pb.leakage, 5 * g);
+
+    size_t face_width = BALANCE_FACE_HEADER_WIDTH + 2 * g;
+    size_t offset = 6 * g;
+    for (size_t f = 0; f < num_faces; f++) {
+      const auto& face = pb.faces[f];
+      row[offset + 0] = static_cast<double>(face.dim);
+      row[offset + 1] = face.is_upper ? 1.0 : 0.0;
+      row[offset + 2] = static_cast<double>(face.type);
+      row[offset + 3] = face.neighbor_gid.has_value()
+                          ? static_cast<double>(*face.neighbor_gid)
+                          : -1.0;
+      row[offset + 4] = face.neighbor_dim.has_value()
+                          ? static_cast<double>(*face.neighbor_dim)
+                          : -1.0;
+      row[offset + 5] =
+        face.neighbor_is_upper.has_value() && *face.neighbor_is_upper ? 1.0
+                                                                      : 0.0;
+      row[offset + 6] = face.incoming.has_value() ? 1.0 : 0.0;
+      put(face.outgoing, offset + BALANCE_FACE_HEADER_WIDTH);
+      if (face.incoming.has_value()) {
+        put(*face.incoming, offset + BALANCE_FACE_HEADER_WIDTH + g);
+      } else {
+        std::memset(
+          row + offset + BALANCE_FACE_HEADER_WIDTH + g, 0, sizeof(double) * g);
+      }
+      offset += face_width;
+    }
+  }
+
+  /// @brief Inverse of pack_patch_balance() -- reconstruct one patch's
+  /// PatchBalance from its packed row.
+  static physics::PatchBalance unpack_patch_balance(int64_t gid,
+    const double* row, int64_t num_groups, size_t num_faces,
+    const torch::TensorOptions& options)
+  {
+    size_t g = static_cast<size_t>(num_groups);
+    auto get = [&](size_t offset) {
+      torch::Tensor t = torch::from_blob(
+        const_cast<double*>(row + offset), {num_groups}, torch::kFloat64);
+      return t.clone().to(options);
+    };
+
+    physics::PatchBalance pb;
+    pb.gid = gid;
+    pb.fixed_source = get(0 * g);
+    pb.fission_source = get(1 * g);
+    pb.absorption = get(2 * g);
+    pb.scatter_in = get(3 * g);
+    pb.scatter_out = get(4 * g);
+    pb.leakage = get(5 * g);
+
+    size_t face_width = BALANCE_FACE_HEADER_WIDTH + 2 * g;
+    size_t offset = 6 * g;
+    pb.faces.reserve(num_faces);
+    for (size_t f = 0; f < num_faces; f++) {
+      physics::FaceBalance face;
+      face.dim = static_cast<size_t>(std::llround(row[offset + 0]));
+      face.is_upper = row[offset + 1] != 0.0;
+      face.type = static_cast<physics::BoundaryType>(
+        static_cast<int>(std::llround(row[offset + 2])));
+      double ngid = row[offset + 3];
+      face.neighbor_gid =
+        ngid >= 0.0
+          ? std::optional<int64_t>(static_cast<int64_t>(std::llround(ngid)))
+          : std::nullopt;
+      double ndim = row[offset + 4];
+      face.neighbor_dim =
+        ndim >= 0.0
+          ? std::optional<size_t>(static_cast<size_t>(std::llround(ndim)))
+          : std::nullopt;
+      face.neighbor_is_upper = face.neighbor_gid.has_value()
+                                 ? std::optional<bool>(row[offset + 5] != 0.0)
+                                 : std::nullopt;
+      bool has_incoming = row[offset + 6] != 0.0;
+      face.outgoing = get(offset + BALANCE_FACE_HEADER_WIDTH);
+      face.incoming = has_incoming ? std::optional<torch::Tensor>(get(
+                                       offset + BALANCE_FACE_HEADER_WIDTH + g))
+                                   : std::nullopt;
+      pb.faces.push_back(std::move(face));
+      offset += face_width;
+    }
+    return pb;
+  }
+
+  /// @brief Build a fresh assembler for `block`, dispatching on its NumDim
+  /// (mirrors compute_error_weights()'s own get_ndim() switch). This is
+  /// compute_patch_balances()'s fallback for any GID whose assembler wasn't
+  /// passed in -- e.g. clear_assemblers=true was used, or the caller simply
+  /// doesn't want to keep TransportDriver::get_assemblers() around. assemble()
+  /// is called once (the same, already-tested path TransportDriver::assemble()
+  /// itself uses) so this assembler's source_ -- needed for fixed_source --
+  /// ends up rounded at the SAME tolerance (config_) the original solve
+  /// actually used, not a fresh/default one; the resulting LinearSystem is
+  /// discarded (only the assembler and its lazily-cached backends are kept).
+  AssemblerPtr make_assembler(const typename Mesh::BlockTypePtr& block) const
+  {
+    AssemblerPtr assembler;
+    switch (block->get_ndim()) {
+    case 1:
+      assembler = physics::DGFirstOrderTransportAssembler<BlockType, 1>::create(
+        block, angular_qset_, xs_server_, config_);
+      break;
+    case 2:
+      assembler = physics::DGFirstOrderTransportAssembler<BlockType, 2>::create(
+        block, angular_qset_, xs_server_, config_);
+      break;
+    case 3:
+      assembler = physics::DGFirstOrderTransportAssembler<BlockType, 3>::create(
+        block, angular_qset_, xs_server_, config_);
+      break;
+    default:
+      throw utils::runtime_error(*this, error_context("make_assembler"),
+        "Unsupported patch dimensionality: " +
+          std::to_string(block->get_ndim()));
+    }
+    assembler->assemble();
+    return assembler;
+  }
+
+  /// @brief make_assembler(), looked up by GID among this rank's own local
+  /// mesh blocks.
+  AssemblerPtr make_assembler_for_gid(int64_t gid) const
+  {
+    for (const auto& block : mesh_->get_blocks()) {
+      if (block->get_gid() == gid) {
+        return make_assembler(block);
+      }
+    }
+    throw utils::runtime_error(*this, error_context("make_assembler_for_gid"),
+      "No local mesh block found for GID " + std::to_string(gid));
+  }
+
+  /// @brief Collective: combine every rank's own local PatchBalances (from
+  /// compute_patch_balances()) into the full, GID-sorted table, identical on
+  /// every rank, via one small iallreduce(SUM) -- see pack_patch_balance()
+  /// for why a fixed-size reduction suffices here instead of a
+  /// variable-size gatherv.
+  std::vector<physics::PatchBalance> gather_patch_balances(
+    const std::unordered_map<int64_t, physics::PatchBalance>& local) const
+  {
+    std::vector<int64_t> gids = all_gids_sorted();
+    if (gids.empty()) {
+      throw utils::runtime_error(*this, error_context("gather_patch_balances"),
+        "No patches found in the mesh");
+    }
+
+    // num_groups/num_faces aren't knowable locally on a rank that owns zero
+    // local patches -- agree on both first via a tiny iallreduce(MAX)
+    // (mirrors regular_mesh_average()'s own num_groups handshake).
+    int64_t local_header[2] = {0, 0};
+    if (!local.empty()) {
+      const auto& any_pb = local.begin()->second;
+      local_header[0] = any_pb.fixed_source.numel();
+      local_header[1] = static_cast<int64_t>(any_pb.faces.size());
+    }
+    int64_t global_header[2] = {local_header[0], local_header[1]};
+    if (comm_.size() > 1) {
+      comm_.iallreduce(local_header, global_header, 2, parallel::MPIOp::MAX)
+        .wait();
+    }
+    int64_t num_groups = global_header[0];
+    size_t num_faces = static_cast<size_t>(global_header[1]);
+
+    size_t row_width = 6 * static_cast<size_t>(num_groups) +
+                       num_faces * (BALANCE_FACE_HEADER_WIDTH +
+                                     2 * static_cast<size_t>(num_groups));
+    size_t total = gids.size() * row_width;
+
+    std::unordered_map<int64_t, size_t> gid_to_row;
+    gid_to_row.reserve(gids.size());
+    for (size_t i = 0; i < gids.size(); i++) {
+      gid_to_row.emplace(gids[i], i);
+    }
+
+    std::vector<double> send(total, 0.0);
+    for (const auto& [gid, pb] : local) {
+      pack_patch_balance(pb, num_groups, num_faces,
+        send.data() + gid_to_row.at(gid) * row_width);
+    }
+
+    std::vector<double> recv(total, 0.0);
+    if (comm_.size() > 1) {
+      comm_
+        .iallreduce(send.data(), recv.data(), static_cast<int>(total),
+          parallel::MPIOp::SUM)
+        .wait();
+    } else {
+      recv = std::move(send);
+    }
+
+    auto options = torch::TensorOptions().dtype(torch::kFloat64);
+    std::vector<physics::PatchBalance> table;
+    table.reserve(gids.size());
+    for (size_t i = 0; i < gids.size(); i++) {
+      table.push_back(unpack_patch_balance(
+        gids[i], recv.data() + i * row_width, num_groups, num_faces, options));
+    }
+    return table;
+  }
+
+  /// @brief Resolve every `INTERNAL` face's `incoming` -- the neighbor's own
+  /// `outgoing` through the same shared interface, located via
+  /// `neighbor_gid`/`neighbor_dim`/`neighbor_is_upper` exactly as recorded
+  /// by `mesh::Mesh::connect()` (see `FaceBalance`) -- and folds
+  /// `outgoing - incoming` into that patch's `leakage`, the same way
+  /// `REFLECTIVE` faces already do at assembly time. Requires `table` to
+  /// already be gathered (every patch present, see gather_patch_balances());
+  /// purely local afterward, no further MPI. Leaves `incoming` unset for any
+  /// `INTERNAL` face whose neighbor patch isn't present in `table`.
+  static void resolve_internal_faces(std::vector<physics::PatchBalance>& table)
+  {
+    struct FaceKey {
+      int64_t gid;
+      size_t dim;
+      bool is_upper;
+      bool operator==(const FaceKey& other) const noexcept
+      {
+        return gid == other.gid && dim == other.dim &&
+               is_upper == other.is_upper;
+      }
+    };
+    struct FaceKeyHash {
+      size_t operator()(const FaceKey& key) const noexcept
+      {
+        size_t h = std::hash<int64_t>()(key.gid);
+        h ^= std::hash<size_t>()(key.dim) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>()(key.is_upper) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+      }
+    };
+
+    // Every INTERNAL face's own outgoing current, keyed by its own (gid,
+    // dim, is_upper) -- built once, up front, so the resolution pass below
+    // never mutates a PatchBalance while another entry still holds a
+    // pointer into it.
+    std::unordered_map<FaceKey, const torch::Tensor*, FaceKeyHash>
+      outgoing_by_face;
+    for (const auto& pb : table) {
+      for (const auto& face : pb.faces) {
+        if (face.type == physics::BoundaryType::INTERNAL) {
+          outgoing_by_face.emplace(
+            FaceKey {pb.gid, face.dim, face.is_upper}, &face.outgoing);
+        }
+      }
+    }
+
+    for (auto& pb : table) {
+      for (auto& face : pb.faces) {
+        if (face.type != physics::BoundaryType::INTERNAL ||
+            !face.neighbor_gid.has_value() || !face.neighbor_dim.has_value() ||
+            !face.neighbor_is_upper.has_value()) {
+          continue;
+        }
+        auto it = outgoing_by_face.find(FaceKey {
+          *face.neighbor_gid, *face.neighbor_dim, *face.neighbor_is_upper});
+        if (it == outgoing_by_face.end()) {
+          continue;
+        }
+        face.incoming = *it->second;
+        pb.leakage += face.outgoing - *face.incoming;
+      }
+    }
+  }
+
   // =================================================================
   // Private constructors
   TransportSolution(parallel::Communicator comm, typename Mesh::Ptr mesh,
-    math::QuadratureSet::Ptr angular_qset,
+    math::QuadratureSet::Ptr angular_qset, xs::Server::Ptr xs_server,
+    physics::DGTransportAssemblerConfig config,
     std::optional<double> k_eff = std::nullopt,
     bool has_angular_dependence = true,
     std::optional<std::string> label = std::nullopt)
     : comm_(std::move(comm)), mesh_(std::move(mesh)),
-      angular_qset_(std::move(angular_qset)), k_eff_(k_eff),
+      angular_qset_(std::move(angular_qset)), xs_server_(std::move(xs_server)),
+      config_(std::move(config)), k_eff_(k_eff),
       has_angular_dependence_(has_angular_dependence),
       label_(label.has_value() ? Label::from_string(*label)
                                : Label::create_internal())
@@ -237,7 +584,7 @@ public:
     }
 
     auto result = create(parallel::Communicator::world(), mesh_, angular_qset_,
-      k_eff_, /*has_angular_dependence=*/false);
+      xs_server_, config_, k_eff_, /*has_angular_dependence=*/false);
     for (const auto& [gid, field] : local_fields_) {
       result->local_fields_[gid] =
         angular_qset_->integrate(field, eps, max_rank);
@@ -259,7 +606,7 @@ public:
   Ptr select_group(int64_t group) const
   {
     auto result = create(parallel::Communicator::world(), mesh_, angular_qset_,
-      k_eff_, has_angular_dependence_);
+      xs_server_, config_, k_eff_, has_angular_dependence_);
     for (const auto& [gid, field] : local_fields_) {
       c10::SmallVector<int64_t, 6> m_modes =
         std::visit([](const auto& engine) { return engine.get_m_modes(); },
@@ -830,15 +1177,17 @@ public:
     torch::Tensor is_winner;
     if (comm_.size() > 1) {
       auto rank_options = torch::TensorOptions().dtype(torch::kInt32);
-      torch::Tensor candidate_rank = torch::where(local_residual <= global_residual,
-        torch::full({total_points}, comm_.rank(), rank_options),
-        torch::full({total_points}, comm_.size(), rank_options));
+      torch::Tensor candidate_rank =
+        torch::where(local_residual <= global_residual,
+          torch::full({total_points}, comm_.rank(), rank_options),
+          torch::full({total_points}, comm_.size(), rank_options));
       torch::Tensor winning_rank = torch::empty_like(candidate_rank);
       comm_
         .iallreduce(candidate_rank.data_ptr<int32_t>(),
           winning_rank.data_ptr<int32_t>(), total_points, parallel::MPIOp::MIN)
         .wait();
-      is_winner = (winning_rank == comm_.rank()).unsqueeze(-1).to(local_values.dtype());
+      is_winner =
+        (winning_rank == comm_.rank()).unsqueeze(-1).to(local_values.dtype());
     } else {
       is_winner = (local_residual <= global_residual)
                     .unsqueeze(-1)
@@ -896,6 +1245,129 @@ public:
     torch::Tensor cell_sums = weighted.sum(sum_dims);
 
     return cell_sums / normalization;
+  }
+
+  /// @brief Compute every one of this rank's own local patches' own
+  /// particle-balance diagnostics (source/absorption/scatter/leakage per
+  /// group, per face) from this solution's own field -- purely local, no
+  /// MPI (mirrors compute_errors()'s own "no MPI" convention). Cross-patch
+  /// resolution of INTERNAL faces (the only place particle balance needs
+  /// data shared between patches) happens in patch_balance_table()/
+  /// global_balance(), not here.
+  /// @param assemblers GID -> assembler, for as many of this rank's own
+  /// local patches as the caller already has on hand -- e.g.
+  /// TransportDriver::get_assemblers(), called with clear_assemblers=false
+  /// so the assemblers survive the solve. Optional: any local GID missing
+  /// from this map (including every GID, if the map is left empty/omitted)
+  /// gets a fresh assembler built on demand via make_assembler(), so this
+  /// solution never strictly needs the full TransportDriver -- just the
+  /// xs_server_/config_ it was already given at construction. Building a
+  /// fresh assembler re-runs that patch's full assemble(), so passing
+  /// already-built assemblers is strictly cheaper when they're available.
+  /// @param eps TT-rounding tolerance for the balance/leakage functionals'
+  /// own construction -- independent of the solve's own tolerance, so
+  /// eps=0 gives an exact/benchmarking-grade result.
+  /// @param max_rank TT-rounding max rank, paired with `eps`.
+  /// @return GID -> PatchBalance, for this rank's own local patches only.
+  std::unordered_map<int64_t, physics::PatchBalance> compute_patch_balances(
+    const std::unordered_map<int64_t, AssemblerPtr>& assemblers = {},
+    double eps = 1e-10,
+    int64_t max_rank = std::numeric_limits<int64_t>::max()) const
+  {
+    std::unordered_map<int64_t, physics::PatchBalance> result;
+    for (const auto& [gid, field] : local_fields_) {
+      auto it = assemblers.find(gid);
+      AssemblerPtr assembler =
+        it != assemblers.end() ? it->second : make_assembler_for_gid(gid);
+      result.emplace(gid, assembler->compute_balance(field, eps, max_rank));
+    }
+    return result;
+  }
+
+  /// @brief Every patch's own particle-balance diagnostics -- fixed source,
+  /// absorption, scatter-in/out, fission, leakage, and a per-face breakdown
+  /// -- each computed purely from that patch's own solution vector, gathered
+  /// across every rank and sorted by GID, with every `INTERNAL` face then
+  /// resolved against its neighbor's own `outgoing` (see
+  /// resolve_internal_faces()) so each patch's own balance closes on its
+  /// own, `INTERNAL` faces included. Collective (every rank must call this);
+  /// the result is identical on every rank (see gather_patch_balances()).
+  /// @param assemblers GID -> assembler, optional (see
+  /// compute_patch_balances()).
+  /// @param eps TT-rounding tolerance, independent of the solve's own.
+  /// @param max_rank TT-rounding max rank, paired with `eps`.
+  /// @return Every patch's PatchBalance, sorted by GID.
+  physics::PatchBalanceTable patch_balance_table(
+    const std::unordered_map<int64_t, AssemblerPtr>& assemblers = {},
+    double eps = 1e-10,
+    int64_t max_rank = std::numeric_limits<int64_t>::max()) const
+  {
+    physics::PatchBalanceTable table;
+    table.patches =
+      gather_patch_balances(compute_patch_balances(assemblers, eps, max_rank));
+    resolve_internal_faces(table.patches);
+    return table;
+  }
+
+  /// @brief Particle-balance diagnostics summed over the whole problem.
+  /// Collective; identical on every rank. `leakage` sums every patch's own
+  /// (resolved -- see resolve_internal_faces()) `leakage` directly: each
+  /// `INTERNAL` interface's two sides are resolved from the same pair of
+  /// `outgoing` tensors with opposite sign, so they cancel out exactly in
+  /// this sum and no separate exclusion is needed for the true whole-system
+  /// leakage. `dd_residual` resolves every INTERNAL interface exactly once
+  /// (via `gid < neighbor_gid`) by comparing the two patches' independently,
+  /// locally computed outgoing currents through their shared face -- ~0 for
+  /// a lossless, fully converged distributed solve, and the direct "is the
+  /// distributed method losing particles" diagnostic.
+  /// @param assemblers GID -> assembler, optional (see
+  /// compute_patch_balances()).
+  /// @param eps TT-rounding tolerance, independent of the solve's own.
+  /// @param max_rank TT-rounding max rank, paired with `eps`.
+  /// @return The whole-problem GlobalBalance.
+  physics::GlobalBalance global_balance(
+    const std::unordered_map<int64_t, AssemblerPtr>& assemblers = {},
+    double eps = 1e-10,
+    int64_t max_rank = std::numeric_limits<int64_t>::max()) const
+  {
+    std::vector<physics::PatchBalance> table =
+      gather_patch_balances(compute_patch_balances(assemblers, eps, max_rank));
+    resolve_internal_faces(table);
+
+    int64_t num_groups = table.empty() ? 0 : table[0].fixed_source.numel();
+    auto options = torch::TensorOptions().dtype(torch::kFloat64);
+
+    physics::GlobalBalance result;
+    result.fixed_source = torch::zeros({num_groups}, options);
+    result.fission_source = torch::zeros({num_groups}, options);
+    result.absorption = torch::zeros({num_groups}, options);
+    result.scatter_in = torch::zeros({num_groups}, options);
+    result.scatter_out = torch::zeros({num_groups}, options);
+    result.leakage = torch::zeros({num_groups}, options);
+    result.dd_residual = torch::zeros({num_groups}, options);
+
+    for (const auto& pb : table) {
+      result.fixed_source += pb.fixed_source;
+      result.fission_source += pb.fission_source;
+      result.absorption += pb.absorption;
+      result.scatter_in += pb.scatter_in;
+      result.scatter_out += pb.scatter_out;
+      result.leakage += pb.leakage;
+
+      for (const auto& face : pb.faces) {
+        if (face.type != physics::BoundaryType::INTERNAL ||
+            !face.neighbor_gid.has_value() || !face.incoming.has_value()) {
+          continue;
+        }
+        // Count each interface exactly once, from its lower-GID side.
+        if (pb.gid >= *face.neighbor_gid) {
+          continue;
+        }
+        result.dd_residual += (face.outgoing - *face.incoming).abs();
+      }
+    }
+
+    return result;
   }
 
   // =================================================================

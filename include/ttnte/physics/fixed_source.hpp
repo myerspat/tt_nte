@@ -20,9 +20,10 @@ struct FixedSource {
   std::optional<std::function<torch::Tensor(const std::vector<torch::Tensor>&)>>
     function = std::nullopt;
   /// Per-group isotropic source strength, in physical units (e.g.
-  /// neutrons/cm^3/s for a volumetric source). The assembler normalizes by
-  /// the angular quadrature's weighting_factor (4*pi in 3-D, 2*pi in 2-D, 2
-  /// in 1-D) to get the per-direction value.
+  /// neutrons/cm^3/s for a volumetric source). No angular normalization is
+  /// applied by the assembler: the angular quadrature weights are always
+  /// normalized to sum to 1, so a uniform per-direction value of this
+  /// strength already integrates to exactly the physical strength.
   std::optional<torch::Tensor> isotropic_strength = std::nullopt;
 
   /// @return True if either field is set.

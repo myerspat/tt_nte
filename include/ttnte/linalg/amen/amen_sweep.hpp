@@ -55,6 +55,8 @@ namespace ttnte::linalg::amen {
 /// @param use_gpu_batched_gmres Whether local solves on CUDA tensors use
 /// the fixed-budget "batched" GPU GMRES strategy (see `gmres_solve`'s
 /// `prefer_incremental`) rather than the incremental CPU-style strategy.
+/// @param gmres_mixed_precision See
+/// `AMEnNativeOptions::gmres_mixed_precision`.
 /// @param proximal_regularization See
 /// `AMEnNativeOptions::proximal_regularization`. Only actually applied while
 /// enrichment is disabled (pure ALS) -- ignored otherwise, regardless of the
@@ -68,7 +70,7 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
   int tsqr_block_size, bool use_qless_tsqr, AMEnEnrichmentMode mode,
   int64_t als_residual_rank, bool use_local_forcing,
   double gmres_forcing_ceiling, bool use_gpu_batched_gmres,
-  double proximal_regularization = 0.0);
+  bool gmres_mixed_precision, double proximal_regularization = 0.0);
 
 /// @brief Shared TTEngine-level wrapper around `amen_sweep`: validates
 /// shapes, optionally applies the rank-1 preconditioner, converts to/from

@@ -92,4 +92,11 @@ torch::Tensor FoldedLocalOperator::to_dense() const
   return dense;
 }
 
+FoldedLocalOperator FoldedLocalOperator::to_float32() const
+{
+  return build(phi_left_raw_.to(torch::kFloat32),
+    a_core_raw_.to(torch::kFloat32), phi_right_raw_.to(torch::kFloat32),
+    regularization_);
+}
+
 } // namespace ttnte::linalg::amen

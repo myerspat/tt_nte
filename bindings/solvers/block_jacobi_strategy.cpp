@@ -1,6 +1,5 @@
 #include "ttnte/solvers/block_jacobi_strategy.hpp"
 #include "ttnte/linalg/linear_system.hpp"
-#include "ttnte/parallel/stream_pool.hpp"
 #include "ttnte/solvers/solver_configs.hpp"
 #include "ttnte/task/task_graph.hpp"
 #include <torch/extension.h>
@@ -32,9 +31,8 @@ void register_BlockJacobiStrategy(py::module_& m)
     .def(
       "build_gpu_compute_dag",
       [](const BlockJacobiStrategy& self, ttnte::task::TaskGraph& dag,
-        const ttnte::linalg::LinearSystem::Ptr& local_system,
-        const ttnte::parallel::StreamPool::Ptr& stream_pool) {
-        self.build_gpu_compute_dag(dag, local_system, stream_pool);
+        const ttnte::linalg::LinearSystem::Ptr& local_system) {
+        self.build_gpu_compute_dag(dag, local_system);
       },
-      py::arg("dag"), py::arg("local_system"), py::arg("stream_pool"));
+      py::arg("dag"), py::arg("local_system"));
 }

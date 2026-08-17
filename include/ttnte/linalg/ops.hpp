@@ -81,6 +81,51 @@ inline State direct_sum(const std::vector<State>& states)
   return State(direct_sum(engines));
 }
 
+/// @brief Round a State while exactly preserving its projection onto
+/// `moment_projector` (e.g. scalar flux + current): split `x` into
+/// `x_macro = mv(moment_projector, x)` and `x_remainder = x - x_macro`,
+/// round each separately (tightly for `x_macro`, which is structurally
+/// low-rank already; with the caller's own `eps`/`max_rank` for
+/// `x_remainder`, which may be rounded more aggressively than `x` itself
+/// ever could be), then recombine. Falls back to a plain `round_()` if
+/// `moment_projector` is undefined (i.e. moment preservation was never
+/// configured for this state's LinearSystem).
+/// @param x The state to round.
+/// @param moment_projector Orthogonal projector onto the moments to
+/// preserve, or an undefined Operator to disable moment preservation.
+/// @param eps Truncation tolerance for `x_remainder` (or for `x` itself, if
+/// `moment_projector` is undefined).
+/// @param max_rank Maximum rank for `x_remainder` (or for `x`, if
+/// `moment_projector` is undefined).
+/// @param moment_eps Truncation tolerance for `x_macro`.
+/// @param moment_max_rank Maximum rank for `x_macro`.
+/// @return The rounded State.
+inline State round_conserved(State x, const Operator& moment_projector,
+  double eps, int64_t max_rank, double moment_eps, int64_t moment_max_rank)
+{
+  if (!moment_projector.defined()) {
+    x.round_(eps, max_rank);
+    return x;
+  }
+
+  State x_macro = mv(moment_projector, x);
+  x_macro.round_(moment_eps, moment_max_rank);
+
+  State x_remainder = x - x_macro;
+  x_remainder.round_(eps, max_rank);
+
+  // x_macro + x_remainder is a plain TT addition -- its bond rank is the
+  // SUM of the two operands' ranks (block-diagonal concatenation), with no
+  // cross-term compression. Left unrounded, every call inflates rank by
+  // ~rank(x_macro), which then feeds back in as the next iteration's warm
+  // start and ratchets up without bound. Round once more, tightly (moment_
+  // eps, not the loose remainder eps -- rounding the recombined sum at the
+  // aggressive tolerance could eat back into the moment just protected),
+  // at the caller's own max_rank (not moment_max_rank, which would
+  // incorrectly clamp the whole result down to the tiny macro-only cap).
+  return (x_macro + x_remainder).round(moment_eps, max_rank);
+}
+
 /// @brief Perform an element-wise division with two tensor trains using AMEn.
 /// This calls the torchTT implementation `torchtt._division.amen_divide()` in
 /// Python.

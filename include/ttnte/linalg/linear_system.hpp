@@ -31,6 +31,12 @@ protected:
 
   /// Interior operator.
   Operator interior_op_;
+  /// Orthogonal projector onto the low-order angular moments (scalar flux +
+  /// current) of the state, expressed back in full angular resolution --
+  /// undefined unless the assembler was configured to build one. Used only
+  /// by LocalSolver/AMEnSolver's moment-preserving rounding -- not part of
+  /// the actual PDE operator, unlike interior_op_.
+  Operator moment_projector_;
   /// State vector.
   State state_;
   /// Source object (null if no source has been set).
@@ -57,7 +63,8 @@ protected:
   LinearSystem(Operator interior_op,
     c10::SmallVector<NeighborCoupling, 6> couplings = {}, State state = State(),
     Source::Ptr source = nullptr,
-    std::optional<std::string> label = std::nullopt);
+    std::optional<std::string> label = std::nullopt,
+    Operator moment_projector = Operator());
 
   // =================================================================
   // Protected methods
@@ -175,6 +182,11 @@ public:
   }
   /// @return The interior operator.
   const Operator& get_interior_op() const noexcept { return interior_op_; };
+  /// @return The moment projector (undefined if none was assembled).
+  const Operator& get_moment_projector() const noexcept
+  {
+    return moment_projector_;
+  }
   /// @return The state vector.
   const State& get_state() const noexcept { return state_; }
   /// @return The source object (null if no source was provided at

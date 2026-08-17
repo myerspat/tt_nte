@@ -2,6 +2,7 @@
 
 #include "ttnte/linalg/amen/amen_config.hpp"
 #include "ttnte/linalg/format_type.hpp"
+#include "ttnte/solvers/enrichment_policy.hpp"
 #include "ttnte/solvers/local_solver.hpp"
 #include "ttnte/utils/exception.hpp"
 
@@ -47,8 +48,19 @@ protected:
   linalg::AMEnBackend backend_;
   /// Tuning knobs specific to `AMEnBackend::NATIVE`.
   linalg::AMEnNativeOptions native_opts_;
-  /// True once `native_opts_.rank_freeze_eps` has triggered (sticky --
-  /// never resets).
+  /// Decides, once per outer DD iteration, whether enrichment should be
+  /// active for the next solve() call; null (default) means always enrich,
+  /// i.e. no rank-freeze behavior at all.
+  EnrichmentPolicy::Ptr enrichment_policy_;
+  /// The user-configured kickrank/kick2/als_residual_rank, preserved so
+  /// `enrichment_policy_` can restore them after zeroing them out -- unlike
+  /// the old sticky-only rank_freeze_eps, a policy may re-enable enrichment.
+  int base_kickrank_;
+  int base_kick2_;
+  int64_t base_als_residual_rank_;
+  /// Cached result of `enrichment_policy_`'s last decision (diagnostic --
+  /// `should_enrich` itself is stateful/advances internal counters, so it
+  /// must not be called again just to query the current state).
   bool rank_frozen_ = false;
 
   // =================================================================
@@ -57,14 +69,29 @@ protected:
     int max_rank = std::numeric_limits<int>::max(), int max_full = 500,
     int kickrank = 4, int kick2 = 0, int local_iterations = 40, int resets = 2,
     bool verbose = false,
-    linalg::AMEnPreconditioner preconditioner = linalg::AMEnPreconditioner::NONE,
+    linalg::AMEnPreconditioner preconditioner =
+      linalg::AMEnPreconditioner::NONE,
     linalg::AMEnBackend backend = linalg::AMEnBackend::NATIVE,
-    linalg::AMEnNativeOptions native_opts = linalg::AMEnNativeOptions{})
+    linalg::AMEnNativeOptions native_opts = linalg::AMEnNativeOptions {},
+    EnrichmentPolicy::Ptr enrichment_policy = nullptr,
+    bool preserve_moments = false, double moment_remainder_relaxation = 1.0,
+    double moment_eps = -1.0, int64_t moment_max_rank = -1)
     : nswp_(nswp), eps_(eps), max_rank_(max_rank), max_full_(max_full),
       kickrank_(kickrank), kick2_(kick2), local_iterations_(local_iterations),
       resets_(resets), verbose_(verbose), preconditioner_(preconditioner),
-      backend_(backend), native_opts_(native_opts)
+      backend_(backend), native_opts_(native_opts),
+      enrichment_policy_(std::move(enrichment_policy)),
+      base_kickrank_(kickrank), base_kick2_(kick2),
+      base_als_residual_rank_(native_opts.als_residual_rank)
   {
+    // Moment-preserving rounding (see LocalSolver::round_conserved()) --
+    // opt-in, forwarded into the base class fields shared by presolve()'s
+    // RHS round and this solver's own solution round.
+    preserve_moments_ = preserve_moments;
+    moment_remainder_relaxation_ = moment_remainder_relaxation;
+    moment_eps_ = moment_eps;
+    moment_max_rank_ = moment_max_rank;
+
     if (nswp_ < 1 || eps_ < 0 || max_rank_ < 1 || max_full < 0 ||
         kickrank < 0 || kick2 < 0 || local_iterations_ < 1 || resets_ < 1) {
       throw utils::runtime_error("ttnte::solvers::AMEnSolver::AMEnSolver",
@@ -81,11 +108,17 @@ protected:
         "preconditioner");
     }
 
-    if (native_opts.rank_freeze_eps > 0 &&
-        backend != linalg::AMEnBackend::NATIVE) {
+    if (enrichment_policy_ && backend != linalg::AMEnBackend::NATIVE) {
       throw utils::runtime_error("ttnte::solvers::AMEnSolver::AMEnSolver",
-        "`rank_freeze_eps` is only supported with `AMEnBackend::NATIVE` -- "
+        "`enrichment_policy` is only supported with `AMEnBackend::NATIVE` -- "
         "the torchTT backend has no zero-enrichment code path");
+    }
+
+    if (moment_remainder_relaxation_ <= 0) {
+      throw utils::runtime_error("ttnte::solvers::AMEnSolver::AMEnSolver",
+        "`moment_remainder_relaxation` must be strictly positive -- it "
+        "multiplies `eps` to form the moment remainder's truncation "
+        "tolerance");
     }
 
     eps_floor_ = eps;
@@ -108,24 +141,27 @@ public:
 
   /// @brief Update min_error_ (via LocalSolver), then force eps_ toward
   /// eps_floor_ as min_error_ improves: eps_ = max(eps_floor_, eps_forcing_ *
-  /// min_error_). Once eps_ drops to or below
-  /// `native_opts_.rank_freeze_eps` (if enabled), permanently disables
-  /// enrichment for every subsequent solve() call -- see `rank_freeze_eps`'s
-  /// doc comment. Since this runs strictly after the solve() call whose
-  /// error triggered it, that solve already completed as a normal,
-  /// enrichment-active AMEn solve with its usual post-solve round; freezing
-  /// only affects solve() calls from this point on.
-  void update_convergence_criteria(double error) override
+  /// min_error_). If an `enrichment_policy_` is set, asks it (given eps_,
+  /// error, and rank_metric) whether enrichment should be active for the
+  /// next solve() call and toggles kickrank_/kick2_/
+  /// native_opts_.als_residual_rank between 0 and their original (base_*)
+  /// values accordingly -- a policy may re-enable enrichment later, unlike
+  /// the old sticky-only rank_freeze_eps. Since this runs strictly after the
+  /// solve() call whose error triggered it, that solve already completed
+  /// under the previous decision; a change here only affects solve() calls
+  /// from this point on.
+  void update_convergence_criteria(
+    double error, double rank_metric = 0.0) override
   {
-    LocalSolver::update_convergence_criteria(error);
+    LocalSolver::update_convergence_criteria(error, rank_metric);
     eps_ = std::max(eps_floor_, eps_forcing_ * min_error_);
 
-    if (!rank_frozen_ && native_opts_.rank_freeze_eps > 0 &&
-        eps_ <= native_opts_.rank_freeze_eps) {
-      rank_frozen_ = true;
-      kickrank_ = 0;
-      kick2_ = 0;
-      native_opts_.als_residual_rank = 0;
+    if (enrichment_policy_) {
+      bool enrich = enrichment_policy_->should_enrich(eps_, error, rank_metric);
+      kickrank_ = enrich ? base_kickrank_ : 0;
+      kick2_ = enrich ? base_kick2_ : 0;
+      native_opts_.als_residual_rank = enrich ? base_als_residual_rank_ : 0;
+      rank_frozen_ = !enrich;
     }
   }
 
@@ -138,9 +174,15 @@ public:
   {
     return static_cast<int64_t>(max_rank_);
   }
-  /// @return Whether rank freezing (`native_opts_.rank_freeze_eps`) has
-  /// triggered.
+  /// @return Whether `enrichment_policy_` disabled enrichment as of the last
+  /// `update_convergence_criteria()` call.
   bool is_rank_frozen() const noexcept { return rank_frozen_; }
+  /// @return The enrichment-scheduling policy, or nullptr if enrichment is
+  /// always active.
+  const EnrichmentPolicy::Ptr& get_enrichment_policy() const noexcept
+  {
+    return enrichment_policy_;
+  }
 
   /// @return Always FormatType::TENSOR_TRAIN.
   linalg::FormatType get_state_format() override final

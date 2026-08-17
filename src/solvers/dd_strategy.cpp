@@ -31,8 +31,7 @@ void DDStrategy::build_cpu_iteration_dag(task::TaskGraph& dag,
 void DDStrategy::build_gpu_iteration_dag(task::TaskGraph& dag,
   const std::vector<SystemPtr>& local_systems,
   const std::unordered_map<int64_t, size_t>& gid_to_local,
-  const parallel::BoundaryCommunicator& boundary_comms,
-  const parallel::StreamPool::Ptr& stream_pool) const
+  const parallel::BoundaryCommunicator& boundary_comms) const
 {
   throw utils::runtime_error(
     "ttnte::solvers::DDStrategy::build_gpu_iteration_dag",

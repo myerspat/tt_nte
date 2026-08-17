@@ -40,13 +40,13 @@ LocalSolver::presolve(const linalg::LinearSystem::Ptr& sys) const
   if (src && src->get_state().defined()) {
     if (has_boundary) {
       b = src->get_state() + boundary_sum;
-      b.round_(get_eps(), get_max_rank());
+      b = round_conserved(std::move(b), sys->get_moment_projector());
     } else {
       b = src->get_state();
     }
   } else if (has_boundary) {
     b = std::move(boundary_sum);
-    b.round_(get_eps(), get_max_rank());
+    b = round_conserved(std::move(b), sys->get_moment_projector());
   }
 
   return std::make_tuple(std::move(A), std::move(b), std::move(x0));

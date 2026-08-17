@@ -52,15 +52,18 @@ void register_amen_internal(py::module_& m)
     py::arg("x0"), py::arg("max_iterations"), py::arg("restarts"),
     py::arg("rel_tol"), py::arg("prefer_incremental") = false,
     py::arg("prec") = static_cast<const LocalPreconditioner*>(nullptr),
+    py::arg("check_interval") = 8, py::arg("gmres_mixed_precision") = false,
     py::call_guard<py::gil_scoped_release>());
   m.def("gmres_solve_cpu", &gmres_solve_cpu, py::arg("op"), py::arg("rhs"),
     py::arg("x0"), py::arg("max_iterations"), py::arg("restarts"),
     py::arg("rel_tol"),
     py::arg("prec") = static_cast<const LocalPreconditioner*>(nullptr),
+    py::arg("gmres_mixed_precision") = false,
     py::call_guard<py::gil_scoped_release>());
   m.def("gmres_solve_gpu", &gmres_solve_gpu, py::arg("op"), py::arg("rhs"),
     py::arg("x0"), py::arg("max_iterations"), py::arg("restarts"),
     py::arg("rel_tol"),
     py::arg("prec") = static_cast<const LocalPreconditioner*>(nullptr),
+    py::arg("check_interval") = 8, py::arg("gmres_mixed_precision") = false,
     py::call_guard<py::gil_scoped_release>());
 }

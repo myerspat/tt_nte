@@ -30,10 +30,12 @@ struct DDSolverConfig {
   ExecMode exec_mode = ExecMode::ASYNC;
   /// Mode for communication heavy tasks.
   CommMode comm_mode = CommMode::ASYNC;
-  /// Number of threads for the TaskScheduler thread pool.
+  /// Number of threads for the TaskScheduler thread pool. For GPU workloads,
+  /// this is also the number of CUDA streams created: each worker thread
+  /// permanently claims exactly one (see
+  /// parallel::StreamPool::claim_for_this_thread()), so there's no separate
+  /// stream count to configure or keep in sync.
   int num_threads = 4;
-  /// Number of CUDA streams for GPU workloads.
-  int num_streams = 16;
   /// Use the GPU in compute tasks.
   bool use_gpu = DEFAULT_USE_GPU;
   /// Memory policy for memory management on GPUs.
@@ -52,12 +54,12 @@ struct DDSolverConfig {
   /// @brief Flat constructor — all parameters supplied directly.
   DDSolverConfig(double tol = 1e-8, int max_iter = 100,
     ExecMode exec_mode = ExecMode::ASYNC, CommMode comm_mode = CommMode::ASYNC,
-    int num_threads = 4, int num_streams = 16, bool use_gpu = DEFAULT_USE_GPU,
+    int num_threads = 4, bool use_gpu = DEFAULT_USE_GPU,
     MemoryPolicy memory_policy = DEFAULT_MEMORY_POLICY,
     double tol_forcing = 0.1, bool verbose = false)
     : tol(tol), max_iter(max_iter), exec_mode(exec_mode), comm_mode(comm_mode),
-      num_threads(num_threads), num_streams(num_streams), use_gpu(use_gpu),
-      memory_policy(memory_policy), tol_forcing(tol_forcing), verbose(verbose)
+      num_threads(num_threads), use_gpu(use_gpu), memory_policy(memory_policy),
+      tol_forcing(tol_forcing), verbose(verbose)
   {}
 };
 

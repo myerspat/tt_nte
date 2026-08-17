@@ -22,6 +22,17 @@
 // exactly three direct `torch::matmul` calls with no further permutes,
 // amortizing the one-time layout cost across every iteration that reuses
 // the same core's operator (GMRES Krylov vectors, residual checks, etc).
+//
+// Deliberately NOT pre-contracting A_core and Phi_right (or Phi_left and
+// A_core) together at build time into a single combined operand: although
+// that would let apply() skip its two runtime permutes entirely, it
+// collapses the low-rank factorization the shared operator-rank index (S)
+// provides. A_core/Phi_right stored separately cost O(s*n*m*S + R*S*L); a
+// combined `G[s,m,n,L,R] = sum_S A_core[s,m,n,S] * Phi_right[L,S,R]` costs
+// O(s*n*m*R*L) -- multiplicative in the STATE's TT ranks R,L (which reach
+// into the hundreds under AMEn's adaptive enrichment; e.g. `max_rank=500` in
+// scripts/ans26/c5g7_pincell_2d.py) instead of additive. Tried and reverted
+// -- see memory.
 
 #include <torch/extension.h>
 
@@ -62,6 +73,13 @@ public:
   /// `+ regularization * I` when this operator was built with a nonzero
   /// `regularization`.
   torch::Tensor to_dense() const;
+
+  /// @brief A float32 copy of this operator, rebuilt from the same raw
+  /// interface/core tensors cast down. For `AMEnNativeOptions::
+  /// gmres_mixed_precision`'s inner-Krylov-loop cast boundary -- the
+  /// original (float64) operator is kept alongside this one, not replaced,
+  /// so residual/truncation logic elsewhere continues to see full precision.
+  FoldedLocalOperator to_float32() const;
 
   int64_t l() const noexcept { return l_; }
   int64_t m() const noexcept { return m_; }

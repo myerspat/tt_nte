@@ -25,9 +25,11 @@ def _skip_if_unavailable(device):
 
 
 def _dense_as_local_operator(A):
-    """Embeds a dense [dim, dim] matrix A as a FoldedLocalOperator with all
+    """Embeds a dense [dim, dim] matrix A as a FoldedLocalOperator with all.
+
     bond ranks trivial (l=r=L=R=s=S=1) and the physical mode carrying `dim`,
-    so `op.apply(y)` with `y` shaped [1, dim, 1] computes `A @ y`."""
+    so `op.apply(y)` with `y` shaped [1, dim, 1] computes `A @ y`.
+    """
     device, dtype = A.device, A.dtype
     dim = A.shape[0]
     phi_left = torch.ones(1, 1, 1, device=device, dtype=dtype)
@@ -112,16 +114,17 @@ def test_gmres_warm_start_converges(device, dtype):
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_gmres_restart_actually_restarts(device):
-    """`max_iterations` deliberately smaller than the problem dimension, so a
-    single (non-restarted) Krylov cycle cannot span the full space and
-    convergence requires the restart loop body (residual recompute, Arnoldi
-    restart from the updated `x`) to actually run more than once -- every
-    other GMRES test in this file picks `max_iterations >= dim`, which
-    converges in the first cycle and never exercises that code path.
+    """`max_iterations` deliberately smaller than the problem dimension, so a single
+    (non-restarted) Krylov cycle cannot span the full space and convergence requires the
+    restart loop body (residual recompute, Arnoldi restart from the updated `x`) to
+    actually run more than once -- every other GMRES test in this file picks
+    `max_iterations >= dim`, which converges in the first cycle and never exercises that
+    code path.
+
     float64-only (locally reseeded for determinism): float32 precision is too
     coarse to reliably distinguish "one cycle under-converges" from "several
-    restarts converge" at a tolerance loose enough for fp32 in the first
-    place."""
+    restarts converge" at a tolerance loose enough for fp32 in the first place.
+    """
     _skip_if_unavailable(device)
     dtype = torch.float64
     torch.manual_seed(999)
@@ -177,7 +180,9 @@ def test_gmres_solve_with_local_preconditioner(device, dtype):
     phi_left = torch.ones(1, 1, 1, device=device, dtype=dtype)
     phi_right = torch.ones(1, 1, 1, device=device, dtype=dtype)
     a_core = A.reshape(1, dim, dim, 1)
-    prec = LocalPreconditioner.build(phi_left, a_core, phi_right, AMEnPreconditioner.LOCAL_C_PREC)
+    prec = LocalPreconditioner.build(
+        phi_left, a_core, phi_right, AMEnPreconditioner.LOCAL_C_PREC
+    )
 
     x_true = torch.randn(1, dim, 1, device=device, dtype=dtype)
     rhs = op.apply(x_true)
@@ -193,13 +198,122 @@ def test_gmres_solve_with_local_preconditioner(device, dtype):
     assert err.item() < tol
 
 
-@pytest.mark.parametrize("device,dtype", [("cuda", torch.float32), ("cuda", torch.float64)])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_gmres_mixed_precision_matches_torch_linalg_solve(device):
+    """`gmres_mixed_precision=True` runs the inner Arnoldi/Gram-Schmidt/Givens
+    build in float32 while keeping x/rhs/the true per-restart residual in
+    float64 (see `AMEnNativeOptions::gmres_mixed_precision`) -- on both CPU
+    and CUDA tensors. float64-only (mixing "up" from an already-float32
+    input is a no-op by construction, not a meaningful case).
+
+    Checks two things: the returned solution is close to the float64 ground
+    truth (`torch.linalg.solve`), and -- the specific failure mode Jang,
+    Jolivet & Mary (NLAA 2026) show for a structurally similar
+    cheap-incremental-update pattern in GMRES-DR -- an INDEPENDENTLY,
+    freshly computed true residual (via the original float64 operator, not
+    reusing any of GMRES's own internal incremental bookkeeping) is actually
+    small. If the incremental Givens residual estimate this codebase tracks
+    (`beta[k+1]`) were silently drifting from the true residual under
+    reduced precision, GMRES could declare false convergence while this
+    independent check would catch it.
+    """
+    _skip_if_unavailable(device)
+    dtype = torch.float64
+    tol = 2e-3
+    dim = 12
+
+    A, op = _random_square_system(dim, device, dtype, diag_boost=5.0 * dim)
+    x_true = torch.randn(1, dim, 1, device=device, dtype=dtype)
+    rhs = op.apply(x_true)
+    x_ref = torch.linalg.solve(A, rhs.reshape(-1)).reshape(x_true.shape)
+
+    x0 = torch.zeros_like(x_true)
+    rel_tol = 1e-10
+    x = gmres_solve(
+        op,
+        rhs,
+        x0,
+        30,
+        3,
+        rel_tol,
+        prefer_incremental=True,
+        gmres_mixed_precision=True,
+    )
+
+    err_vs_torch_solve = (x - x_ref).norm() / x_ref.norm()
+    err_vs_true = (x - x_true).norm() / x_true.norm()
+    assert err_vs_torch_solve.item() < tol
+    assert err_vs_true.item() < tol
+
+    # Independent true-residual check (the Jang/Jolivet/Mary-motivated part):
+    # recompute b - A @ x from scratch via the original float64 op, with no
+    # reuse of GMRES's own internal state.
+    true_residual = (rhs - op.apply(x)).norm() / rhs.norm()
+    assert true_residual.item() < 10 * rel_tol
+
+
+def test_gmres_mixed_precision_gpu_batched_strategy_matches_torch_linalg_solve():
+    """Same check as `test_gmres_mixed_precision_matches_torch_linalg_solve`, but
+    through `gmres_solve_gpu`'s fixed-budget Arnoldi strategy instead of the
+    incremental-Givens one -- `gmres_mixed_precision` applies to both GMRES strategies,
+    not just the incremental one."""
+    _skip_if_unavailable("cuda")
+    device, dtype = "cuda", torch.float64
+    tol = 2e-3
+    dim = 12
+
+    A, op = _random_square_system(dim, device, dtype, diag_boost=5.0 * dim)
+    x_true = torch.randn(1, dim, 1, device=device, dtype=dtype)
+    rhs = op.apply(x_true)
+    x_ref = torch.linalg.solve(A, rhs.reshape(-1)).reshape(x_true.shape)
+
+    x0 = torch.zeros_like(x_true)
+    rel_tol = 1e-10
+    x = gmres_solve_gpu(op, rhs, x0, 30, 3, rel_tol, gmres_mixed_precision=True)
+
+    err_vs_torch_solve = (x - x_ref).norm() / x_ref.norm()
+    err_vs_true = (x - x_true).norm() / x_true.norm()
+    assert err_vs_torch_solve.item() < tol
+    assert err_vs_true.item() < tol
+
+    true_residual = (rhs - op.apply(x)).norm() / rhs.norm()
+    assert true_residual.item() < 10 * rel_tol
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_gmres_mixed_precision_default_off_is_unchanged(device):
+    """`gmres_mixed_precision` defaults to False -- omitting it entirely must produce
+    bit-for-bit the same result as passing it explicitly False, and the same code path
+    as before this option existed.
+
+    Checked against both
+    GMRES strategies (gmres_solve_cpu on CPU, gmres_solve_gpu on CUDA, since
+    that's what `gmres_solve` itself would dispatch to by default).
+    """
+    _skip_if_unavailable(device)
+    dtype = torch.float64
+    dim = 10
+
+    _, op = _random_square_system(dim, device, dtype, diag_boost=5.0 * dim)
+    x_true = torch.randn(1, dim, 1, device=device, dtype=dtype)
+    rhs = op.apply(x_true)
+    x0 = torch.zeros_like(x_true)
+
+    solve_fn = gmres_solve_cpu if device == "cpu" else gmres_solve_gpu
+    x_default = solve_fn(op, rhs, x0, 30, 3, 1e-10)
+    x_explicit_off = solve_fn(op, rhs, x0, 30, 3, 1e-10, gmres_mixed_precision=False)
+
+    assert torch.equal(x_default, x_explicit_off)
+
+
+@pytest.mark.parametrize(
+    "device,dtype", [("cuda", torch.float32), ("cuda", torch.float64)]
+)
 def test_gmres_prefer_incremental_forces_cpu_strategy_on_gpu_tensors(device, dtype):
-    """`gmres_solve`'s `prefer_incremental` flag should route CUDA tensors
-    through `gmres_solve_cpu`'s incremental-Givens strategy instead of
-    `gmres_solve_gpu`'s fixed-budget strategy -- previously untested (every
-    other test in this file either omits the flag or only exercises the
-    per-device dispatch's default routing)."""
+    """`gmres_solve`'s `prefer_incremental` flag should route CUDA tensors through
+    `gmres_solve_cpu`'s incremental-Givens strategy instead of `gmres_solve_gpu`'s
+    fixed-budget strategy -- previously untested (every other test in this file either
+    omits the flag or only exercises the per-device dispatch's default routing)."""
     _skip_if_unavailable(device)
     tol = 2e-3 if dtype == torch.float32 else 1e-8
     dim = 12

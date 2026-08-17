@@ -1,6 +1,5 @@
 #include "ttnte/solvers/dd_strategy.hpp"
 #include "ttnte/parallel/boundary_communicator.hpp"
-#include "ttnte/parallel/stream_pool.hpp"
 #include "ttnte/solvers/solver_configs.hpp"
 #include "ttnte/task/task_graph.hpp"
 #include <torch/extension.h>
@@ -26,11 +25,10 @@ public:
   void build_gpu_iteration_dag(ttnte::task::TaskGraph& dag,
     const std::vector<SystemPtr>& local_systems,
     const std::unordered_map<int64_t, size_t>& gid_to_local,
-    const ttnte::parallel::BoundaryCommunicator& boundary_comms,
-    const ttnte::parallel::StreamPool::Ptr& stream_pool) const override
+    const ttnte::parallel::BoundaryCommunicator& boundary_comms) const override
   {
     PYBIND11_OVERRIDE(void, DDStrategy, build_gpu_iteration_dag, dag,
-      local_systems, gid_to_local, boundary_comms, stream_pool);
+      local_systems, gid_to_local, boundary_comms);
   }
 };
 
@@ -49,7 +47,7 @@ void register_DDStrategy(py::module_& m)
       py::arg("boundary_comms"))
     .def("build_gpu_iteration_dag", &DDStrategy::build_gpu_iteration_dag,
       py::arg("dag"), py::arg("local_systems"), py::arg("gid_to_local"),
-      py::arg("boundary_comms"), py::arg("stream_pool"))
+      py::arg("boundary_comms"))
 
     // =================================================================
     // Public getters / setters

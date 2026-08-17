@@ -18,6 +18,14 @@ void register_ops(py::module_& m)
     py::arg("a"), py::arg("b"), "Compute an exact matrix-vector product.",
     py::call_guard<py::gil_scoped_release>());
 
+  m.def("round_conserved", &round_conserved, py::arg("x"),
+    py::arg("moment_projector"), py::arg("eps"), py::arg("max_rank"),
+    py::arg("moment_eps"), py::arg("moment_max_rank"),
+    "Round a State while exactly preserving its projection onto "
+    "moment_projector (e.g. scalar flux + current); falls back to a plain "
+    "round if moment_projector is undefined.",
+    py::call_guard<py::gil_scoped_release>());
+
   // =================================================================
   // Element-Wise Operations & Fast Approximations
   // =================================================================
@@ -102,7 +110,7 @@ void register_ops(py::module_& m)
     py::arg("verbose") = false,
     py::arg("preconditioner") = AMEnPreconditioner::NONE,
     py::arg("backend") = AMEnBackend::NATIVE,
-    py::arg("native_opts") = AMEnNativeOptions{},
+    py::arg("native_opts") = AMEnNativeOptions {},
     "Solve a linear system A @ x = b using AMEn.",
     py::call_guard<py::gil_scoped_release>());
 

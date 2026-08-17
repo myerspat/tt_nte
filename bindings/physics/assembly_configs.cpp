@@ -68,5 +68,8 @@ void register_assembly_configs(py::module_& m)
     .def_readwrite("fission_fmt", &DGTransportAssemblerConfig::fission_fmt)
     .def_readwrite("outflow_fmt", &DGTransportAssemblerConfig::outflow_fmt)
     .def_readwrite("inflow_fmt", &DGTransportAssemblerConfig::inflow_fmt)
-    .def_readwrite("source_fmt", &DGTransportAssemblerConfig::source_fmt);
+    .def_readwrite("source_fmt", &DGTransportAssemblerConfig::source_fmt)
+    .def_readwrite("assemble_moment_projector",
+      &DGTransportAssemblerConfig::assemble_moment_projector)
+    .def_readwrite("moment_order", &DGTransportAssemblerConfig::moment_order);
 }

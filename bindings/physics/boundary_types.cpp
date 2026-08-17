@@ -15,6 +15,8 @@ void register_BoundaryType(py::module_& m)
     .value("PERIODIC", BoundaryType::PERIODIC, "Periodic boundary")
     .value("DEGENERATE", BoundaryType::DEGENERATE,
       "Boundary is degenerate and needs no boundary operators")
+    .value("INCIDENT", BoundaryType::INCIDENT,
+      "Prescribed (fixed) incident angular flux -- RHS-only, not an unknown")
     .export_values()
     .def("__str__", [](ttnte::physics::BoundaryType t) {
       return ttnte::physics::to_string(t);

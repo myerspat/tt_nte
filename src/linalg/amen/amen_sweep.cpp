@@ -30,6 +30,7 @@
 #include "ttnte/utils/exception.hpp"
 #include <cmath>
 #include <iostream>
+#include <optional>
 
 using namespace torch::indexing;
 
@@ -68,7 +69,8 @@ torch::Tensor fixed_rank_basis(const torch::Tensor& candidate,
     padded = torch::cat(
       {padded, torch::randn({rows, rank - padded.size(1)}, options)}, 1);
   }
-  auto [Q, R] = orthogonalize_maybe_qless(padded, tsqr_block_size, use_qless_tsqr);
+  auto [Q, R] =
+    orthogonalize_maybe_qless(padded, tsqr_block_size, use_qless_tsqr);
   return Q.index({Slice(), Slice(0, rank)});
 }
 
@@ -81,7 +83,8 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
   int resets, bool verbose, AMEnPreconditioner preconditioner,
   int tsqr_block_size, bool use_qless_tsqr, AMEnEnrichmentMode mode,
   int64_t als_residual_rank, bool use_local_forcing,
-  double gmres_forcing_ceiling, bool use_gpu_batched_gmres)
+  double gmres_forcing_ceiling, bool use_gpu_batched_gmres,
+  bool gmres_mixed_precision, double proximal_regularization)
 {
   if (preconditioner == AMEnPreconditioner::RANK1) {
     throw utils::runtime_error("ttnte::linalg::amen::amen_sweep",
@@ -105,6 +108,14 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
   // usual eps/max_rank truncation loop but never grow).
   const bool enrichment_disabled =
     fixed_rank ? (als_residual_rank == 0) : (kickrank == 0 && kick2 == 0);
+  // Proximal (RALS-style) damping of the per-core ALS update only makes
+  // sense once enrichment is off: during the enrichment-active phase, rank
+  // is still adapting to reach the tightening truncation target, so the
+  // local solves aren't structurally swamped -- damping them there would
+  // just slow down otherwise-legitimate large corrections. See
+  // `AMEnNativeOptions::proximal_regularization`.
+  const double active_regularization =
+    enrichment_disabled ? proximal_regularization : 0.0;
 
   auto options = A_cores[0].options();
   const int64_t d = static_cast<int64_t>(N.size());
@@ -129,7 +140,8 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
     // Right-to-left orthogonalize z_cores.
     for (int64_t k = d - 1; k > 0; --k) {
       torch::Tensor core = z_cores[k].reshape({rz[k], -1}).t();
-      auto [Q, R] = orthogonalize_maybe_qless(core, tsqr_block_size, use_qless_tsqr);
+      auto [Q, R] =
+        orthogonalize_maybe_qless(core, tsqr_block_size, use_qless_tsqr);
       rz[k] = Q.size(1);
       z_cores[k] = Q.t().reshape({rz[k], N[k], rz[k + 1]});
       z_cores[k - 1] = torch::tensordot(z_cores[k - 1], R.t(), {2}, {0});
@@ -154,10 +166,14 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
 
   if (verbose) {
     std::cout << "Starting native AMEn solve with: eps=" << eps
-               << ", max_rank=" << max_rank << ", nswp=" << nswp
-               << ", kickrank=" << kickrank << ", kick2=" << kick2
-               << (enrichment_disabled ? " (enrichment disabled, pure ALS)" : "")
-               << std::endl;
+              << ", max_rank=" << max_rank << ", nswp=" << nswp
+              << ", kickrank=" << kickrank << ", kick2=" << kick2
+              << (enrichment_disabled ? " (enrichment disabled, pure ALS)" : "")
+              << (active_regularization > 0.0
+                     ? ", proximal_regularization=" +
+                         std::to_string(active_regularization)
+                     : "")
+              << std::endl;
   }
 
   for (int swp = 0; swp < nswp; ++swp) {
@@ -200,7 +216,8 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
         } else {
           cz_new = z_cores[k].reshape({rz[k], -1}).t();
         }
-        auto [Qz, Rz] = orthogonalize_maybe_qless(cz_new, tsqr_block_size, use_qless_tsqr);
+        auto [Qz, Rz] =
+          orthogonalize_maybe_qless(cz_new, tsqr_block_size, use_qless_tsqr);
         rz[k] = Qz.size(1);
         z_cores[k] = Qz.t().reshape({rz[k], N[k], rz[k + 1]});
       }
@@ -210,18 +227,24 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
       }
 
       torch::Tensor core = x_cores[k].reshape({rx[k], N[k] * rx[k + 1]}).t();
-      auto [Qx, Rx] = orthogonalize_maybe_qless(core, tsqr_block_size, use_qless_tsqr);
+      auto [Qx, Rx] =
+        orthogonalize_maybe_qless(core, tsqr_block_size, use_qless_tsqr);
       torch::Tensor core_prev =
         torch::tensordot(x_cores[k - 1], Rx.t(), {2}, {0});
       rx[k] = Qx.size(1);
 
-      double current_norm = core_prev.norm().item<double>();
-      if (current_norm > 0) {
-        core_prev = core_prev / current_norm;
-      } else {
-        current_norm = 1.0;
-      }
-      normx[k - 1] = normx[k - 1] * current_norm;
+      // Defer the three per-core norm host-reads below (current_norm,
+      // normA_k, normb_k) into a single batched round trip instead of three
+      // separate `.item()` calls -- each one is a full stream sync, and
+      // profiling showed these dominate wall time, worse so at large rank
+      // (deeper queued GEMM work behind each sync). The GPU-side divisions
+      // use `torch::where` so they don't need the host value first -- only
+      // the bookkeeping (normx/normA/normb arrays, nrmsc) needs the actual
+      // scalar, and nothing here reads it before the batched fetch below.
+      torch::Tensor core_prev_norm_raw = core_prev.norm();
+      torch::Tensor current_norm_t = torch::where(core_prev_norm_raw > 0,
+        core_prev_norm_raw, torch::ones_like(core_prev_norm_raw));
+      core_prev = core_prev / current_norm_t;
 
       x_cores[k] = Qx.t().reshape({rx[k], N[k], rx[k + 1]}).clone();
       x_cores[k - 1] = core_prev.clone();
@@ -230,15 +253,25 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
         compute_phi_bck_A(Phis[k + 1], x_cores[k], A_cores[k], x_cores[k]);
       Phis_b[k] = compute_phi_bck_rhs(Phis_b[k + 1], b_cores[k], x_cores[k]);
 
-      double normA_k = Phis[k].norm().item<double>();
-      normA_k = normA_k > 0 ? normA_k : 1.0;
-      normA[k - 1] = normA_k;
-      Phis[k] = Phis[k] / normA_k;
+      torch::Tensor phis_norm_raw = Phis[k].norm();
+      torch::Tensor normA_k_t = torch::where(
+        phis_norm_raw > 0, phis_norm_raw, torch::ones_like(phis_norm_raw));
+      Phis[k] = Phis[k] / normA_k_t;
 
-      double normb_k = Phis_b[k].norm().item<double>();
-      normb_k = normb_k > 0 ? normb_k : 1.0;
+      torch::Tensor phisb_norm_raw = Phis_b[k].norm();
+      torch::Tensor normb_k_t = torch::where(
+        phisb_norm_raw > 0, phisb_norm_raw, torch::ones_like(phisb_norm_raw));
+      Phis_b[k] = Phis_b[k] / normb_k_t;
+
+      torch::Tensor norms_cpu =
+        torch::stack({current_norm_t, normA_k_t, normb_k_t}).cpu();
+      const double current_norm = norms_cpu[0].item<double>();
+      const double normA_k = norms_cpu[1].item<double>();
+      const double normb_k = norms_cpu[2].item<double>();
+
+      normx[k - 1] = normx[k - 1] * current_norm;
+      normA[k - 1] = normA_k;
       normb[k - 1] = normb_k;
-      Phis_b[k] = Phis_b[k] / normb_k;
 
       nrmsc = nrmsc * normb[k - 1] / (normA[k - 1] * normx[k - 1]);
 
@@ -246,9 +279,8 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
         Phiz[k] =
           compute_phi_bck_A(Phiz[k + 1], z_cores[k], A_cores[k], x_cores[k]) /
           normA[k - 1];
-        Phiz_b[k] =
-          compute_phi_bck_rhs(Phiz_b[k + 1], b_cores[k], z_cores[k]) /
-          normb[k - 1];
+        Phiz_b[k] = compute_phi_bck_rhs(Phiz_b[k + 1], b_cores[k], z_cores[k]) /
+                    normb[k - 1];
       }
     }
 
@@ -257,15 +289,23 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
     for (int64_t k = 0; k < d; ++k) {
       torch::Tensor previous_solution = x_cores[k].reshape({-1, 1});
 
-      torch::Tensor rhs = torch::tensordot(Phis_b[k], b_cores[k] * nrmsc, {0}, {0});
+      torch::Tensor rhs =
+        torch::tensordot(Phis_b[k], b_cores[k] * nrmsc, {0}, {0});
       rhs = torch::tensordot(rhs, Phis_b[k + 1], {2}, {0}).reshape({-1, 1});
-      double norm_rhs = rhs.norm().item<double>();
+      // Raw (undivided) norm tensor -- the host read is deferred and batched
+      // with the branch's own residual norm(s) below instead of being its
+      // own separate `.item()` call.
+      torch::Tensor rhs_norm_t = rhs.norm();
 
       double real_tol = (eps / std::sqrt(static_cast<double>(d))) / damp;
 
       bool use_full = rx[k] * N[k] * rx[k + 1] < max_full;
       torch::Tensor solution_now;
-      double res_old, res_new;
+      double norm_rhs, res_old, res_new = 0.0;
+      // Only set by the GMRES (non-`use_full`) path -- an unsynced GPU
+      // tensor, merged into the truncation loop's first batched read below
+      // instead of paying for a standalone host sync (see there).
+      torch::Tensor res_new_t;
       // Whether this core's local solve target was deliberately loosened by
       // the forcing term (see below). When true, `res_new` reflects
       // accuracy left on the table on purpose, not genuine local-solve
@@ -280,20 +320,56 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
         FoldedLocalOperator::build(Phis[k], A_cores[k], Phis[k + 1]);
       torch::Tensor B_dense;
 
+      // When active, the per-core solve targets the proximally-regularized
+      // system `(B + w I) x = rhs + w x_prev` instead of `B x = rhs` --
+      // damping the step toward the previous iterate (see
+      // `AMEnNativeOptions::proximal_regularization`). `local_op` above stays
+      // unregularized: every residual/truncation decision below (`res_old`,
+      // `res_new`, `max_res`, the rank-truncation floor) must still reflect
+      // the true system, not the shifted one, or a damped-but-unconverged
+      // solve would look artificially converged.
+      const bool regularized = active_regularization > 0.0;
+      FoldedLocalOperator solve_op =
+        regularized ? FoldedLocalOperator::build(
+                        Phis[k], A_cores[k], Phis[k + 1], active_regularization)
+                    : local_op;
+
       if (use_full) {
         B_dense = local_op.to_dense();
-        solution_now = torch::linalg_solve(B_dense, rhs);
-        res_old = (torch::matmul(B_dense, previous_solution) - rhs).norm().item<double>() /
-          norm_rhs;
-        res_new =
-          (torch::matmul(B_dense, solution_now) - rhs).norm().item<double>() / norm_rhs;
+        torch::Tensor rhs_solve =
+          regularized ? rhs + active_regularization * previous_solution : rhs;
+        torch::Tensor B_solve = regularized ? solve_op.to_dense() : B_dense;
+        solution_now = torch::linalg_solve(B_solve, rhs_solve);
+        // None of these three raw norms are needed on the host before this
+        // point (solution_now came from a direct solve, not anything
+        // residual-dependent), so batch all three into one round trip.
+        torch::Tensor res_old_raw_t =
+          (torch::matmul(B_dense, previous_solution) - rhs).norm();
+        torch::Tensor res_new_raw_t =
+          (torch::matmul(B_dense, solution_now) - rhs).norm();
+        torch::Tensor batched =
+          torch::stack({rhs_norm_t, res_old_raw_t, res_new_raw_t}).cpu();
+        norm_rhs = batched[0].item<double>();
+        res_old = batched[1].item<double>() / norm_rhs;
+        res_new = batched[2].item<double>() / norm_rhs;
       } else {
         torch::Tensor rhs_shaped = rhs.reshape({rx[k], N[k], rx[k + 1]});
-        torch::Tensor prev_shaped = previous_solution.reshape({rx[k], N[k], rx[k + 1]});
+        torch::Tensor prev_shaped =
+          previous_solution.reshape({rx[k], N[k], rx[k + 1]});
+        torch::Tensor rhs_shaped_solve =
+          regularized ? rhs_shaped + active_regularization * prev_shaped
+                      : rhs_shaped;
 
-        res_old =
-          (local_op.apply(prev_shaped).reshape({-1, 1}) - rhs).norm().item<double>() /
-          norm_rhs;
+        // res_old's host value gates `forcing_tol` right below (GMRES needs
+        // it before it can run), so it can't be deferred past this point --
+        // but it can still be batched together with rhs_norm_t into one
+        // round trip instead of two separate ones. Measured against the
+        // true (unregularized) operator, same as `use_full` above.
+        torch::Tensor res_old_raw_t =
+          (local_op.apply(prev_shaped).reshape({-1, 1}) - rhs).norm();
+        torch::Tensor batched = torch::stack({rhs_norm_t, res_old_raw_t}).cpu();
+        norm_rhs = batched[0].item<double>();
+        res_old = batched[1].item<double>() / norm_rhs;
 
         // Forcing term (inexact-Newton style, matching the local-tolerance
         // heuristic of Roehrig-Zoellner et al. 2025 / pitts' "AMEn+ALS"):
@@ -303,16 +379,20 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
         // will be overwritten by enrichment/further sweeps anyway; the
         // target tightens toward `real_tol` as res_old shrinks, so the
         // final sweep still gets full accuracy.
-        double forcing_tol = use_local_forcing
-          ? std::max(real_tol, std::min(gmres_forcing_ceiling, res_old))
-          : real_tol;
+        double forcing_tol =
+          use_local_forcing
+            ? std::max(real_tol, std::min(gmres_forcing_ceiling, res_old))
+            : real_tol;
         was_forced_loose = forcing_tol > real_tol;
 
         // Local (per-core) preconditioning: solve `(A M^-1) y = rhs`
         // directly (M is the cheap Jacobi-style block built from the
         // diagonal of Phis[k]/Phis[k+1], see local_preconditioner.hpp) with
         // `y0 = M x0`, then recover `x = M^-1 y`. Only on the iterative
-        // path -- there's nothing to precondition when solving exactly.
+        // path -- there's nothing to precondition when solving exactly. The
+        // preconditioner block itself is still built from the unregularized
+        // interface tensors -- a small proximal shift doesn't change a
+        // cheap Jacobi-style approximation enough to be worth rebuilding it.
         torch::Tensor sol_shaped;
         bool preconditioned_ok = false;
         if (preconditioner != AMEnPreconditioner::NONE) {
@@ -326,8 +406,9 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
             LocalPreconditioner prec = LocalPreconditioner::build(
               Phis[k], A_cores[k], Phis[k + 1], preconditioner);
             torch::Tensor y0 = prec.apply_forward(prev_shaped);
-            torch::Tensor sol_y = gmres_solve(local_op, rhs_shaped, y0,
-              local_iterations, resets, forcing_tol, !use_gpu_batched_gmres, &prec);
+            torch::Tensor sol_y = gmres_solve(solve_op, rhs_shaped_solve, y0,
+              local_iterations, resets, forcing_tol, !use_gpu_batched_gmres,
+              &prec, 8, gmres_mixed_precision);
             sol_shaped = prec.apply_inverse(sol_y);
             preconditioned_ok = true;
           } catch (const c10::Error&) {
@@ -335,13 +416,22 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
           }
         }
         if (!preconditioned_ok) {
-          sol_shaped = gmres_solve(local_op, rhs_shaped, prev_shaped,
-            local_iterations, resets, forcing_tol, !use_gpu_batched_gmres);
+          sol_shaped = gmres_solve(solve_op, rhs_shaped_solve, prev_shaped,
+            local_iterations, resets, forcing_tol, !use_gpu_batched_gmres,
+            nullptr, 8, gmres_mixed_precision);
         }
         solution_now = sol_shaped.reshape({-1, 1});
-        res_new =
-          (local_op.apply(sol_shaped).reshape({-1, 1}) - rhs).norm().item<double>() /
-          norm_rhs;
+        // `res_new` (`res_new_t` here) only ever feeds the truncation-loop
+        // floor below, which only runs when this core has a truncation loop
+        // at all (`k < d - 1`) and enrichment is still active -- skip the
+        // extra operator apply entirely otherwise. When it is needed, keep
+        // it as an unsynced GPU tensor and pay its one host sync merged into
+        // the truncation loop's first batched read instead of a standalone
+        // one.
+        if (k < d - 1 && !enrichment_disabled) {
+          res_new_t =
+            (local_op.apply(sol_shaped).reshape({-1, 1}) - rhs).norm();
+        }
       }
 
       max_res = std::max(max_res, res_old);
@@ -357,39 +447,104 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
         s = S;
         v = Vh;
         r = u.size(1);
-        // See `was_forced_loose` above: when this core's solve was
-        // deliberately under-solved for speed, `res_new` doesn't reflect
-        // genuine local-solve difficulty, so don't let it loosen the
-        // truncation floor -- fall back to the tight per-core target alone.
-        double truncation_floor =
-          was_forced_loose ? real_tol * damp : std::max(res_new, real_tol * damp);
-        while (r > 0) {
-          torch::Tensor sol_r = torch::matmul(
-            u.index({Ellipsis, Slice(0, r)}) * s.index({Slice(0, r)}),
-            v.index({Slice(0, r), Ellipsis}));
-          double res;
-          if (use_full) {
-            res = (torch::matmul(B_dense, sol_r.reshape({-1, 1})) - rhs)
-                    .norm()
-                    .item<double>() /
-              norm_rhs;
-          } else {
-            res = (local_op.apply(sol_r.reshape({rx[k], N[k], rx[k + 1]}))
-                     .reshape({-1, 1}) -
-                    rhs)
-                    .norm()
-                    .item<double>() /
-              norm_rhs;
+        if (enrichment_disabled) {
+          // Once enrichment is disabled (pure ALS -- either an AMEnSolver
+          // EnrichmentPolicy disabled it, or the caller requested zero
+          // enrichment directly), skip the residual-based truncation loop
+          // entirely: keep the full local solve's rank, bounded only by
+          // `max_rank`. Re-evaluating the truncated residual at every
+          // candidate rank is needless extra
+          // work here -- there is no more enrichment to grow back into
+          // afterward, so the loop can only ever shrink the warm start's
+          // rank, and doing that via a residual floor derived from `res_new`
+          // is exactly what let a regularized (deliberately biased) solve
+          // erode rank it didn't actually need to lose (see
+          // `AMEnNativeOptions::proximal_regularization`).
+          r = std::min<int64_t>(u.size(1), max_rank);
+        } else {
+          // When this core's solve was deliberately under-solved for speed
+          // (`was_forced_loose`), `res_new` doesn't reflect genuine
+          // local-solve difficulty, so don't let it loosen the truncation
+          // floor -- fall back to the tight per-core target alone (and skip
+          // the `res_new` sync entirely -- it's unused in that case). On the
+          // `use_full` path `res_new` is already a synced host double (see
+          // above); on the GMRES path it's `res_new_t`, an unsynced GPU
+          // tensor -- merge that one sync into the loop's first batched read
+          // below instead of paying for it separately.
+          bool need_res_new_sync = !was_forced_loose && !use_full;
+          double truncation_floor =
+            was_forced_loose       ? real_tol * damp
+            : (!need_res_new_sync) ? std::max(res_new, real_tol * damp)
+                                   : 0.0; // filled in by the first chunk below
+
+          // Same candidate-by-candidate search as a plain `while (r > 0)`
+          // walk from full rank downward (identical break point, identical
+          // per-candidate residual -- no change in the truncation
+          // criterion), but evaluated in fixed-size chunks so the O(r) host
+          // syncs a per-candidate `.item()` would force collapse to O(r /
+          // kTruncationCheckChunk): every candidate in a chunk is computed
+          // as a GPU tensor with no intermediate sync, then the whole chunk
+          // is read back in one `.cpu()` round trip and scanned on the host
+          // in the same descending order the original loop used. Worst-case
+          // extra work vs. the original early-breaking loop is bounded by
+          // `kTruncationCheckChunk - 1` wasted candidate evaluations (small,
+          // since achieved TT ranks here are typically tens, not hundreds).
+          constexpr int64_t kTruncationCheckChunk = 4;
+          auto residual_at_rank = [&](int64_t rc) -> torch::Tensor {
+            torch::Tensor sol_r = torch::matmul(
+              u.index({Ellipsis, Slice(0, rc)}) * s.index({Slice(0, rc)}),
+              v.index({Slice(0, rc), Ellipsis}));
+            return use_full
+                     ? (torch::matmul(B_dense, sol_r.reshape({-1, 1})) - rhs)
+                         .norm()
+                     : (local_op.apply(sol_r.reshape({rx[k], N[k], rx[k + 1]}))
+                           .reshape({-1, 1}) -
+                         rhs)
+                         .norm();
+          };
+
+          std::optional<int64_t> failing_r;
+          int64_t probe = r;
+          bool first_chunk = true;
+          while (probe > 0 && !failing_r.has_value()) {
+            int64_t chunk_lo =
+              std::max<int64_t>(1, probe - kTruncationCheckChunk + 1);
+            const bool merge_res_new = first_chunk && need_res_new_sync;
+            std::vector<torch::Tensor> res_tensors;
+            res_tensors.reserve(probe - chunk_lo + 1 + (merge_res_new ? 1 : 0));
+            if (merge_res_new) {
+              res_tensors.push_back(res_new_t);
+            }
+            for (int64_t rc = probe; rc >= chunk_lo; --rc) {
+              res_tensors.push_back(residual_at_rank(rc));
+            }
+            torch::Tensor batched = torch::stack(res_tensors).cpu();
+            int64_t offset = 0;
+            if (merge_res_new) {
+              double res_new_val = batched[0].item<double>() / norm_rhs;
+              truncation_floor = std::max(res_new_val, real_tol * damp);
+              offset = 1;
+            }
+            for (int64_t i = 0; i + offset < batched.numel(); ++i) {
+              double res = batched[offset + i].item<double>() / norm_rhs;
+              if (res > truncation_floor) {
+                failing_r = probe - i;
+                break;
+              }
+            }
+            first_chunk = false;
+            if (!failing_r.has_value()) {
+              probe = chunk_lo - 1;
+            }
           }
-          if (res > truncation_floor) {
-            break;
-          }
-          --r;
+          r = failing_r.has_value() ? (*failing_r + 1) : 1;
+          r = (r < u.size(1) && r < max_rank)
+                ? r
+                : std::min<int64_t>(u.size(1), max_rank);
         }
-        ++r;
-        r = (r < u.size(1) && r < max_rank) ? r : std::min<int64_t>(u.size(1), max_rank);
       } else {
-        auto [Q, R] = orthogonalize_maybe_qless(solution_now, tsqr_block_size, use_qless_tsqr);
+        auto [Q, R] = orthogonalize_maybe_qless(
+          solution_now, tsqr_block_size, use_qless_tsqr);
         u = Q;
         v = R;
         r = u.size(1);
@@ -402,11 +557,13 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
       v = torch::matmul(tmp1, tmp2).t();
 
       if (!last && !enrichment_disabled) {
-        torch::Tensor tmp = torch::matmul(u, v.t()).reshape({rx[k], N[k], rx[k + 1]});
+        torch::Tensor tmp =
+          torch::matmul(u, v.t()).reshape({rx[k], N[k], rx[k + 1]});
         torch::Tensor czA =
           FoldedLocalOperator::build(Phiz[k], A_cores[k], Phiz[k + 1])
             .apply(tmp);
-        torch::Tensor czy = torch::tensordot(Phiz_b[k], nrmsc * b_cores[k], {0}, {0});
+        torch::Tensor czy =
+          torch::tensordot(Phiz_b[k], nrmsc * b_cores[k], {0}, {0});
         czy = torch::tensordot(czy, Phiz_b[k + 1], {2}, {0});
         torch::Tensor tmp_z = (czy - czA).reshape({rz[k] * N[k], rz[k + 1]});
 
@@ -417,8 +574,9 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
           // als_residual_rank there, matching how FULL mode's SVD is
           // naturally capped by the same dimensional constraint (no kick2
           // augmentation at k == d-1 either).
-          int64_t target_rank =
-            (k < d - 1) ? als_residual_rank : std::min(als_residual_rank, tmp_z.size(1));
+          int64_t target_rank = (k < d - 1)
+                                  ? als_residual_rank
+                                  : std::min(als_residual_rank, tmp_z.size(1));
           tmp3 = fixed_rank_basis(
             tmp_z, target_rank, tsqr_block_size, use_qless_tsqr, options);
         } else {
@@ -426,29 +584,33 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
           int64_t rtmp = std::min<int64_t>(kickrank, Uz.size(1));
           tmp3 = Uz.index({Ellipsis, Slice(0, rtmp)});
           if (k < d - 1) {
-            tmp3 =
-              torch::cat({tmp3, torch::randn({tmp3.size(0), kick2}, options)}, 1);
+            tmp3 = torch::cat(
+              {tmp3, torch::randn({tmp3.size(0), kick2}, options)}, 1);
           }
         }
-        auto [Qz2, Rz2] = orthogonalize_maybe_qless(tmp3, tsqr_block_size, use_qless_tsqr);
+        auto [Qz2, Rz2] =
+          orthogonalize_maybe_qless(tmp3, tsqr_block_size, use_qless_tsqr);
         rz[k + 1] = Qz2.size(1);
         z_cores[k] = Qz2.reshape({rz[k], N[k], rz[k + 1]}).clone();
       }
 
       if (k < d - 1) {
         if (!last && !enrichment_disabled) {
-          torch::Tensor tmp = torch::matmul(u, v.t()).reshape({rx[k], N[k], rx[k + 1]});
+          torch::Tensor tmp =
+            torch::matmul(u, v.t()).reshape({rx[k], N[k], rx[k + 1]});
           torch::Tensor left_res =
             FoldedLocalOperator::build(Phis[k], A_cores[k], Phiz[k + 1])
               .apply(tmp);
-          torch::Tensor left_b = torch::tensordot(Phis_b[k], b_cores[k] * nrmsc, {0}, {0});
+          torch::Tensor left_b =
+            torch::tensordot(Phis_b[k], b_cores[k] * nrmsc, {0}, {0});
           left_b = torch::tensordot(left_b, Phiz_b[k + 1], {2}, {0});
 
           torch::Tensor uk = (left_b - left_res).reshape({u.size(0), -1});
           uk = torch::cat({u, uk}, 1);
           int64_t r_add = left_res.size(2);
 
-          auto [Uk2, Rmat] = orthogonalize_maybe_qless(uk, tsqr_block_size, use_qless_tsqr);
+          auto [Uk2, Rmat] =
+            orthogonalize_maybe_qless(uk, tsqr_block_size, use_qless_tsqr);
           u = Uk2;
 
           torch::Tensor toadd = torch::zeros({rx[k + 1], r_add}, options);
@@ -461,13 +623,12 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
 
         nrmsc = nrmsc * normA[k] * normx[k] / normb[k];
 
-        double norm_now = v.norm().item<double>();
-        if (norm_now > 0) {
-          v = v / norm_now;
-        } else {
-          norm_now = 1.0;
-        }
-        normx[k] = normx[k] * norm_now;
+        // Same batching pattern as the backward half-sweep above: defer
+        // norm_now/normA_k/normb_k's host reads into one round trip.
+        torch::Tensor v_norm_raw = v.norm();
+        torch::Tensor norm_now_t = torch::where(
+          v_norm_raw > 0, v_norm_raw, torch::ones_like(v_norm_raw));
+        v = v / norm_now_t;
 
         x_cores[k] = u.reshape({rx[k], N[k], r}).clone();
         x_cores[k + 1] = v.reshape({r, N[k + 1], rx[k + 2]}).clone();
@@ -477,15 +638,25 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
           compute_phi_fwd_A(Phis[k], x_cores[k], A_cores[k], x_cores[k]);
         Phis_b[k + 1] = compute_phi_fwd_rhs(Phis_b[k], b_cores[k], x_cores[k]);
 
-        double normA_k = Phis[k + 1].norm().item<double>();
-        normA_k = normA_k > 0 ? normA_k : 1.0;
-        normA[k] = normA_k;
-        Phis[k + 1] = Phis[k + 1] / normA_k;
+        torch::Tensor phis_fwd_norm_raw = Phis[k + 1].norm();
+        torch::Tensor normA_k_t = torch::where(phis_fwd_norm_raw > 0,
+          phis_fwd_norm_raw, torch::ones_like(phis_fwd_norm_raw));
+        Phis[k + 1] = Phis[k + 1] / normA_k_t;
 
-        double normb_k = Phis_b[k + 1].norm().item<double>();
-        normb_k = normb_k > 0 ? normb_k : 1.0;
+        torch::Tensor phisb_fwd_norm_raw = Phis_b[k + 1].norm();
+        torch::Tensor normb_k_t = torch::where(phisb_fwd_norm_raw > 0,
+          phisb_fwd_norm_raw, torch::ones_like(phisb_fwd_norm_raw));
+        Phis_b[k + 1] = Phis_b[k + 1] / normb_k_t;
+
+        torch::Tensor norms_cpu =
+          torch::stack({norm_now_t, normA_k_t, normb_k_t}).cpu();
+        const double norm_now = norms_cpu[0].item<double>();
+        const double normA_k = norms_cpu[1].item<double>();
+        const double normb_k = norms_cpu[2].item<double>();
+
+        normx[k] = normx[k] * norm_now;
+        normA[k] = normA_k;
         normb[k] = normb_k;
-        Phis_b[k + 1] = Phis_b[k + 1] / normb_k;
 
         nrmsc = nrmsc * normb[k] / (normA[k] * normx[k]);
 
@@ -505,8 +676,8 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
 
     if (verbose) {
       std::cout << "Sweep " << (swp + 1) << "/" << nswp
-                 << (last ? " (last, polishing)" : "") << ": max_res=" << max_res
-                 << ", ranks=[ ";
+                << (last ? " (last, polishing)" : "") << ": max_res=" << max_res
+                << ", ranks=[ ";
       for (int64_t rr : rx) {
         std::cout << rr << " ";
       }
@@ -534,16 +705,19 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
 }
 
 TTEngine amen_solve_dispatch(const TTEngine& A, const TTEngine& b,
-  std::optional<TTEngine> x0, int nswp, double eps, int max_rank,
-  int max_full, int kickrank, int kick2, int local_iterations, int resets,
-  bool verbose, AMEnPreconditioner preconditioner,
-  const AMEnNativeOptions& native_opts, const char* caller)
+  std::optional<TTEngine> x0, int nswp, double eps, int max_rank, int max_full,
+  int kickrank, int kick2, int local_iterations, int resets, bool verbose,
+  AMEnPreconditioner preconditioner, const AMEnNativeOptions& native_opts,
+  const char* caller)
 {
-  std::vector<torch::Tensor> A_cores(A.get_cores().begin(), A.get_cores().end());
-  std::vector<torch::Tensor> b_cores_4d(b.get_cores().begin(), b.get_cores().end());
+  std::vector<torch::Tensor> A_cores(
+    A.get_cores().begin(), A.get_cores().end());
+  std::vector<torch::Tensor> b_cores_4d(
+    b.get_cores().begin(), b.get_cores().end());
 
   if (A_cores.size() != b_cores_4d.size()) {
-    throw utils::runtime_error(caller, "`A` and `b` must have the same number of cores");
+    throw utils::runtime_error(
+      caller, "`A` and `b` must have the same number of cores");
   }
 
   const int64_t d = static_cast<int64_t>(A_cores.size());
@@ -604,7 +778,7 @@ TTEngine amen_solve_dispatch(const TTEngine& A, const TTEngine& b,
   // LOCAL_R_PREC, so it would reject RANK1 if passed through.
   const AMEnPreconditioner local_preconditioner =
     (preconditioner == AMEnPreconditioner::RANK1) ? AMEnPreconditioner::NONE
-                                                    : preconditioner;
+                                                  : preconditioner;
 
   std::vector<torch::Tensor> x_cores;
   if (x0_cores.has_value()) {
@@ -620,7 +794,8 @@ TTEngine amen_solve_dispatch(const TTEngine& A, const TTEngine& b,
     verbose, local_preconditioner, native_opts.tsqr_block_size,
     native_opts.use_qless_tsqr, native_opts.enrichment_mode,
     native_opts.als_residual_rank, native_opts.use_local_forcing,
-    native_opts.gmres_forcing_ceiling, native_opts.use_gpu_batched_gmres);
+    native_opts.gmres_forcing_ceiling, native_opts.use_gpu_batched_gmres,
+    native_opts.gmres_mixed_precision, native_opts.proximal_regularization);
 
   if (prec.has_value()) {
     result = prec->apply_right(result);

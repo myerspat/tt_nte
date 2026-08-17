@@ -518,9 +518,13 @@ public:
   /// Euclidean axes.
   /// @param bcplanes Which planes are set with the boundary condition.
   /// @param type The boundary condition type.
+  /// @param source Optional incident source, applied to every matched face.
+  /// Only valid when `type == BoundaryType::INCIDENT`.
   /// @param tol The tolerance for geometric comparisons.
   void set_axis_aligned_conditions(const physics::BCPlane& bcplanes,
-    const physics::BoundaryType& type, double tol = 1e-8)
+    const physics::BoundaryType& type,
+    std::optional<physics::FixedSource> source = std::nullopt,
+    double tol = 1e-8)
   {
     // Lock class from multiple threads calling
     std::lock_guard<std::mutex> lock(mesh_mutex);
@@ -528,6 +532,11 @@ public:
     // State checks
     is_connected_or_error("set_axis_aligned_condition");
     is_not_finalized_or_error("set_axis_aligned_condition");
+    if (source.has_value() && type != physics::BoundaryType::INCIDENT) {
+      throw utils::runtime_error(*this,
+        error_context("set_axis_aligned_condition"),
+        "A source was provided but `type` is not BoundaryType::INCIDENT");
+    }
 
     // Global bbox accessor
     auto bbox_acc = bbox_.accessor<double, 2>();
@@ -551,11 +560,19 @@ public:
               if (i < active_planes.size() && active_planes[i] &&
                   std::abs(bbox_center[d].item<double>() - bbox_acc[0][d]) <
                     tol) {
-                bptr->set_boundary_type(dim, is_upper, type);
+                if (source.has_value()) {
+                  bptr->set_boundary_source(dim, is_upper, *source);
+                } else {
+                  bptr->set_boundary_type(dim, is_upper, type);
+                }
               } else if (i + 1 < active_planes.size() && active_planes[i + 1] &&
                          std::abs(bbox_center[d].item<double>() -
                                   bbox_acc[1][d]) < tol) {
-                bptr->set_boundary_type(dim, is_upper, type);
+                if (source.has_value()) {
+                  bptr->set_boundary_source(dim, is_upper, *source);
+                } else {
+                  bptr->set_boundary_type(dim, is_upper, type);
+                }
               }
             }
           }

@@ -72,6 +72,15 @@ struct DGTransportAssemblerConfig : public DGAssemblerConfig {
   /// linear system.
   linalg::MatrixComponent implicit_scatter_component =
     linalg::MatrixComponent::FULL;
+
+  /// Whether to assemble an orthogonal projector onto the low-order angular
+  /// moments (scalar flux + current) and attach it to the resulting
+  /// LinearSystem, for use by LocalSolver/AMEnSolver's moment-preserving
+  /// rounding. Opt-in -- off by default, since most callers don't need it.
+  bool assemble_moment_projector = false;
+  /// Highest angular moment order to preserve. Only `1` (scalar flux +
+  /// current) is currently supported.
+  int64_t moment_order = 1;
 };
 
 } // namespace ttnte::physics

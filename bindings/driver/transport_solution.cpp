@@ -70,6 +70,44 @@ static void register_TransportSolution_impl(
       py::arg("seed_resolution") =
         ttnte::cad::DEFAULT_INVERSE_MAP_SEED_RESOLUTION,
       py::call_guard<py::gil_scoped_release>())
+    .def("compute_patch_balances", &TransportSolution::compute_patch_balances,
+      "Compute every one of this rank's own local patches' own "
+      "particle-balance diagnostics (source/absorption/scatter/leakage per "
+      "group, per face) from this solution's own field. Purely local -- no "
+      "MPI. `assemblers` is GID -> assembler, optional and may be partial or "
+      "omitted entirely -- e.g. TransportDriver.get_assemblers() (requires "
+      "clear_assemblers=False when solving); any local GID missing from it "
+      "gets a fresh assembler built on demand (re-running that patch's "
+      "assemble(), so passing existing assemblers is cheaper when you have "
+      "them). Returns a dict of GID -> PatchBalance.",
+      py::arg("assemblers") =
+        std::unordered_map<int64_t, typename TransportSolution::AssemblerPtr>(),
+      py::arg("eps") = 1e-10,
+      py::arg("max_rank") = std::numeric_limits<int64_t>::max(),
+      py::call_guard<py::gil_scoped_release>())
+    .def("patch_balance_table", &TransportSolution::patch_balance_table,
+      "Every patch's own particle-balance diagnostics, gathered across "
+      "every rank and sorted by GID. Always collective -- every rank must "
+      "call this; the result is identical on every rank. `assemblers` is "
+      "GID -> assembler, optional (see compute_patch_balances()). Returns a "
+      "PatchBalanceTable.",
+      py::arg("assemblers") =
+        std::unordered_map<int64_t, typename TransportSolution::AssemblerPtr>(),
+      py::arg("eps") = 1e-10,
+      py::arg("max_rank") = std::numeric_limits<int64_t>::max(),
+      py::call_guard<py::gil_scoped_release>())
+    .def("global_balance", &TransportSolution::global_balance,
+      "Particle-balance diagnostics summed over the whole problem. Always "
+      "collective -- every rank must call this; the result is identical on "
+      "every rank. `dd_residual` is the direct 'is the distributed method "
+      "losing particles' diagnostic (~0 for a lossless, fully converged "
+      "distributed solve). `assemblers` is GID -> assembler, optional (see "
+      "compute_patch_balances()). Returns a GlobalBalance.",
+      py::arg("assemblers") =
+        std::unordered_map<int64_t, typename TransportSolution::AssemblerPtr>(),
+      py::arg("eps") = 1e-10,
+      py::arg("max_rank") = std::numeric_limits<int64_t>::max(),
+      py::call_guard<py::gil_scoped_release>())
 
     // =================================================================
     // Public getters / setters

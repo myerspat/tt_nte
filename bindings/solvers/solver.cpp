@@ -18,9 +18,10 @@ public:
   }
   void step() override { PYBIND11_OVERRIDE_PURE(void, Solver, step); }
   void finalize() override { PYBIND11_OVERRIDE(void, Solver, finalize); }
-  void update_convergence_criteria(double error) override
+  void update_convergence_criteria(double error, double rank_metric) override
   {
-    PYBIND11_OVERRIDE(void, Solver, update_convergence_criteria, error);
+    PYBIND11_OVERRIDE(
+      void, Solver, update_convergence_criteria, error, rank_metric);
   }
   const Systems& get_local_systems() const override
   {
@@ -59,7 +60,7 @@ void register_Solver(py::module_& m)
     .def(
       "finalize", &Solver::finalize, py::call_guard<py::gil_scoped_release>())
     .def("update_convergence_criteria", &Solver::update_convergence_criteria,
-      py::arg("error"))
+      py::arg("error"), py::arg("rank_metric") = 0.0)
 
     // =================================================================
     // Public getters / setters

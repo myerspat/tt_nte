@@ -72,6 +72,8 @@ void register_DGFirstOrderTransportBackend(
       py::call_guard<py::gil_scoped_release>())
     .def("assemble_boundary_operators", &Backend::assemble_boundary_operators,
       py::call_guard<py::gil_scoped_release>())
+    .def("assemble_moment_projector", &Backend::assemble_moment_projector,
+      py::arg("order") = 1, py::call_guard<py::gil_scoped_release>())
     .def(
       "apply_angular_weights",
       [](const Backend& self, const ttnte::linalg::TTEngine& op,

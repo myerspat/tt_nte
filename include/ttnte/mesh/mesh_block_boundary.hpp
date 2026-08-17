@@ -1,9 +1,11 @@
 #pragma once
 
 #include "ttnte/physics/boundary_types.hpp"
+#include "ttnte/physics/fixed_source.hpp"
 #include "ttnte/utils/io_formatting.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -110,6 +112,10 @@ private:
   /// mesh block boundary
   c10::SmallVector<NeighborInfo, 2> connections_;
 
+  /// If type == ttnte::physics::BoundaryType::INCIDENT this is the
+  /// prescribed incident flux specification for this face.
+  std::optional<physics::FixedSource> source_ = std::nullopt;
+
 public:
   // =================================================================
   // Public constructors
@@ -135,8 +141,15 @@ public:
     return connections_;
   }
   c10::SmallVector<NeighborInfo, 2>& get_connections() { return connections_; }
+  /// @return The prescribed incident source for this face, if one was set.
+  const std::optional<physics::FixedSource>& get_source() const noexcept
+  {
+    return source_;
+  }
 
   void set_type(const physics::BoundaryType& type) { type_ = type; }
+  /// @param source The prescribed incident source for this face.
+  void set_source(physics::FixedSource source) { source_ = std::move(source); }
 };
 
 inline std::ostream& operator<<(std::ostream& os, const BoundaryMapping& bm)

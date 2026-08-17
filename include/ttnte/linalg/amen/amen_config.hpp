@@ -119,25 +119,65 @@ struct AMEnNativeOptions {
   /// on your own problems; not yet proven adequate on this project's
   /// regression tests.
   bool use_gpu_batched_gmres = false;
-  /// Once the solver's own adaptively-tightening truncation tolerance
-  /// (`AMEnSolver::get_eps()`) drops to or below this value, permanently
-  /// stop enrichment (`kickrank`/`kick2`/`als_residual_rank` forced to 0 for
-  /// the rest of the solve, regardless of `enrichment_mode`) and continue
-  /// as pure ALS -- same `nswp` budget, same local solves and
-  /// rank-truncation, just no more basis growth. Intended for a
-  /// domain-decomposition run that has already grown the TT rank to a good
-  /// working value over several block-Jacobi iterations and wants to
-  /// converge the residual further (e.g. toward machine precision) without
-  /// paying enrichment cost that isn't buying accuracy anymore. Once frozen,
-  /// a bond's rank can only hold steady or shrink -- it is bounded above by
-  /// whatever rank the warm start (the previous iteration's state) already
-  /// had, regardless of how rich the right-hand side becomes; `max_rank`
-  /// doesn't need retuning for this to hold, though it still bounds the cost
-  /// of the boundary/source-term accumulation feeding the right-hand side
-  /// (see `LocalSolver::presolve`).
+  /// Run the GMRES inner Arnoldi/Gram-Schmidt/Givens build in float32
+  /// instead of the input's own (float64) dtype -- a mixed-precision
+  /// iterative-refinement scheme, not a blanket precision switch: `x`, `b`,
+  /// and the true residual recomputed at the top of every restart (`r = b -
+  /// local_apply(x)`) all stay in float64 throughout, so any float32-
+  /// rounding error introduced by one restart's inner loop is corrected by
+  /// the next restart's full-precision residual recompute rather than
+  /// accumulating. Follows the pattern in Haque, Shontz & Tu, "GPU-
+  /// Accelerated Mixed Precision GMRES(m) with Varied Restarts" (HPEC 2025),
+  /// Algorithm 6/7.
   ///
-  /// Disabled (0.0) by default -- freezing never triggers.
-  double rank_freeze_eps = 0.0;
+  /// Targets the confirmed dominant real-workload cost (dense GEMM/GEMV
+  /// inside the per-core local operator apply, profiled via `torch.profiler`
+  /// CUDA-activity tracing on the C5G7 pincell benchmark) on hardware with a
+  /// large FP64:FP32 throughput gap (e.g. RTX Ada workstation GPUs, ~1/64).
+  /// Applies to both `gmres_solve_cpu` (CPU and CUDA tensors alike) and
+  /// `gmres_solve_gpu` -- i.e. every GMRES strategy this codebase has,
+  /// regardless of device or `use_gpu_batched_gmres`. The FP64:FP32 gap that
+  /// motivates this is far smaller on general-purpose CPUs (~2:1) than on
+  /// RTX Ada GPUs, so the CPU win is expected to be modest -- validate
+  /// before assuming it's worth enabling there.
+  ///
+  /// NOT YET VALIDATED against this project's real regression/benchmark
+  /// accuracy tolerances at the time this option was added -- defaults to
+  /// off. In particular, watch for the incremental Givens-rotation residual
+  /// estimate (`beta[k+1]`, updated each iteration rather than recomputed
+  /// from scratch) drifting from the true residual under reduced precision:
+  /// Jang, Jolivet & Mary, "Mixed Precision Augmented GMRES" (NLAA 2026),
+  /// show a structurally similar cheap-update-derived-from-an-exact-
+  /// arithmetic-identity pattern (GMRES-DR's restart construction) can
+  /// silently stagnate at low accuracy under reduced precision, though their
+  /// specific failure mode (a collinearity property used for augmented-
+  /// subspace restarts) doesn't apply here since this GMRES has no
+  /// augmentation/deflation.
+  bool gmres_mixed_precision = false;
+  /// Proximal regularization weight for the per-core ALS solve: when active,
+  /// each core's local system `B x = rhs` is solved as `(B + w I) x = rhs +
+  /// w x_prev` instead (`w` = this field), damping the step toward the
+  /// previous iterate -- the standard remedy for ALS "swamping" (Tomasi &
+  /// Bro-style regularized ALS). Convergence bookkeeping (`max_res`, the
+  /// rank-truncation floor, the eps-forcing term) is still measured against
+  /// the true, unshifted residual `B x - rhs`; this only changes how the
+  /// step itself is computed, never what counts as converged.
+  ///
+  /// Only takes effect once enrichment is disabled (i.e. pure ALS -- either
+  /// an `AMEnSolver` `EnrichmentPolicy` disabled it, or the caller set zero
+  /// enrichment directly); ignored otherwise. Rationale: while enrichment is
+  /// active,
+  /// rank is still adapting to reach the tightening truncation target, so
+  /// the local solves aren't structurally swamped -- damping them there
+  /// would just slow down otherwise-legitimate large corrections. The
+  /// swamping this targets shows up specifically once a frozen rank is asked
+  /// for a truncation tolerance tighter than it can represent: the per-core
+  /// solve becomes ill-conditioned enough that its residual *increases*
+  /// sweep-to-sweep instead of decreasing (confirmed via a real fixed-source
+  /// regression case).
+  ///
+  /// Disabled (0.0) by default.
+  double proximal_regularization = 0.0;
 };
 
 } // namespace ttnte::linalg

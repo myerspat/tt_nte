@@ -27,10 +27,10 @@ void register_amen_internal(py::module_& m)
   py::class_<Rank1Preconditioner>(m, "Rank1Preconditioner")
     .def_static("build", &Rank1Preconditioner::build, py::arg("A"),
       py::arg("sv_floor_ratio") = 1e-10)
-    .def("apply_left", &Rank1Preconditioner::apply_left,
-      py::arg("vector_cores"))
-    .def("apply_right", &Rank1Preconditioner::apply_right,
-      py::arg("vector_cores"))
+    .def(
+      "apply_left", &Rank1Preconditioner::apply_left, py::arg("vector_cores"))
+    .def(
+      "apply_right", &Rank1Preconditioner::apply_right, py::arg("vector_cores"))
     .def("apply_right_inverse", &Rank1Preconditioner::apply_right_inverse,
       py::arg("vector_cores"))
     .def("sandwich_operator", &Rank1Preconditioner::sandwich_operator,
@@ -38,7 +38,7 @@ void register_amen_internal(py::module_& m)
 
   py::class_<FoldedLocalOperator>(m, "FoldedLocalOperator")
     .def_static("build", &FoldedLocalOperator::build, py::arg("phi_left"),
-      py::arg("a_core"), py::arg("phi_right"))
+      py::arg("a_core"), py::arg("phi_right"), py::arg("regularization") = 0.0)
     .def("apply", &FoldedLocalOperator::apply, py::arg("y"))
     .def("to_dense", &FoldedLocalOperator::to_dense);
 
@@ -52,15 +52,18 @@ void register_amen_internal(py::module_& m)
     py::arg("x0"), py::arg("max_iterations"), py::arg("restarts"),
     py::arg("rel_tol"), py::arg("prefer_incremental") = false,
     py::arg("prec") = static_cast<const LocalPreconditioner*>(nullptr),
+    py::arg("check_interval") = 8, py::arg("gmres_mixed_precision") = false,
     py::call_guard<py::gil_scoped_release>());
   m.def("gmres_solve_cpu", &gmres_solve_cpu, py::arg("op"), py::arg("rhs"),
     py::arg("x0"), py::arg("max_iterations"), py::arg("restarts"),
     py::arg("rel_tol"),
     py::arg("prec") = static_cast<const LocalPreconditioner*>(nullptr),
+    py::arg("gmres_mixed_precision") = false,
     py::call_guard<py::gil_scoped_release>());
   m.def("gmres_solve_gpu", &gmres_solve_gpu, py::arg("op"), py::arg("rhs"),
     py::arg("x0"), py::arg("max_iterations"), py::arg("restarts"),
     py::arg("rel_tol"),
     py::arg("prec") = static_cast<const LocalPreconditioner*>(nullptr),
+    py::arg("check_interval") = 8, py::arg("gmres_mixed_precision") = false,
     py::call_guard<py::gil_scoped_release>());
 }

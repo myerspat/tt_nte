@@ -489,6 +489,7 @@ void register_TTEngine(py::module_& m)
       })
     .def_property_readonly("device", &TTEngine::get_device)
     .def_property_readonly("dtype", &TTEngine::get_dtype)
+    .def_property_readonly("compression", &TTEngine::get_compression)
     .def_property_readonly("numel", &TTEngine::get_numel)
     .def_property_readonly("ranks",
       [](const TTEngine& self) {

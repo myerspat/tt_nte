@@ -3,7 +3,8 @@
 namespace ttnte::linalg::amen {
 
 FoldedLocalOperator FoldedLocalOperator::build(const torch::Tensor& phi_left,
-  const torch::Tensor& a_core, const torch::Tensor& phi_right)
+  const torch::Tensor& a_core, const torch::Tensor& phi_right,
+  double regularization)
 {
   TORCH_CHECK(phi_left.dim() == 3, "phi_left must be 3-D [l, s, r]");
   TORCH_CHECK(a_core.dim() == 4, "a_core must be 4-D [s, m, n, S]");
@@ -19,8 +20,8 @@ FoldedLocalOperator FoldedLocalOperator::build(const torch::Tensor& phi_left,
   op.L_ = phi_right.size(0);
   op.R_ = phi_right.size(2);
 
-  TORCH_CHECK(a_core.size(0) == op.s_,
-    "a_core's left rank must match phi_left's A-rank");
+  TORCH_CHECK(
+    a_core.size(0) == op.s_, "a_core's left rank must match phi_left's A-rank");
   TORCH_CHECK(phi_right.size(1) == op.S_,
     "phi_right's A-rank must match a_core's right rank");
 
@@ -35,9 +36,10 @@ FoldedLocalOperator FoldedLocalOperator::build(const torch::Tensor& phi_left,
                      .contiguous()
                      .reshape({op.s_ * op.n_, op.m_ * op.S_});
   // [L, S, R] -> [R, S, L] -> [R*S, L]
-  op.phi_right_mat_ = op.phi_right_raw_.permute({2, 1, 0})
-                        .contiguous()
-                        .reshape({op.R_ * op.S_, op.L_});
+  op.phi_right_mat_ = op.phi_right_raw_.permute({2, 1, 0}).contiguous().reshape(
+    {op.R_ * op.S_, op.L_});
+
+  op.regularization_ = regularization;
 
   return op;
 }
@@ -47,7 +49,8 @@ torch::Tensor FoldedLocalOperator::apply(const torch::Tensor& y) const
   torch::Tensor y_mat = y.reshape({r_, n_ * R_});
 
   // Step 1: [l*s, r] @ [r, n*R] -> [l*s, n*R] -> [l, s, n, R]
-  torch::Tensor t1 = torch::matmul(phi_left_mat_, y_mat).reshape({l_, s_, n_, R_});
+  torch::Tensor t1 =
+    torch::matmul(phi_left_mat_, y_mat).reshape({l_, s_, n_, R_});
   // -> [l, R, s, n] -> [l*R, s*n]
   t1 = t1.permute({0, 3, 1, 2}).contiguous().reshape({l_ * R_, s_ * n_});
 
@@ -58,6 +61,9 @@ torch::Tensor FoldedLocalOperator::apply(const torch::Tensor& y) const
 
   // Step 3: [l*m, R*S] @ [R*S, L] -> [l*m, L] -> [l, m, L]
   torch::Tensor out = torch::matmul(t2, phi_right_mat_).reshape({l_, m_, L_});
+  if (regularization_ != 0.0) {
+    out = out + regularization_ * y.reshape({l_, m_, L_});
+  }
   return out;
 }
 
@@ -67,8 +73,8 @@ torch::Tensor FoldedLocalOperator::to_dense() const
   torch::Tensor phi_left_lrs =
     phi_left_raw_.permute({0, 2, 1}).contiguous().reshape({l_ * r_, s_});
   torch::Tensor a_core_s_mnS = a_core_raw_.reshape({s_, m_ * n_ * S_});
-  torch::Tensor C = torch::matmul(phi_left_lrs, a_core_s_mnS)
-                       .reshape({l_, r_, m_, n_, S_});
+  torch::Tensor C =
+    torch::matmul(phi_left_lrs, a_core_s_mnS).reshape({l_, r_, m_, n_, S_});
 
   // B[l, r, m, n, L, R] = sum_S C[l, r, m, n, S] * phi_right[L, S, R]
   torch::Tensor C_lrmn_S = C.reshape({l_ * r_ * m_ * n_, S_});
@@ -79,7 +85,18 @@ torch::Tensor FoldedLocalOperator::to_dense() const
 
   // -> [l, m, L, r, n, R] -> [(l*m*L), (r*n*R)]
   B = B.permute({0, 2, 4, 1, 3, 5}).contiguous();
-  return B.reshape({l_ * m_ * L_, r_ * n_ * R_});
+  torch::Tensor dense = B.reshape({l_ * m_ * L_, r_ * n_ * R_});
+  if (regularization_ != 0.0) {
+    dense = dense + regularization_ * torch::eye(l_ * m_ * L_, dense.options());
+  }
+  return dense;
+}
+
+FoldedLocalOperator FoldedLocalOperator::to_float32() const
+{
+  return build(phi_left_raw_.to(torch::kFloat32),
+    a_core_raw_.to(torch::kFloat32), phi_right_raw_.to(torch::kFloat32),
+    regularization_);
 }
 
 } // namespace ttnte::linalg::amen

@@ -57,23 +57,52 @@ namespace ttnte::linalg::amen {
 /// instead of `op.apply(v)`, i.e. solves `(A M^-1) y = rhs`. `nullptr`
 /// (default) means unpreconditioned, byte-identical to the original
 /// behavior.
+/// @param check_interval Forwarded to `gmres_solve_gpu()` -- see there.
+/// Ignored by `gmres_solve_cpu()`, which already checks every iteration.
+/// @param gmres_mixed_precision Forwarded to whichever strategy is
+/// dispatched to -- see `AMEnNativeOptions::gmres_mixed_precision`.
 /// @return The approximate solution, same shape as `rhs` (in preconditioned
 /// space if `prec` was given -- see the `x0` note above).
-torch::Tensor gmres_solve(const FoldedLocalOperator& op, const torch::Tensor& rhs,
-  const torch::Tensor& x0, int max_iterations, int restarts, double rel_tol,
-  bool prefer_incremental = false, const LocalPreconditioner* prec = nullptr);
+torch::Tensor gmres_solve(const FoldedLocalOperator& op,
+  const torch::Tensor& rhs, const torch::Tensor& x0, int max_iterations,
+  int restarts, double rel_tol, bool prefer_incremental = false,
+  const LocalPreconditioner* prec = nullptr, int check_interval = 8,
+  bool gmres_mixed_precision = false);
 
 /// @brief CPU strategy: incremental Givens rotations with a per-iteration
 /// early-stop residual check.
+/// @param gmres_mixed_precision When true, runs the inner Arnoldi/Gram-
+/// Schmidt/Givens build in float32 (on either CPU or CUDA `rhs`) while
+/// keeping `x`/`rhs`/the true per-restart residual in float64 -- see
+/// `AMEnNativeOptions::gmres_mixed_precision`.
 torch::Tensor gmres_solve_cpu(const FoldedLocalOperator& op,
   const torch::Tensor& rhs, const torch::Tensor& x0, int max_iterations,
-  int restarts, double rel_tol, const LocalPreconditioner* prec = nullptr);
+  int restarts, double rel_tol, const LocalPreconditioner* prec = nullptr,
+  bool gmres_mixed_precision = false);
 
 /// @brief GPU strategy: fixed-budget Arnoldi expansion (no incremental
-/// least-squares tracking, no per-iteration host sync), followed by a single
-/// `at::linalg_lstsq` solve of the small Hessenberg system per restart.
+/// least-squares tracking), with a residual check amortized every
+/// `check_interval` iterations instead of every iteration (down from
+/// `gmres_solve_cpu()`'s per-iteration host sync, while still bounding
+/// wasted work -- past convergence -- to at most `check_interval - 1` Krylov
+/// steps instead of always burning the full `max_iterations` budget). Each
+/// check solves the small least-squares problem on the Krylov subspace built
+/// so far (`H[:k+2, :k+1]`, `beta[:k+2]`) and reads back its residual norm --
+/// one host sync per check, not per iteration. On break (early or at the
+/// budget), the solution uses the last solved `y`/subspace, so no final
+/// re-solve is needed.
+/// @param check_interval Check convergence (and update `x` if it holds)
+/// every this many Krylov iterations, plus always on the final iteration of
+/// a restart. Smaller values check more often (more syncs, less wasted
+/// work); larger values check less often (fewer syncs, more wasted work
+/// past convergence). Must be >= 1.
+/// @param gmres_mixed_precision When true, runs the inner Arnoldi build in
+/// float32 while keeping `x`/`rhs`/the true per-restart residual in
+/// float64 -- see `AMEnNativeOptions::gmres_mixed_precision` and
+/// `gmres_solve_cpu`'s identical parameter.
 torch::Tensor gmres_solve_gpu(const FoldedLocalOperator& op,
   const torch::Tensor& rhs, const torch::Tensor& x0, int max_iterations,
-  int restarts, double rel_tol, const LocalPreconditioner* prec = nullptr);
+  int restarts, double rel_tol, const LocalPreconditioner* prec = nullptr,
+  int check_interval = 8, bool gmres_mixed_precision = false);
 
 } // namespace ttnte::linalg::amen

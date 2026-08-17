@@ -55,6 +55,19 @@ static void register_TransportDriver_impl(
       py::arg("inner_solver"), py::arg("tol") = 1e-8, py::arg("max_iter") = 500,
       py::arg("clear_assemblers") = true, py::arg("verbose") = true,
       py::arg("k_tol") = 1e-5, py::call_guard<py::gil_scoped_release>())
+    .def("solve_fixed_source", &TransportDriver::solve_fixed_source,
+      "Run the fixed-source solver with the given solver (e.g. a DDSolver "
+      "for multi-patch domain decomposition, or a bare LocalSolver such as "
+      "AMEnSolver for a single-patch problem). Unlike solve_eigenvalue(), "
+      "there is no eigenvalue to update each outer iteration -- every "
+      "attached Source is already fixed at assembly time. Returns a "
+      "TransportSolution holding the raw angular flux per local patch "
+      "(k_eff is unset). Convergence requires the scalar-flux-shape "
+      "relative L2 error (tol) between successive outer iterations to fall "
+      "below tol.",
+      py::arg("inner_solver"), py::arg("tol") = 1e-8, py::arg("max_iter") = 500,
+      py::arg("clear_assemblers") = true, py::arg("verbose") = true,
+      py::call_guard<py::gil_scoped_release>())
     .def("distribute", &TransportDriver::distribute,
       "Initial partition using METIS on rank 0 and cull the local mesh.",
       py::arg("load_heuristics") = std::vector<LoadHeuristicPtr> {},
@@ -68,6 +81,12 @@ static void register_TransportDriver_impl(
       py::arg("gid"))
     .def("get_system", &TransportDriver::get_system,
       "Return the linear system for a mesh block GID.", py::arg("gid"))
+    .def("get_assemblers", &TransportDriver::get_assemblers,
+      "Return GID -> this rank's own local patch assembler, for every "
+      "patch whose assembler hasn't been cleared. Pass to "
+      "TransportSolution.compute_patch_balances()/patch_balance_table()/"
+      "global_balance() (requires clear_assemblers=False when solving).",
+      py::call_guard<py::gil_scoped_release>())
 
     // =================================================================
     // Public getters / setters

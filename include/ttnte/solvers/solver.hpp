@@ -34,7 +34,16 @@ public:
   /// default -- solvers with their own internal convergence signal (e.g.
   /// DDSolver) should leave this unoverridden; solvers without one (e.g.
   /// LocalSolver) use it to drive their own forcing.
-  virtual void update_convergence_criteria(double error) {}
+  /// @param error The latest global convergence error (solver-specific
+  /// meaning, e.g. the DD Schwarz current-weighted L2 error).
+  /// @param rank_metric An aggregate measure of solution size (e.g. total TT
+  /// state element count, summed across every local patch and MPI-reduced),
+  /// as of the solve that produced `error`. Defaulted to 0.0 for callers that
+  /// don't have or need one; solvers without a rank-aware EnrichmentPolicy
+  /// ignore it.
+  virtual void update_convergence_criteria(
+    double error, double rank_metric = 0.0)
+  {}
 
   // =================================================================
   // Public getters / setters

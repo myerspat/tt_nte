@@ -14,6 +14,7 @@ enum class BoundaryType : uint8_t {
   REFLECTIVE,
   PERIODIC,
   DEGENERATE,
+  INCIDENT,
 };
 
 /// @brief Convert the BoundaryType to a string name.
@@ -32,6 +33,8 @@ enum class BoundaryType : uint8_t {
     return "PERIODIC";
   case BoundaryType::DEGENERATE:
     return "DEGENERATE";
+  case BoundaryType::INCIDENT:
+    return "INCIDENT";
   default:
     return "UNKNOWN";
   }

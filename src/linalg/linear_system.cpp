@@ -9,10 +9,12 @@ namespace ttnte::linalg {
 // Protected constructors
 LinearSystem::LinearSystem(Operator interior_op,
   c10::SmallVector<NeighborCoupling, 6> couplings, State state,
-  Source::Ptr source, std::optional<std::string> label)
-  : interior_op_(std::move(interior_op)), couplings_(std::move(couplings)),
-    state_(std::move(state)), source_(std::move(source)),
-    device_(interior_op_.get_device()),
+  Source::Ptr source, std::optional<std::string> label,
+  Operator moment_projector)
+  : interior_op_(std::move(interior_op)),
+    moment_projector_(std::move(moment_projector)),
+    couplings_(std::move(couplings)), state_(std::move(state)),
+    source_(std::move(source)), device_(interior_op_.get_device()),
     label_(label.has_value() ? Label::from_string(label.value())
                              : Label::create_internal())
 {
@@ -24,10 +26,17 @@ LinearSystem::LinearSystem(Operator interior_op,
     options = options.pinned_memory(true);
   }
 
-  // Compute flat buffer size: interior_op + boundary_ops + [state] + [source]
+  // Compute flat buffer size: interior_op + [moment_projector] +
+  // boundary_ops + current_ops + [state] + [source]
   int64_t total = interior_op_.get_numel();
+  if (moment_projector_.defined()) {
+    total += moment_projector_.get_numel();
+  }
   for (const auto& c : couplings_) {
     total += c.boundary_op.get_numel();
+    if (c.current_op.defined()) {
+      total += c.current_op.get_numel();
+    }
   }
   if (state_.defined()) {
     state_is_static_ = true;
@@ -57,8 +66,15 @@ LinearSystem::LinearSystem(Operator interior_op,
   };
 
   pack(interior_op_);
-  for (auto& c : couplings_)
+  if (moment_projector_.defined()) {
+    pack(moment_projector_);
+  }
+  for (auto& c : couplings_) {
     pack(c.boundary_op);
+    if (c.current_op.defined()) {
+      pack(c.current_op);
+    }
+  }
   if (state_.defined())
     pack(state_);
   if (source_ && source_->buffer_size() > 0) {
@@ -133,8 +149,14 @@ void LinearSystem::transfer_buffer(
   };
 
   unpack(interior_op_);
+  if (moment_projector_.defined()) {
+    unpack(moment_projector_);
+  }
   for (auto& c : couplings_) {
     unpack(c.boundary_op);
+    if (c.current_op.defined()) {
+      unpack(c.current_op);
+    }
   }
   if (state_is_static_)
     unpack(state_);

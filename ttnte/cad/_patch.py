@@ -6,11 +6,11 @@ import torch
 import numpy as np
 import pyvista as pv
 from igakit.cad import NURBS
-from matplotlib.collections import PolyCollection, QuadMesh
+from matplotlib.collections import LineCollection, PolyCollection, QuadMesh
+from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch as MplPatch
 import matplotlib.pyplot as plt
 
-from ttnte import mpi_context
 from ttnte.cpp.ttnte_python.xs import MaterialLabel
 from ttnte.cpp.ttnte_python.cad import BSplineBasis, Patch
 from ttnte.visualization.style import MplPatchStyle, PvPatchStyle
@@ -51,6 +51,7 @@ def patch_slice(
     resolution: int,
     normal: Optional[Union[List[float], Tuple[float]]],
     origin: Optional[Union[List[float], Tuple[float]]],
+    field: Optional[torch.Tensor] = None,
 ) -> Union[pv.PolyData, pv.StructuredGrid]:
     """Slice a patch based on the plane defined by a normal vector and a point on the
     plane. If `normal` and `origin` are `None` then the evaluated patch data is returned
@@ -65,11 +66,28 @@ def patch_slice(
         The normal vector of the plane.
     origin: list of float or tuple of float or None
         The point that lives on the plane.
+    field: torch.Tensor, optional
+        A dense DOF-coefficient field defined on this patch's own basis (e.g.
+        a solved scalar-flux field's dense array), shaped so that its leading
+        dimensions match this patch's control-point grid
+        (``get_ctrlpts_size(dim)`` per dimension) and any trailing dimensions
+        collapse to a single channel (e.g. the trailing size-1 axes
+        ``State.to_dense()`` carries). Must resolve to exactly one channel --
+        a multigroup field must first be narrowed to one energy group (e.g.
+        via ``TransportSolution.select_group()``). If given, the field is
+        evaluated at the same parametric grid as the geometry and stored as
+        ``grid.point_data["field"]``.
 
     Returns
     -------
     grid: pyvista.PolyData or pyvista.StructuredGrid
         The evaluated points of the patch.
+
+    Raises
+    ------
+    ValueError
+        If `field` has more than one trailing channel (e.g. an
+        un-narrowed multigroup field).
     """
     # Create parametric grid
     tensor_product_pts = self.ndim * [
@@ -77,12 +95,41 @@ def patch_slice(
     ]
     pts = self(tensor_product_pts)
     pts = [pts[..., i].cpu().numpy() for i in range(pts.shape[-1])]
-    pts += ((3 - self.ndim) * [np.zeros_like(pts[0])]) if self.ndim <= 2 else []
+    # Pad up to 3 arrays (x, y, z) for pv.StructuredGrid -- based on how many
+    # PHYSICAL coordinate channels this patch actually has (which can differ
+    # from its parametric ndim, e.g. a non-degenerate 1-D curve embedded in
+    # 2-D physical space), not on ndim itself.
+    if len(pts) < 3:
+        pts += (3 - len(pts)) * [np.zeros_like(pts[0])]
     grid = pv.StructuredGrid(*pts)
 
     # Add scalar attributes
     grid.cell_data["Material ID"] = np.full(grid.n_cells, self.fill.to_int())
     grid.cell_data["Patch ID"] = np.full(grid.n_cells, self.label.to_int())
+
+    if field is not None:
+        # Evaluate the field at the same tensor-product parametric grid used
+        # for geometry above -- stored as point_data (not cell_data) so that
+        # PyVista's slice() below interpolates it correctly onto the cutting
+        # plane for 3-D patches.
+        ctrlpts_shape = [self.get_ctrlpts_size(d) for d in range(self.ndim)]
+        field = field.reshape(*ctrlpts_shape, -1)
+        if field.shape[-1] != 1:
+            raise ValueError(
+                f"`field` has {field.shape[-1]} channels after collapsing its "
+                "trailing dimensions -- plotting needs exactly one (e.g. a "
+                "single energy group). Narrow it first, e.g. via "
+                "TransportSolution.select_group()."
+            )
+        mesh_coords = torch.meshgrid(*tensor_product_pts, indexing="ij")
+        flat_points = torch.stack([c.flatten() for c in mesh_coords], dim=-1)
+        field_values = self.evaluate_field(field, flat_points)[..., 0]
+        field_values = field_values.reshape(self.ndim * [resolution])
+        # Match the flatten order pv.StructuredGrid uses internally for the
+        # geometry arrays above (verified empirically: grid.points recovers
+        # its constructor's input arrays via an 'F'-order flatten), so
+        # `grid.point_data["field"]` lines up per-point with `grid.points`.
+        grid.point_data["field"] = field_values.cpu().numpy().flatten(order="F")
 
     # Only slice if we have a 3-D patch
     if self.ndim == 3 and normal is not None and origin is not None:
@@ -117,6 +164,7 @@ def _plot_matplotlib(
     filename: Optional[str],
     label: str,
     style: MplPatchStyle,
+    field: Optional[torch.Tensor] = None,
 ) -> plt.Axes | None:
     """Plot a patch using matplotlib.
 
@@ -138,6 +186,10 @@ def _plot_matplotlib(
         The fill label of the patch.
     style: ttnte.visualization.style.MplPatchStyle
         The settings for plotting.
+    field: torch.Tensor, optional
+        A dense DOF-coefficient field to color the patch by -- see
+        `patch_slice()` for the expected shape. If given, it is always used
+        for coloring, regardless of `style.colorby`.
 
     Returns
     -------
@@ -147,15 +199,29 @@ def _plot_matplotlib(
         `None` is returned.
     """
     # Run slice algorithm
+    # A given `field` always wins, coloring by it regardless of
+    # `style.colorby` -- see plot()'s effective_colorby comment.
+    use_field = field is not None
     grid = patch_slice(
-        self, resolution=resolution, normal=style.normal, origin=style.origin
+        self,
+        resolution=resolution,
+        normal=style.normal,
+        origin=style.origin,
+        field=field if use_field else None,
     )
     is_3d = self.ndim == 3 and style.normal is None
     points = grid.points
+    field_grid = grid.point_data["field"] if use_field else None
     if style.normal is None or self.ndim <= 2:
         points = points.reshape(self.ndim * [resolution] + [3])
+        if field_grid is not None:
+            field_grid = field_grid.reshape(self.ndim * [resolution])
     handles = []
     labels = []
+    # Set below, per-branch, to whatever mappable (LineCollection/QuadMesh/
+    # PolyCollection/manual ScalarMappable) carries this plot's cmap+norm --
+    # used to add a colorbar once field coloring is actually drawn.
+    field_mappable = None
 
     # Create axes if not given
     standalone = ax is None
@@ -169,19 +235,62 @@ def _plot_matplotlib(
     if self.ndim == 1:
         # Plot 1-D geometry
         X, Y = points[..., 0], points[..., 1]
-        handles.append(ax.plot(X, Y, **style.mesh.to_plot()))
+        if use_field:
+            # Color the line continuously by field value -- one segment per
+            # pair of adjacent points, colored by their average.
+            pts_2d = np.stack([X, Y], axis=-1)
+            segments = np.stack([pts_2d[:-1], pts_2d[1:]], axis=1)
+            lc = LineCollection(
+                segments,
+                cmap=style.mesh.cmap,
+                norm=style.mesh.norm,
+                linewidths=style.mesh.linewidth,
+                alpha=style.mesh.alpha,
+                zorder=style.mesh.zorder,
+            )
+            lc.set_array((field_grid[:-1] + field_grid[1:]) / 2)
+            handles.append(ax.add_collection(lc))
+            ax.autoscale(tight=True)
+            field_mappable = lc
+        else:
+            handles.append(ax.plot(X, Y, **style.mesh.to_plot()))
         labels.append(label)
 
     elif self.ndim == 2:
         # Plot 2-D surface
-        X, Y, Z = points[..., 0], points[..., 1], points[:-1, :-1, 2]
-        style.mesh.shading = "flat"
-        handles.append(ax.pcolormesh(X, Y, Z, **style.mesh.to_pcolormesh()))
+        if use_field:
+            # Node-centered field values, one per evaluated grid point --
+            # "gouraud" shading interpolates between them (vs. "flat", which
+            # expects one cell-centered value per cell).
+            X, Y, Z = points[..., 0], points[..., 1], field_grid
+            style.mesh.shading = "gouraud"
+        else:
+            X, Y, Z = points[..., 0], points[..., 1], points[:-1, :-1, 2]
+            style.mesh.shading = "flat"
+        mesh_handle = ax.pcolormesh(X, Y, Z, **style.mesh.to_pcolormesh())
+        handles.append(mesh_handle)
         labels.append(label)
+        if use_field:
+            field_mappable = mesh_handle
 
     elif is_3d:
         # Plot 3-D geometry
         settings = style.mesh.to_plot_surface()
+        cmap = norm = None
+        if use_field:
+            # facecolors overrides plot_surface's own Z-based coloring, so
+            # the surface SHAPE stays the true geometry while its COLOR
+            # reflects the field -- compute the colormap/norm once, drop the
+            # kwargs plot_surface would otherwise use to auto-color by Z.
+            cmap = plt.get_cmap(style.mesh.cmap or "viridis")
+            vmin = style.mesh.vmin if style.mesh.vmin is not None else field_grid.min()
+            vmax = style.mesh.vmax if style.mesh.vmax is not None else field_grid.max()
+            norm = plt.Normalize(vmin=vmin, vmax=vmax)
+            # `color`, if present, takes priority over `facecolors` in
+            # matplotlib's plot_surface -- drop it (and the Z-based-coloring
+            # kwargs) so the per-face field colors actually show.
+            for key in ("color", "cmap", "vmin", "vmax", "norm"):
+                settings.pop(key, None)
         # Iterate over the 3 parametric axes (U, V, W) and the 2 boundaries (start, end)
         handle = None
         for axis in (0, 1, 2):
@@ -189,9 +298,27 @@ def _plot_matplotlib(
                 face_x = np.take(points[..., 0], idx, axis=axis)
                 face_y = np.take(points[..., 1], idx, axis=axis)
                 face_z = np.take(points[..., 2], idx, axis=axis)
-                handle = ax.plot_surface(face_x, face_y, face_z, **settings)
+                face_settings = dict(settings)
+                if use_field:
+                    face_field = np.take(field_grid, idx, axis=axis)
+                    # Average adjacent nodes into cell-centered values --
+                    # facecolors needs one entry per cell (one fewer per
+                    # axis than the node count).
+                    cell_field = (
+                        face_field[:-1, :-1]
+                        + face_field[1:, :-1]
+                        + face_field[:-1, 1:]
+                        + face_field[1:, 1:]
+                    ) / 4
+                    face_settings["facecolors"] = cmap(norm(cell_field))
+                handle = ax.plot_surface(face_x, face_y, face_z, **face_settings)
         handles.append(handle)
         labels.append(label)
+        if use_field:
+            # plot_surface's own handle isn't cmap-aware here (facecolors
+            # was set manually above), so build a standalone ScalarMappable
+            # carrying the same cmap+norm for the colorbar.
+            field_mappable = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
 
     else:
         n = np.array(style.normal, dtype=float)
@@ -226,10 +353,24 @@ def _plot_matplotlib(
             points_2d = np.stack([u_coords, v_coords], axis=-1)
 
             poly = PolyCollection(points_2d[faces], **style.mesh.to_poly())
+            if use_field and "field" in surf.point_data:
+                # Per-triangle color = average of its 3 vertices' field
+                # values (point_data survives extract_surface()/triangulate()
+                # via standard VTK interpolation).
+                poly.set_array(surf.point_data["field"][faces].mean(axis=1))
+                field_mappable = poly
             ax.add_collection(poly)
             ax.autoscale(tight=True)
             handles.append(poly)
             labels.append(label)
+
+    # Add a colorbar once, keyed off the axes itself so a multi-patch
+    # composited plot (IGAMesh.plot() calling this once per patch against
+    # the SAME shared ax) doesn't end up with one colorbar per patch.
+    if field_mappable is not None and not getattr(ax, "_ttnte_has_colorbar", False):
+        cbar = ax.figure.colorbar(field_mappable, ax=ax)
+        cbar.set_label(label)
+        ax._ttnte_has_colorbar = True
 
     # Plot control points
     if show_ctrlpts:
@@ -338,11 +479,12 @@ def _plot_matplotlib(
             else:
                 clean_handles.append(h_obj)
 
-        ax.legend(
-            handles=clean_handles,
-            labels=labels,
-            **style.legend.to_dict(),
-        )
+        if clean_handles:
+            ax.legend(
+                handles=clean_handles,
+                labels=labels,
+                **style.legend.to_dict(),
+            )
         ax.set_aspect(style.aspect)
 
         # Adjust window to not cut the control points
@@ -368,6 +510,7 @@ def _plot_pyvista(
     filename: Optional[str],
     label: str,
     style: PvPatchStyle,
+    field: Optional[torch.Tensor] = None,
 ) -> Tuple[pv.Plotter, PatchActors] | None:
     """Plot a patch with PyVista.
 
@@ -389,6 +532,10 @@ def _plot_pyvista(
         The fill label of the patch.
     style: ttnte.visualization.style.PvPatchStyle
         The settings for plotting.
+    field: torch.Tensor, optional
+        A dense DOF-coefficient field to color the patch by -- see
+        `patch_slice()` for the expected shape. If given, it is always used
+        for coloring, regardless of `style.colorby`.
 
     Returns
     -------
@@ -407,16 +554,31 @@ def _plot_pyvista(
         )
     assert isinstance(plotter, pv.Plotter)
 
+    # A given `field` always wins, coloring by it regardless of
+    # `style.colorby` -- see plot()'s effective_colorby comment.
+    use_field = field is not None
+
     # Create physical space grid
     grid = patch_slice(
-        self, resolution=resolution, normal=style.normal, origin=style.origin
+        self,
+        resolution=resolution,
+        normal=style.normal,
+        origin=style.origin,
+        field=field if use_field else None,
     )
 
     # Create labels list
     labels = [[label, style.mesh.color, "r"]]
 
+    # Color by the evaluated field (point_data["field"], set above by
+    # patch_slice()) rather than a flat per-patch color, defaulting
+    # style.mesh.scalars to "field" if the caller hasn't set it explicitly.
+    mesh_kwargs = style.mesh.to_dict()
+    if use_field and mesh_kwargs.get("scalars") is None:
+        mesh_kwargs["scalars"] = "field"
+
     # Add to plotter
-    patch_actor = plotter.add_mesh(grid, **style.mesh.to_dict())
+    patch_actor = plotter.add_mesh(grid, **mesh_kwargs)
 
     ctrlpts_actor = None
     ctrlnet_actor = None
@@ -574,6 +736,8 @@ def plot(
     filename: Optional[str] = None,
     style: Optional[Union[MplPatchStyle, PvPatchStyle]] = None,
     backend: Literal["matplotlib", "pyvista", "auto"] = "auto",
+    field: Optional[torch.Tensor] = None,
+    field_label: Optional[str] = None,
     **kwargs,
 ) -> Tuple[pv.Plotter, PatchActors] | plt.Axes | None:
     """Plot this patch using matplotlib or PyVista. If `style.normal != None and
@@ -595,13 +759,26 @@ def plot(
         The name of the file to save to.
     style: ttnte.visualization.style.PvPatchStyle, ttnte.visualization.style.MplPatchStyle, or None, default=None
         The settings for plotting. If this is `None` then the default visualization settings are
-        used for the chosen backend.
+        used for the chosen backend. When coloring by field and `style.mesh.cmap` is still at its
+        material/patch-mode default (a flat single color, or PyVista's unset `None`), it's
+        overridden to `"plasma"` for this call (restored afterward) -- pass your own
+        `style.mesh.cmap` (any matplotlib/PyVista colormap name) to use something else.
     backend: "matplotlib", "pyvista", or "auto"
         The plotting backend to use. Note that the backend must match the `style` passed. If
         `backend == "matplotlib"` then `isinstance(style, ttnte.visualization.style.MplPatchStyle)`
         must be `True` and the opposite is true for `backend == "pyvista"`. If `backend == "auto"`
         then PyVista is used for non-sliced 3-D plotting while matplotlib is used for the
         rest.
+    field: torch.Tensor, optional
+        A dense DOF-coefficient field defined on this patch's own basis (e.g.
+        `some_transport_solution.get_local_field(gid).to_dense()`). If
+        given, it is always used for coloring, regardless of
+        `style.colorby` (there's no reason to pass a field and not want it
+        shown). See `patch_slice()` for the expected shape.
+    field_label: str, optional
+        Legend/colorbar label to use when coloring by `field` (e.g.
+        `"Scalar Flux"`). Defaults to `"Field"` if not given. Ignored if
+        `field` is not given.
     **kwargs: dict of any
         This includes the `plotter` for `backend == "pyvista"` and the `ax` for
         `backend == "matplotlib"`.
@@ -611,12 +788,8 @@ def plot(
     result: tuple of pyvista.Plotter and ttnte._patch.PatchActors, matplotlib.pyplot.Axes, or None
         If `backend == "matplotlib" and filename == None` then the matplotlib axes is
         returned. If `backend == "pyvista" and filename  == None` then the PyVista plotter
-        and patch actors are returned. Otherwise `None` is returned or when `ttnte.mpi_context.rank != 0`.
+        and patch actors are returned. Otherwise `None` is returned.
     """
-    # Return early for other MPI ranks
-    if mpi_context.rank != 0:
-        return None
-
     # Figure out auto backend and turn off control point/net
     # plotting if we're slicing a 3-D object
     if backend == "auto":
@@ -631,10 +804,17 @@ def plot(
         else (MplPatchStyle() if backend == "matplotlib" else PvPatchStyle())
     )
 
-    # Get the label for this patch
-    label = (
-        self.fill.to_string() if style.colorby == "material" else self.label.to_string()
-    )
+    # Get the label for this patch. A given `field` always wins, coloring by
+    # it regardless of `style.colorby` -- there's no reason to pass `field`
+    # and not want it used, so requiring `colorby="field"` in lockstep would
+    # just be a footgun (pass field, forget colorby, get silently ignored).
+    effective_colorby = "field" if field is not None else style.colorby
+    if effective_colorby == "material":
+        label = self.fill.to_string()
+    elif effective_colorby == "patch":
+        label = self.label.to_string()
+    else:
+        label = field_label if field_label is not None else "Field"
 
     # Check if we are plotting a 3-D slice and disable control points and control net
     if style.normal is not None:
@@ -642,6 +822,22 @@ def plot(
         show_ctrlnet = False
     elif self.ndim == 3:
         show_boundary = False
+
+    # When coloring by field, default cmap to "plasma" if style.mesh.cmap is
+    # still at its material/patch-mode default -- a single flat color
+    # (MplPatchStyle's ListedColormap) or PyVista's unset None -- neither of
+    # which can render a continuous field. Pass your own style.mesh.cmap
+    # (any colormap name) to use something else instead. Restored afterward
+    # so the caller's own style object isn't left mutated for any later,
+    # unrelated call.
+    original_cmap = style.mesh.cmap
+    if effective_colorby == "field":
+        cmap_is_flat_default = (
+            isinstance(style.mesh.cmap, ListedColormap)
+            and len(style.mesh.cmap.colors) <= 1
+        ) or style.mesh.cmap is None
+        if cmap_is_flat_default:
+            style.mesh.cmap = "plasma"
 
     if backend == "matplotlib":
         if isinstance(style, PvPatchStyle):
@@ -651,7 +847,7 @@ def plot(
             )
 
         ax = kwargs.get("ax", None)
-        return _plot_matplotlib(
+        result = _plot_matplotlib(
             self,
             resolution=resolution,
             show_ctrlpts=show_ctrlpts,
@@ -661,6 +857,7 @@ def plot(
             filename=filename,
             label=label,
             style=style,
+            field=field,
         )
     else:
         if isinstance(style, MplPatchStyle):
@@ -670,7 +867,7 @@ def plot(
             )
 
         plotter = kwargs.get("plotter", None)
-        return _plot_pyvista(
+        result = _plot_pyvista(
             self,
             resolution,
             show_ctrlpts=show_ctrlpts,
@@ -680,7 +877,11 @@ def plot(
             filename=filename,
             label=label,
             style=style,
+            field=field,
         )
+
+    style.mesh.cmap = original_cmap
+    return result
 
 
 # Add methods to the patch class

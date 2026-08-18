@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ttnte/linalg/format_type.hpp"
 #include "ttnte/linalg/linear_system.hpp"
 #include "ttnte/linalg/tt_config.hpp"
 #include "ttnte/mesh/mesh.hpp"
@@ -9,12 +10,16 @@
 #include "ttnte/parallel/request.hpp"
 #include "ttnte/parallel/stream_pool.hpp"
 #include "ttnte/solvers/dd_strategy.hpp"
+#include "ttnte/solvers/solver.hpp"
 #include "ttnte/solvers/solver_configs.hpp"
 #include "ttnte/task/task_graph.hpp"
 #include "ttnte/task/task_scheduler.hpp"
 #include "ttnte/utils/exception.hpp"
 #include "ttnte/utils/label.hpp"
 
+#ifdef USE_CUDA
+#include <c10/cuda/CUDACachingAllocator.h>
+#endif
 #include <memory>
 #include <optional>
 #include <string>
@@ -24,7 +29,7 @@ namespace ttnte::solvers {
 
 /// @brief The domain decomposition solver class.
 template<typename BlockType>
-class DDSolver {
+class DDSolver : public Solver {
 public:
   // =================================================================
   // Public types
@@ -47,8 +52,6 @@ private:
   DDStrategy::Ptr strategy_;
   /// DAG for the solver.
   task::TaskGraph dag_;
-  /// Scheduler for executing the solver DAG.
-  task::TaskScheduler scheduler_;
   /// GPU device.
   const torch::Device device_;
 
@@ -56,30 +59,25 @@ private:
   parallel::Communicator world_comm_;
   /// The boundary communicators.
   parallel::BoundaryCommunicator boundary_comms_;
-  /// The stream pool for GPU streams.
-  parallel::StreamPool::Ptr stream_pool_;
-
-  // Dynamic data during the solve.
-  /// Current tolerance of the system.
-  double tol_ = 1.0;
-  /// The minimum error achieved by this DD solver thus far.
-  double min_error_ = 1.0;
+  /// Scheduler for executing the solver DAG. Owns its own GPU stream pool
+  /// (see TaskScheduler) -- DDSolver has no direct use for the streams
+  /// itself, only for sizing/passing through to the scheduler.
+  task::TaskScheduler scheduler_;
 
   // State variables
   bool is_initialized_ = false;
   bool is_finalized_ = false;
+  bool is_converged_ = false;
 
   // =================================================================
   // Private constructors
   DDSolver(Mesh::Ptr mesh, DDStrategy::Ptr strategy,
     std::optional<std::string> label = std::nullopt)
     : mesh_(std::move(mesh)), strategy_(std::move(strategy)),
+      device_(parallel::ParallelContext::instance().device()),
       world_comm_(parallel::Communicator::world()),
       boundary_comms_(world_comm_, 2 * mesh_->get_ndim()),
       scheduler_(strategy_->get_config().num_threads),
-      stream_pool_(
-        parallel::StreamPool::instance(strategy_->get_config().num_streams)),
-      device_(parallel::ParallelContext::instance().device()),
       label_(label.has_value() ? Label::from_string(label.value())
                                : Label::create_internal())
   {}
@@ -104,7 +102,7 @@ public:
   /// @brief Block until every worker thread has completed its one-time
   /// initialization (e.g. CUDA device setup). Call this before the first
   /// step() to ensure all threads are ready.
-  void wait_for_thread_init() { scheduler_.wait_for_init(); }
+  void wait_for_thread_init() override { scheduler_.wait_for_init(); }
 
   /// @brief Build one iteration of the DAG using the stored strategy.
   /// @param dag The task graph to populate.
@@ -119,7 +117,7 @@ public:
 
     if (strategy_->get_config().use_gpu) {
       strategy_->build_gpu_iteration_dag(
-        dag_, local_systems_, gid_to_local_idx_, boundary_comms_, stream_pool_);
+        dag_, local_systems_, gid_to_local_idx_, boundary_comms_);
     } else {
       strategy_->build_cpu_iteration_dag(
         dag_, local_systems_, gid_to_local_idx_, boundary_comms_);
@@ -129,7 +127,7 @@ public:
   /// @brief Initialize the DD solver. This method will send systems to GPU
   /// depending on the MemoryPolicy.
   /// @param local_systems The vector of systems local to this MPI rank.
-  void init(const std::vector<linalg::LinearSystem::Ptr>& local_systems)
+  void init(const Systems& local_systems) override
   {
     // Get the memory policy
     auto memory_policy = strategy_->get_config().memory_policy;
@@ -153,10 +151,12 @@ public:
 
     is_initialized_ = true;
     is_finalized_ = false;
+    is_converged_ = false;
+    build_iteration_dag();
   }
 
   /// @brief Run the solver.
-  void step()
+  void step() override
   {
     if (!is_initialized_ || is_finalized_) {
       throw utils::runtime_error(*this, error_context("step"),
@@ -164,15 +164,21 @@ public:
         "already been finalized");
     }
 
-    double error;
+    double error = std::numeric_limits<double>::max();
     parallel::Request ereq;
 
     const auto& cfg = strategy_->get_config();
     bool verbose = cfg.verbose && world_comm_.rank() == 0;
 
-    tol_ = std::max(cfg.tol, cfg.inner_forcing * min_error_);
-    strategy_->update_eps(
-      std::max(cfg.rounding.eps, cfg.eps_forcing * min_error_));
+    // Snapshot the Schwarz break tolerance ONCE for this whole step() call,
+    // from min_error_ as it stood at the end of the PREVIOUS step() call
+    // (persists across calls, so this still tightens over repeated outer
+    // iterations). Deliberately NOT recomputed inside the loop below --
+    // doing so would make tol chase the very error it's compared against
+    // (tol == tol_forcing * this iteration's own error), so the loop could
+    // only ever break once tol bottoms out at the hard floor cfg.tol.
+    const double tol =
+      std::max(cfg.tol, cfg.tol_forcing * strategy_->get_min_error());
 
     if (cfg.use_gpu && torch::cuda::is_available()) {
       torch::cuda::synchronize();
@@ -184,20 +190,28 @@ public:
       scheduler_.execute(dag_);
 
       // Compute the total squared L2 norms for the difference between this
-      // iteration and last as well as last iterations boundary solution
-      double local_sums[2] = {0.0, 0.0};
+      // iteration and last as well as last iteration's partial current at
+      // each INTERNAL boundary (NeighborCoupling::sq_diff/sq_prev, computed
+      // in LocalSolver::postsolve() from coupling.current_op), and the total
+      // TT-state element count across every local patch (for an
+      // EnrichmentPolicy's rank-growth backoff, e.g.
+      // solvers::AdaptiveRevalidationPolicy -- summed/reduced here rather
+      // than inside AMEnSolver since that only ever sees one patch at a
+      // time).
+      double local_sums[3] = {0.0, 0.0, 0.0};
       for (const auto& sys : local_systems_) {
         for (const auto& coupling : sys->get_couplings()) {
           local_sums[0] += coupling.sq_diff;
           local_sums[1] += coupling.sq_prev;
         }
+        local_sums[2] += static_cast<double>(sys->get_state().get_numel());
       }
 
       // Sum the local norms with all MPI ranks
-      double global_sums[2] = {local_sums[0], local_sums[1]};
+      double global_sums[3] = {local_sums[0], local_sums[1], local_sums[2]};
       if (world_comm_.size() > 1) {
         ereq = world_comm_.iallreduce(
-          local_sums, global_sums, 2, parallel::MPIOp::SUM);
+          local_sums, global_sums, 3, parallel::MPIOp::SUM);
       }
 
       // Reset the DAG
@@ -206,22 +220,33 @@ public:
       // Wait for MPI communication
       ereq.wait();
 
-      // Compute error for DD iteration
+      // Compute the global error of the DD solver
       error = (global_sums[1] > 0.0)
                 ? std::sqrt(global_sums[0] / global_sums[1])
-                : std::numeric_limits<double>::max();
+                : 0.0;
 
-      // Tighten TT truncation eps and Schwarz inner tol independently
-      if (error < min_error_ && error > 0) {
-        min_error_ = error;
-        strategy_->update_eps(
-          std::max(cfg.rounding.eps, cfg.eps_forcing * min_error_));
+      // Tighten TT truncation eps (this step()'s Schwarz tol is fixed --
+      // see the snapshot above)
+      strategy_->update_convergence_criteria(error, global_sums[2]);
+
+      // Release the CUDA caching allocator's unused cached blocks every
+      // Schwarz iteration. AMEn's per-core local-subproblem sizes vary from
+      // one iteration to the next as TT ranks adapt, which defeats the
+      // caching allocator's block reuse and otherwise lets "reserved" GPU
+      // memory ratchet up far past what's ever simultaneously live (see the
+      // GPU-memory investigation report). Measured cost is within run-to-run
+      // noise (~2% on a short benchmark) -- negligible next to the several
+      // seconds each Schwarz iteration's AMEn local solves take.
+      if (cfg.use_gpu && torch::cuda::is_available()) {
+        torch::cuda::synchronize();
+#ifdef USE_CUDA
+        c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
       }
 
-      // Check if the angular flux converged
+      // Check if the interfaces converged
       if (verbose) {
-        std::cout << "-- (" << j
-                  << "): Interface Flux L2-Error = " << std::fixed
+        std::cout << "-- (" << j << "): Current L2-Error = " << std::fixed
                   << std::setprecision(10) << error
                   << ", Elapsed Time = " << std::fixed << std::setprecision(3)
                   << static_cast<double>(
@@ -231,21 +256,22 @@ public:
                        1e-3
                   << " s" << std::defaultfloat << std::endl;
       }
-      if (error < tol_) {
+      if (error < tol) {
         break;
       }
     }
 
+    is_converged_ = error < tol;
     if (verbose) {
       std::cout << "-- "
-                << ((error < tol_) ? "Converged!" : "Failed to Converge!")
+                << (is_converged_ ? "Converged!" : "Failed to Converge!")
                 << std::endl;
     }
   }
 
   /// @brief Finalize the DD solver and remove any remaining information from
   /// the GPU.
-  void finalize()
+  void finalize() override
   {
     if (!is_initialized_ || is_finalized_) {
       throw utils::runtime_error(*this, error_context("finalize"),
@@ -266,6 +292,10 @@ public:
   /// @return Whether the DD solver has been finalized.
   bool is_finalized() const noexcept { return is_finalized_; }
 
+  /// @return Whether the last step() call's Schwarz loop broke via
+  /// convergence rather than hitting max_iter.
+  bool is_converged() const noexcept { return is_converged_; }
+
   // =================================================================
   // Public getters / setters
   /// @return The label of the DD solver.
@@ -273,11 +303,7 @@ public:
   /// @return Get the pointer to the DD strategy.
   const DDStrategy::Ptr& get_strategy() const noexcept { return strategy_; }
   /// @return A vector of linear systems for each mesh block local to this rank.
-  const std::vector<linalg::LinearSystem::Ptr>& get_local_systems()
-    const noexcept
-  {
-    return local_systems_;
-  }
+  const Systems& get_local_systems() const override { return local_systems_; }
   /// @return GID-to-local-index map for the local systems.
   const std::unordered_map<int64_t, size_t>& get_gid_map() const noexcept
   {
@@ -296,19 +322,32 @@ public:
   /// @return Get the GPU stream pool.
   const parallel::StreamPool::Ptr get_stream_pool() const noexcept
   {
-    return stream_pool_;
+    return scheduler_.get_stream_pool();
   }
   /// @brief Set the local linear systems and rebuild the GID map.
   /// @param local_systems Systems for each mesh block on this MPI rank.
   ///        Each system must have its GID set via LinearSystem::set_gid().
-  void set_local_systems(
-    const std::vector<linalg::LinearSystem::Ptr>& local_systems)
+  void set_local_systems(const Systems& local_systems) override
   {
-    local_systems_ = local_systems;
-    gid_to_local_idx_.clear();
-    for (size_t i = 0; i < local_systems_.size(); ++i) {
-      gid_to_local_idx_[local_systems_[i]->get_gid()] = i;
-    }
+    init(local_systems);
+  }
+
+  /// @return The state format of the strategy's local solver.
+  linalg::FormatType get_state_format() override
+  {
+    return strategy_->get_local_solver()->get_state_format();
+  }
+
+  /// @return The current truncation tolerance of the strategy's local
+  /// solver.
+  double get_eps() const override
+  {
+    return strategy_->get_local_solver()->get_eps();
+  }
+  /// @return The maximum rank of the strategy's local solver.
+  int64_t get_max_rank() const override
+  {
+    return strategy_->get_local_solver()->get_max_rank();
   }
 };
 

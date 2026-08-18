@@ -341,6 +341,14 @@ class SurfaceStyle(SerializableStyle):
     def to_poly(self) -> dict[str, Any]:
         """Translates intent-driven semantic fields directly to Poly3DCollection
         kwargs."""
+        # `clim` wins if explicitly given; otherwise fall back to vmin/vmax so a
+        # shared color scale set there (e.g. IGAMesh.plot()'s global field
+        # normalization) still reaches this collection -- unlike pcolormesh/
+        # plot_surface, PolyCollection has no vmin/vmax kwargs of its own, only
+        # `set_clim()`, so vmin/vmax must be folded into `clim` here.
+        clim = self.clim
+        if clim is None and (self.vmin is not None or self.vmax is not None):
+            clim = (self.vmin, self.vmax)
         kwargs = {
             "facecolors": self.facecolor,
             "alpha": self.alpha,
@@ -349,7 +357,7 @@ class SurfaceStyle(SerializableStyle):
             "linestyles": self.linestyle,
             "cmap": self.cmap,
             "norm": self.norm,
-            "clim": self.clim,
+            "clim": clim,
             "zorder": self.zorder,
             "visible": self.visible,
             "antialiaseds": self.antialiased,
@@ -546,8 +554,6 @@ class AxesStyle(SerializableStyle):
     labels_off: bool = False
 
     # --- Interactive Controls ---
-    box: bool = False
-    box_args: dict | None = None
     viewport: Sequence[float] = (0.0, 0.0, 0.2, 0.2)
 
 
@@ -591,7 +597,7 @@ class PvLegendStyle(SerializableStyle):
 
 @dataclass
 class MplPatchStyle:
-    colorby: Literal["material", "patch"] = "material"
+    colorby: Literal["material", "patch", "field"] = "material"
     crop_padding: int = 10
     normal: Optional[list | tuple] = None
     origin: tuple = (0, 0, 0)
@@ -640,7 +646,7 @@ class MplPatchStyle:
 
 @dataclass
 class PvPatchStyle:
-    colorby: Literal["material", "patch"] = "material"
+    colorby: Literal["material", "patch", "field"] = "material"
     crop_padding: int = 10
     normal: Optional[list | tuple] = None
     origin: tuple = (0, 0, 0)

@@ -18,6 +18,14 @@ void register_ops(py::module_& m)
     py::arg("a"), py::arg("b"), "Compute an exact matrix-vector product.",
     py::call_guard<py::gil_scoped_release>());
 
+  m.def("round_conserved", &round_conserved, py::arg("x"),
+    py::arg("moment_projector"), py::arg("eps"), py::arg("max_rank"),
+    py::arg("moment_eps"), py::arg("moment_max_rank"),
+    "Round a State while exactly preserving its projection onto "
+    "moment_projector (e.g. scalar flux + current); falls back to a plain "
+    "round if moment_projector is undefined.",
+    py::call_guard<py::gil_scoped_release>());
+
   // =================================================================
   // Element-Wise Operations & Fast Approximations
   // =================================================================
@@ -92,13 +100,17 @@ void register_ops(py::module_& m)
 
   m.def("amen_solve",
     py::overload_cast<const Operator&, const State&, std::optional<State>, int,
-      double, int, int, int, int, int, int, bool, int>(&amen_solve),
+      double, int, int, int, int, int, int, bool, AMEnPreconditioner,
+      AMEnBackend, AMEnNativeOptions>(&amen_solve),
     py::arg("A"), py::arg("b"), py::arg("x0") = py::none(),
     py::arg("nswp") = 22, py::arg("eps") = 1e-10,
     py::arg("max_rank") = std::numeric_limits<int>::max(),
     py::arg("max_full") = 500, py::arg("kickrank") = 4, py::arg("kick2") = 0,
     py::arg("local_iterations") = 40, py::arg("resets") = 2,
-    py::arg("verbose") = false, py::arg("preconditioner") = 0,
+    py::arg("verbose") = false,
+    py::arg("preconditioner") = AMEnPreconditioner::NONE,
+    py::arg("backend") = AMEnBackend::NATIVE,
+    py::arg("native_opts") = AMEnNativeOptions {},
     "Solve a linear system A @ x = b using AMEn.",
     py::call_guard<py::gil_scoped_release>());
 

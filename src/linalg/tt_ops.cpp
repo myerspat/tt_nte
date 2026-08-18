@@ -1,4 +1,5 @@
 #include "ttnte/linalg/tt_ops.hpp"
+#include "ttnte/linalg/amen/amen_sweep.hpp"
 #include "ttnte/linalg/matrix_ops.hpp"
 #include "ttnte/python/torchtt.hpp"
 #include "ttnte/utils/exception.hpp"
@@ -118,6 +119,97 @@ TTEngine mm(const TTEngine& a, const TTEngine& b)
   }
 
   return TTEngine(cores, false);
+}
+
+TTEngine direct_sum(const std::vector<TTEngine>& tts)
+{
+  if (tts.empty()) {
+    throw utils::runtime_error("ttnte::linalg::direct_sum", "`tts` is empty");
+  }
+  if (tts.size() == 1) {
+    return tts[0];
+  }
+
+  const auto& first_cores = tts[0].get_cores();
+  const int64_t num_cores = static_cast<int64_t>(first_cores.size());
+  const auto device = tts[0].get_device();
+  const auto dtype = tts[0].get_dtype();
+
+  for (const auto& tt : tts) {
+    if (static_cast<int64_t>(tt.get_cores().size()) != num_cores) {
+      throw utils::runtime_error("ttnte::linalg::direct_sum",
+        "All TTs must have the same number of cores");
+    }
+    if (tt.get_device() != device || tt.get_dtype() != dtype) {
+      throw utils::runtime_error("ttnte::linalg::direct_sum",
+        "All TTs must be on the same device with the same data type");
+    }
+  }
+
+  // A single-core TT has no bond dimensions to embed into -- it's a raw
+  // tensor, so summing means ordinary elementwise addition.
+  if (num_cores == 1) {
+    torch::Tensor acc = tts[0].get_cores()[0].clone();
+    for (size_t t = 1; t < tts.size(); t++) {
+      acc = acc + tts[t].get_cores()[0];
+    }
+    return TTEngine(TTEngine::Tensors {std::move(acc)}, false);
+  }
+
+  TTEngine::Tensors cores;
+  cores.reserve(num_cores);
+
+  for (int64_t i = 0; i < num_cores; i++) {
+    const bool is_first = (i == 0);
+    const bool is_last = (i == num_cores - 1);
+
+    const auto& core0 = first_cores[i];
+    const int64_t n = core0.size(1);
+    const int64_t m = core0.size(2);
+
+    // Boundary ranks stay at 1; internal ranks are the sum across all terms.
+    int64_t r_in = 0;
+    int64_t r_out = 0;
+    for (const auto& tt : tts) {
+      const auto& core = tt.get_cores()[i];
+      if (core.size(1) != n || core.size(2) != m) {
+        throw utils::runtime_error("ttnte::linalg::direct_sum",
+          "Physical dimensions must match at core " + std::to_string(i));
+      }
+      r_in += core.size(0);
+      r_out += core.size(3);
+    }
+    r_in = is_first ? 1 : r_in;
+    r_out = is_last ? 1 : r_out;
+
+    torch::Tensor new_core = torch::zeros({r_in, n, m, r_out}, core0.options());
+
+    // Place each term's core into its block-diagonal slot in one pass:
+    // first core concatenates along the output rank, last core concatenates
+    // along the input rank, and internal cores go fully block-diagonal.
+    int64_t row_offset = 0;
+    int64_t col_offset = 0;
+    for (const auto& tt : tts) {
+      const auto& core = tt.get_cores()[i];
+      const int64_t rl = core.size(0);
+      const int64_t rr = core.size(3);
+
+      const int64_t row_start = is_first ? 0 : row_offset;
+      const int64_t row_len = is_first ? 1 : rl;
+      const int64_t col_start = is_last ? 0 : col_offset;
+      const int64_t col_len = is_last ? 1 : rr;
+
+      new_core.slice(0, row_start, row_start + row_len)
+        .slice(3, col_start, col_start + col_len) = core;
+
+      row_offset += is_first ? 0 : rl;
+      col_offset += is_last ? 0 : rr;
+    }
+
+    cores.push_back(std::move(new_core));
+  }
+
+  return TTEngine(std::move(cores), false);
 }
 
 TTEngine elementwise_divide(const TTEngine& a, const TTEngine& b, int nswp,
@@ -325,11 +417,21 @@ TTEngine amen_mm(const linalg::TTEngine& a, const linalg::TTEngine& b, int nswp,
     a, b, nswp, x0, eps, max_rank, kickrank, kick2, verbose);
 }
 
-TTEngine amen_solve(const linalg::TTEngine& A, const linalg::TTEngine& b,
-  std::optional<linalg::TTEngine> x0, int nswp, double eps, int max_rank,
-  int max_full, int kickrank, int kick2, int local_iterations, int resets,
-  bool verbose, int preconditioner)
+namespace {
+
+TTEngine amen_solve_torchtt(const linalg::TTEngine& A,
+  const linalg::TTEngine& b, std::optional<linalg::TTEngine> x0, int nswp,
+  double eps, int max_rank, int max_full, int kickrank, int kick2,
+  int local_iterations, int resets, bool verbose,
+  AMEnPreconditioner preconditioner)
 {
+  if (preconditioner == AMEnPreconditioner::RANK1) {
+    throw utils::runtime_error("ttnte::linalg::amen_solve",
+      "`AMEnPreconditioner::RANK1` is only supported with "
+      "`AMEnBackend::NATIVE` -- the torchTT backend has no rank-1 "
+      "preconditioner");
+  }
+
   // Get cores for each portion
   std::vector<torch::Tensor> A_cores(
     A.get_cores().begin(), A.get_cores().end());
@@ -403,9 +505,41 @@ TTEngine amen_solve(const linalg::TTEngine& A, const linalg::TTEngine& b,
 
   auto x_cores = torchtt::amen_solve(A_cores, b_cores, x0_cores, N, rA, rb, rx0,
     nswp, eps, max_rank, max_full, kickrank, kick2, local_iterations, resets,
-    verbose, preconditioner);
+    verbose, static_cast<int>(preconditioner));
 
   return TTEngine(TTEngine::Tensors(x_cores.cbegin(), x_cores.cend()), true);
+}
+
+} // namespace
+
+TTEngine amen_solve(const linalg::TTEngine& A, const linalg::TTEngine& b,
+  std::optional<linalg::TTEngine> x0, int nswp, double eps, int max_rank,
+  int max_full, int kickrank, int kick2, int local_iterations, int resets,
+  bool verbose, AMEnPreconditioner preconditioner, AMEnBackend backend,
+  AMEnNativeOptions native_opts)
+{
+  if (backend == AMEnBackend::TORCHTT) {
+    return amen_solve_torchtt(A, b, x0, nswp, eps, max_rank, max_full, kickrank,
+      kick2, local_iterations, resets, verbose, preconditioner);
+  }
+
+  return amen_solve_native(A, b, x0, nswp, eps, max_rank, max_full, kickrank,
+    kick2, local_iterations, resets, verbose, preconditioner, native_opts);
+}
+
+TTEngine amen_solve_native(const linalg::TTEngine& A, const linalg::TTEngine& b,
+  std::optional<linalg::TTEngine> x0, int nswp, double eps, int max_rank,
+  int max_full, int kickrank, int kick2, int local_iterations, int resets,
+  bool verbose, AMEnPreconditioner preconditioner,
+  const AMEnNativeOptions& native_opts)
+{
+  // No device-specific branching needed here: every device-specific tuning
+  // decision already lives one layer down, inside amen_sweep's own
+  // primitives (FoldedLocalOperator, gmres_solve's CPU/GPU strategy split,
+  // qless_orthogonalize) -- see amen_solve_dispatch's doc comment.
+  return amen::amen_solve_dispatch(A, b, x0, nswp, eps, max_rank, max_full,
+    kickrank, kick2, local_iterations, resets, verbose, preconditioner,
+    native_opts, "ttnte::linalg::amen_solve_native");
 }
 
 TTEngine function_interpolate(

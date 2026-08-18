@@ -32,6 +32,27 @@ def test_initialize(device, dtype):
 
 
 @pytest.mark.parametrize("device, dtype", test_params)
+def test_initialize_normalizes_non_zero_start_knotvector(device, dtype):
+    # A knot vector sliced from an interior sub-domain (e.g. igakit's
+    # `NURBS.slice(0, 1/3, 2/3)`, which preserves absolute parameter values
+    # rather than renormalizing) does not start at 0. normalize_knotvector()
+    # must still map it onto [0, 1] -- dividing by the raw last-knot value
+    # instead of the true span width silently mis-scales this case.
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    knotvector = torch.tensor(
+        [1 / 3, 1 / 3, 1 / 3, 0.5, 2 / 3, 2 / 3, 2 / 3], device=device, dtype=dtype
+    )
+    degree = 2
+
+    basis = BSplineBasis(knotvector, degree)
+
+    expected = torch.tensor([0, 0, 0, 0.5, 1, 1, 1], device=device, dtype=dtype)
+    assert torch.allclose(basis.knotvector, expected, atol=1e-6)
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
 def test_find_spans(device, dtype):
     # Skip if GPU is requested but not available
     if device == "cuda" and not torch.cuda.is_available():

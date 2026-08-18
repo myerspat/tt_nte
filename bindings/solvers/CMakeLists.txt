@@ -1,15 +1,17 @@
 # Define the relative filenames
 set(SOLVERS_BINDINGS_REL
     bindings.cpp
+    solver.cpp
     solver_configs.cpp
     dd_strategy.cpp
     memory_policy.cpp
     block_jacobi_strategy.cpp
     dd_solver.cpp
     local_solver.cpp
+    enrichment_policy.cpp
     amen_solver.cpp)
 set(SOLVERS_SRC_REL block_jacobi_strategy.cpp dd_strategy.cpp amen_solver.cpp
-                    local_solver.cpp)
+                    local_solver.cpp enrichment_policy.cpp)
 
 # Define the directory paths (Use local variables here, then push if needed)
 set(SOLVERS_SRC_DIR "${PROJECT_SOURCE_DIR}/src/solvers")

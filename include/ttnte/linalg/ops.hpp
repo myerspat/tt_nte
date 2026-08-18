@@ -62,6 +62,70 @@ inline State mv(const Operator& a, const State& b)
     a.get_variant(), b.get_variant());
 }
 
+/// @brief Compute the direct sum (TT addition) of several states in a single
+/// allocation pass per core, instead of folding them together one at a time
+/// with repeated `operator+=` calls. See `direct_sum(const
+/// std::vector<TTEngine>&)` for why this matters. Unrounded -- callers should
+/// round the result themselves.
+/// @param states The states to sum; each must hold a TTEngine with the same
+/// number of cores, matching modes, and shared device/dtype.
+/// @return The (unrounded) State sum of `states`.
+inline State direct_sum(const std::vector<State>& states)
+{
+  std::vector<TTEngine> engines;
+  engines.reserve(states.size());
+  for (const auto& state : states) {
+    engines.push_back(state.as_tt());
+  }
+
+  return State(direct_sum(engines));
+}
+
+/// @brief Round a State while exactly preserving its projection onto
+/// `moment_projector` (e.g. scalar flux + current): split `x` into
+/// `x_macro = mv(moment_projector, x)` and `x_remainder = x - x_macro`,
+/// round each separately (tightly for `x_macro`, which is structurally
+/// low-rank already; with the caller's own `eps`/`max_rank` for
+/// `x_remainder`, which may be rounded more aggressively than `x` itself
+/// ever could be), then recombine. Falls back to a plain `round_()` if
+/// `moment_projector` is undefined (i.e. moment preservation was never
+/// configured for this state's LinearSystem).
+/// @param x The state to round.
+/// @param moment_projector Orthogonal projector onto the moments to
+/// preserve, or an undefined Operator to disable moment preservation.
+/// @param eps Truncation tolerance for `x_remainder` (or for `x` itself, if
+/// `moment_projector` is undefined).
+/// @param max_rank Maximum rank for `x_remainder` (or for `x`, if
+/// `moment_projector` is undefined).
+/// @param moment_eps Truncation tolerance for `x_macro`.
+/// @param moment_max_rank Maximum rank for `x_macro`.
+/// @return The rounded State.
+inline State round_conserved(State x, const Operator& moment_projector,
+  double eps, int64_t max_rank, double moment_eps, int64_t moment_max_rank)
+{
+  if (!moment_projector.defined()) {
+    x.round_(eps, max_rank);
+    return x;
+  }
+
+  State x_macro = mv(moment_projector, x);
+  x_macro.round_(moment_eps, moment_max_rank);
+
+  State x_remainder = x - x_macro;
+  x_remainder.round_(eps, max_rank);
+
+  // x_macro + x_remainder is a plain TT addition -- its bond rank is the
+  // SUM of the two operands' ranks (block-diagonal concatenation), with no
+  // cross-term compression. Left unrounded, every call inflates rank by
+  // ~rank(x_macro), which then feeds back in as the next iteration's warm
+  // start and ratchets up without bound. Round once more, tightly (moment_
+  // eps, not the loose remainder eps -- rounding the recombined sum at the
+  // aggressive tolerance could eat back into the moment just protected),
+  // at the caller's own max_rank (not moment_max_rank, which would
+  // incorrectly clamp the whole result down to the tiny macro-only cap).
+  return (x_macro + x_remainder).round(moment_eps, max_rank);
+}
+
 /// @brief Perform an element-wise division with two tensor trains using AMEn.
 /// This calls the torchTT implementation `torchtt._division.amen_divide()` in
 /// Python.
@@ -249,16 +313,19 @@ inline State amen_solve(const Operator& A, const State& b,
   std::optional<State> x0 = std::nullopt, int nswp = 22, double eps = 1e-10,
   int max_rank = std::numeric_limits<int>::max(), int max_full = 500,
   int kickrank = 4, int kick2 = 0, int local_iterations = 40, int resets = 2,
-  bool verbose = false, int preconditioner = 0)
+  bool verbose = false,
+  AMEnPreconditioner preconditioner = AMEnPreconditioner::NONE,
+  AMEnBackend backend = AMEnBackend::NATIVE,
+  AMEnNativeOptions native_opts = AMEnNativeOptions {})
 {
   std::optional<TTEngine> x0_engine = std::nullopt;
   if (x0.has_value()) {
     x0_engine = x0->as_tt();
   }
 
-  TTEngine result =
-    amen_solve(A.as_tt(), b.as_tt(), x0_engine, nswp, eps, max_rank, max_full,
-      kickrank, kick2, local_iterations, resets, verbose, preconditioner);
+  TTEngine result = amen_solve(A.as_tt(), b.as_tt(), x0_engine, nswp, eps,
+    max_rank, max_full, kickrank, kick2, local_iterations, resets, verbose,
+    preconditioner, backend, native_opts);
 
   return State(std::move(result));
 }

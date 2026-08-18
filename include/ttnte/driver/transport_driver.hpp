@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ttnte/driver/transport_solution.hpp"
 #include "ttnte/linalg/tt_engine.hpp"
 #include "ttnte/math/quadrature_set.hpp"
 #include "ttnte/mesh/mesh.hpp"
@@ -9,8 +10,7 @@
 #include "ttnte/parallel/parallel_context.hpp"
 #include "ttnte/physics/assembly_configs.hpp"
 #include "ttnte/physics/dg_first_order_transport_assembler.hpp"
-#include "ttnte/solvers/dd_solver.hpp"
-#include "ttnte/solvers/dd_strategy.hpp"
+#include "ttnte/solvers/solver.hpp"
 #include "ttnte/utils/exception.hpp"
 #include "ttnte/utils/label.hpp"
 #include "ttnte/xs/server.hpp"
@@ -37,7 +37,7 @@ public:
   using Label = utils::Label<TransportDriver>;
   using Ptr = std::shared_ptr<TransportDriver>;
   using Assembler = physics::DGFirstOrderTransportAssembler<BlockType, NumDim>;
-  using Solver = solvers::DDSolver<BlockType>;
+  using Solution = TransportSolution<BlockType>;
 
   // Communication and load balancing
   using Communicator = parallel::Communicator;
@@ -68,12 +68,18 @@ private:
   Communicator comm_;
   /// Load balancer for running (Par)METIS
   LoadBalancer load_balancer_;
-
   // Per-patch assembled data (populated by assemble())
   std::unordered_map<int64_t, PatchData> patch_data_;
-
-  // Solver (populated by solve_eigenvalue())
-  Solver::Ptr solver_;
+  /// The angular quadrature set passed to assemble(), retained so it
+  /// survives clear_assemblers (needed by get_solution()'s TransportSolution
+  /// to compute scalar flux after solve_eigenvalue()).
+  math::QuadratureSet::Ptr angular_qset_;
+  /// The assembler config passed to assemble(), retained (like
+  /// angular_qset_) so the TransportSolution this driver produces can build
+  /// fresh assemblers on demand -- e.g. compute_patch_balances()/
+  /// patch_balance_table()/global_balance() when the caller doesn't already
+  /// have one (say, clear_assemblers=true was used).
+  physics::DGTransportAssemblerConfig config_;
 
   // States
   bool is_distributed_ = false;
@@ -116,6 +122,8 @@ public:
     const physics::DGTransportAssemblerConfig& config)
   {
     patch_data_.clear();
+    angular_qset_ = angular_qset;
+    config_ = config;
 
     for (const auto& block : mesh_->get_blocks()) {
       const int64_t gid = block->get_gid();
@@ -128,16 +136,33 @@ public:
     }
   }
 
-  /// @brief Run the eigenvalue solver using the given strategy.
-  /// @param strategy Domain-decomposition strategy that owns the
-  /// DDSolverConfig.
+  /// @brief Run the eigenvalue solver using the given solver.
+  /// @param inner_solver Solver for each outer iteration's inner solve --
+  /// e.g. a DDSolver for multi-patch domain decomposition, or a bare
+  /// LocalSolver (such as AMEnSolver) for a single-patch problem.
   /// @param tol The convergence tolerance on the relative Frobenius (L2) error
-  /// of the angular flux.
+  /// of the scalar flux shape (not normalized -- the natural 1/k
+  /// eigenvalue rescaling is left in place, so this also reflects residual
+  /// k-drift). Necessary but not sufficient on its own: the inner solver's
+  /// forcing (see DDSolver::step()/AMEnSolver's eps forcing) ratchets
+  /// strictly tighter as outer iterations proceed and never loosens, so a
+  /// later outer iteration's inner solve can become accurate enough to make
+  /// this metric read small even while k_global is still visibly drifting --
+  /// see k_tol below.
   /// @param max_iter The maximum number of outer iterations.
+  /// @param clear_assemblers Clear each patch's assembler after building the
+  /// local systems (frees assembled operators no longer needed once the
+  /// LinearSystem buffer is built).
   /// @param verbose Whether to print outer iteration progress.
-  /// @return The resulting eigenvalue of the linear system.
-  double solve_eigenvalue(solvers::DDStrategy::Ptr strategy, double tol = 1e-8,
-    int max_iter = 500, bool verbose = true)
+  /// @param k_tol The convergence tolerance on k_global's own absolute
+  /// iteration-to-iteration change, |k_i - k_{i-1}| (in k-units, so e.g.
+  /// 1e-5 is 1 pcm). Checked independently of (in addition to) `tol`'s
+  /// flux-shape criterion -- both must hold before the outer loop breaks.
+  /// @return A TransportSolution holding the converged k-eigenvalue
+  /// (get_k_eff()) and the raw angular flux per local patch (get_solution()).
+  typename Solution::Ptr solve_eigenvalue(solvers::Solver::Ptr inner_solver,
+    double tol = 1e-8, int max_iter = 500, bool clear_assemblers = true,
+    bool verbose = true, double k_tol = 1e-5)
   {
     if (patch_data_.empty()) {
       throw utils::runtime_error(
@@ -146,34 +171,84 @@ public:
     }
 
     // Initialize the solver
-    double k_global = init_solver(std::move(strategy));
-    assert(solver_->is_initialized() && !solver_->is_finalized());
+    double k_global = init_solver(inner_solver, clear_assemblers);
+    // Previous iteration's k_global, for the independent k-convergence check
+    // below -- seeded from the pre-loop value so the very first outer
+    // iteration's k_error reflects the initial guess's own drift, not a
+    // spurious zero.
+    double k_prev = k_global;
 
     // Ensure all worker threads have set their CUDA device before the first
     // iteration so cuBLAS context initialization does not produce warnings.
-    solver_->wait_for_thread_init();
+    inner_solver->wait_for_thread_init();
 
     parallel::Request ereq;
     parallel::Request kreq;
     const double one = 1.0;
-    const auto& cfg = solver_->get_strategy()->get_config();
-    const auto& local_systems = solver_->get_local_systems();
+    const auto& local_systems = inner_solver->get_local_systems();
     verbose = verbose && comm_.rank() == 0;
 
     double error = std::numeric_limits<double>::max();
-    double min_error = 0.1;
+    double k_error = std::numeric_limits<double>::max();
+    inner_solver->update_convergence_criteria(error);
 
-    // Previous patch solutions for computing errors
+    for (const auto& sys : local_systems) {
+      const auto& x = sys->get_state();
+      std::cout << "GID: " << sys->get_gid()
+                << ", Discretization: " << x.as_tt().get_m_modes() << std::endl;
+    }
+
+    // Temporarily move the angular quadrature set (deliberately often
+    // CPU-resident, since it's tiny) to match the local systems' own
+    // device/dtype for the duration of the solve, since
+    // angular_qset_->integrate() is now called every outer iteration below
+    // for the scalar-flux-shape convergence check -- this avoids
+    // re-transferring the small weight tensors on every single call
+    // (QuadratureSet::integrate()'s own per-call device guard then becomes
+    // a no-op). Restored to its original device/dtype once the solve
+    // completes, even if it throws.
+    const torch::Device original_qset_device = angular_qset_->get_device();
+    const torch::ScalarType original_qset_dtype = angular_qset_->get_dtype();
+    if (!local_systems.empty()) {
+      const auto& op = local_systems[0]->get_interior_op();
+      angular_qset_->to_(op.get_device(), op.get_dtype());
+    }
+    struct QsetRestoreGuard {
+      math::QuadratureSet::Ptr qset;
+      torch::Device device;
+      torch::ScalarType dtype;
+      ~QsetRestoreGuard() { qset->to_(device, dtype); }
+    } qset_restore_guard {
+      angular_qset_, original_qset_device, original_qset_dtype};
+
+    // Previous patch scalar fluxes for computing the outer convergence
+    // error. Reduced via angular_qset_->integrate() rather than diffing the
+    // raw angular flux: converging the full angular flux is a stricter
+    // (and, for a low-rank TT representation, somewhat misaligned)
+    // criterion than what's physically needed -- k-eff, reaction rates, and
+    // everything downstream only ever depend on the scalar flux (0th
+    // angular moment). The eigenvalue typically converges well before the
+    // scalar flux SHAPE does, making shape the binding criterion here.
+    // Deliberately NOT normalized: the natural 1/k rescaling below (
+    // fsrc->set_eigval(1/k_global); fsrc->scale()) is the physically
+    // meaningful power-iteration update, so leaving it in means this metric
+    // reflects BOTH residual k-drift and shape-drift combined -- if k
+    // hasn't settled, dividing by a wrong k still causes systematic
+    // amplitude drift here even once the shape itself is stable.
     std::vector<linalg::State> states(local_systems.size());
+
+    // Initial scalar flux snapshot, before any Schwarz sweep has run. Inside
+    // the loop below, each iteration's post-step() scalar flux is reused
+    // directly as the next iteration's "previous" snapshot (see below) rather
+    // than recomputing this same integrate() call twice per outer iteration.
+    for (size_t idx = 0; idx < local_systems.size(); ++idx) {
+      states[idx] = angular_qset_->integrate(local_systems[idx]->get_state(),
+        inner_solver->get_eps(), inner_solver->get_max_rank());
+    }
 
     // Begin transport iteration
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < max_iter; i++) {
-      // Snapshot flux before the inner Schwarz so we can measure outer change
-      for (size_t idx = 0; idx < local_systems.size(); ++idx) {
-        states[idx] = local_systems[idx]->get_state();
-      }
-
       // Set eigenvalues of the multiplying systems
       for (const auto& sys : local_systems) {
         const auto& src = sys->get_source();
@@ -185,21 +260,28 @@ public:
       }
 
       // Run the DD solver
-      solver_->step();
+      inner_solver->step();
 
-      // Compute the local error in the eigenvector using a relative L2 error to
-      // the last iteration
+      // Compute the local error in the scalar flux shape using a relative
+      // L2 error to the last iteration, then store this iteration's scalar
+      // flux back into states[idx] so the next iteration's "previous"
+      // snapshot is this one -- avoids recomputing the same integrate() call
+      // twice per outer iteration.
       double local_outer_sums[2] = {0.0, 0.0};
       for (size_t idx = 0; idx < local_systems.size(); ++idx) {
-        const linalg::State& prev = states[idx];
-        if (!prev.defined())
+        if (!states[idx].defined())
           continue;
 
-        linalg::State diff = local_systems[idx]->get_state() - prev;
+        linalg::State scalar_flux =
+          angular_qset_->integrate(local_systems[idx]->get_state(),
+            inner_solver->get_eps(), inner_solver->get_max_rank());
+        linalg::State diff = scalar_flux - states[idx];
         const double n_diff = diff.norm();
-        const double n_prev = prev.norm();
+        const double n_prev = states[idx].norm();
         local_outer_sums[0] += n_diff * n_diff;
         local_outer_sums[1] += n_prev * n_prev;
+
+        states[idx] = std::move(scalar_flux);
       }
 
       // Sum the errors across all MPI ranks
@@ -215,8 +297,8 @@ public:
         const auto& src = sys->get_source();
         if (src && src->is_eigenvalue()) {
           auto fsrc = std::static_pointer_cast<linalg::EigenSource>(src);
-          fsrc->update(
-            sys->get_state(), cfg.rounding.eps, cfg.rounding.max_rank);
+          fsrc->update(sys->get_state(), inner_solver->get_eps(),
+            inner_solver->get_max_rank());
           k += fsrc->get_total_source();
         }
       }
@@ -234,13 +316,196 @@ public:
                 ? std::sqrt(global_outer_sums[0] / global_outer_sums[1])
                 : std::numeric_limits<double>::max();
 
-      min_error = std::min(error, min_error);
+      // Feed the outer error to the solver's generic convergence hook. This
+      // is a no-op for a DDSolver (its forcing is entirely self-contained,
+      // driven by its own internal partial-current error -- see
+      // DDSolver::step()); for a bare LocalSolver used standalone (no domain
+      // decomposition, e.g. a single-patch problem) this is the only signal
+      // that ever drives its eps forcing, since nothing else calls this on
+      // it.
+      inner_solver->update_convergence_criteria(error);
       kreq.wait();
+
+      // Independent k-convergence check -- the flux-shape `error` above can
+      // read small even while k is still drifting (see solve_eigenvalue()'s
+      // doc comment on `tol`), so k_global's own absolute change is tracked
+      // and checked separately rather than trusting it to be implied by the
+      // flux-shape metric.
+      k_error = std::abs(k_global - k_prev);
+      k_prev = k_global;
+
+      for (const auto& sys : local_systems) {
+        const auto& x = sys->get_state();
+        std::cout << "GID: " << sys->get_gid()
+                  << ", Ranks: " << x.as_tt().get_ranks()
+                  << ", Compression: " << x.get_compression() << std::endl;
+      }
 
       if (verbose) {
         std::cout << "-- (" << i << "): k = " << std::fixed
                   << std::setprecision(6) << k_global
-                  << ", Angular Flux L2 Error = " << std::fixed
+                  << ", k Error = " << std::fixed << std::setprecision(6)
+                  << k_error << ", Scalar Flux L2 Error = " << std::fixed
+                  << std::setprecision(10) << error
+                  << ", Elapsed Time = " << std::fixed << std::setprecision(3)
+                  << static_cast<double>(
+                       std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::high_resolution_clock::now() - start)
+                         .count()) *
+                       1e-3
+                  << " s" << std::defaultfloat << std::endl;
+      }
+      if (error < tol && k_error < k_tol) {
+        break;
+      }
+    }
+
+    // Remove the linear systems from GPU
+    inner_solver->finalize();
+
+    if (verbose) {
+      std::cout << "-- "
+                << ((error < tol && k_error < k_tol) ? "Converged!"
+                                                     : "Failed to Converge!")
+                << std::endl;
+    }
+    for (const auto& sys : local_systems) {
+      const auto& x = sys->get_state();
+      std::cout << "GID: " << sys->get_gid()
+                << ", Ranks: " << x.as_tt().get_ranks()
+                << ", Compression: " << x.get_compression() << std::endl;
+    }
+
+    // Build the TransportSolution holding the raw angular flux per local
+    // patch; call TransportSolution::compute_scalar_flux() on the result to
+    // get a spatial-only field suitable for plotting/averaging.
+    auto solution = Solution::create(Communicator::world(), mesh_,
+      angular_qset_, xs_server_, config_, k_global);
+    for (const auto& sys : local_systems) {
+      solution->add_local_patch(sys->get_gid(), sys->get_state());
+    }
+    return solution;
+  }
+
+  /// @brief Run the fixed-source solver using the given solver. Unlike
+  /// solve_eigenvalue(), there is no eigenvalue to update/rescale each outer
+  /// iteration -- every attached Source (volumetric and/or boundary-incident,
+  /// see DGFirstOrderTransportAssembler::assemble()) is already fixed at
+  /// assembly time, so this simply iterates the DD sweep to convergence.
+  /// @param inner_solver Solver for each outer iteration's inner solve -- e.g.
+  /// a DDSolver for multi-patch domain decomposition, or a bare LocalSolver
+  /// (such as AMEnSolver) for a single-patch problem.
+  /// @param tol The convergence tolerance on the relative Frobenius (L2)
+  /// error of the scalar flux shape between successive outer iterations.
+  /// @param max_iter The maximum number of outer iterations.
+  /// @param clear_assemblers Clear each patch's assembler after building the
+  /// local systems (frees assembled operators no longer needed once the
+  /// LinearSystem buffer is built).
+  /// @param verbose Whether to print outer iteration progress.
+  /// @return A TransportSolution holding the raw angular flux per local patch
+  /// (get_solution()); k_eff is left unset (nullopt) since fixed-source
+  /// problems have no eigenvalue.
+  typename Solution::Ptr solve_fixed_source(solvers::Solver::Ptr inner_solver,
+    double tol = 1e-8, int max_iter = 500, bool clear_assemblers = true,
+    bool verbose = true)
+  {
+    if (patch_data_.empty()) {
+      throw utils::runtime_error(
+        "ttnte::driver::TransportDriver::solve_fixed_source",
+        "No linear systems assembled. Call assemble() first.");
+    }
+
+    // Initialize the solver. The returned total fission source is unused
+    // here -- fixed-source problems have no eigenvalue to seed.
+    init_solver(inner_solver, clear_assemblers);
+
+    // Ensure all worker threads have set their CUDA device before the first
+    // iteration so cuBLAS context initialization does not produce warnings.
+    inner_solver->wait_for_thread_init();
+
+    parallel::Request ereq;
+    const auto& local_systems = inner_solver->get_local_systems();
+    verbose = verbose && comm_.rank() == 0;
+
+    double error = std::numeric_limits<double>::max();
+    inner_solver->update_convergence_criteria(error);
+
+    // Temporarily move the angular quadrature set to match the local
+    // systems' own device/dtype for the duration of the solve -- see
+    // solve_eigenvalue()'s identical guard for the full rationale.
+    const torch::Device original_qset_device = angular_qset_->get_device();
+    const torch::ScalarType original_qset_dtype = angular_qset_->get_dtype();
+    if (!local_systems.empty()) {
+      const auto& op = local_systems[0]->get_interior_op();
+      angular_qset_->to_(op.get_device(), op.get_dtype());
+    }
+    struct QsetRestoreGuard {
+      math::QuadratureSet::Ptr qset;
+      torch::Device device;
+      torch::ScalarType dtype;
+      ~QsetRestoreGuard() { qset->to_(device, dtype); }
+    } qset_restore_guard {
+      angular_qset_, original_qset_device, original_qset_dtype};
+
+    // Previous patch scalar fluxes for computing the outer convergence
+    // error -- see solve_eigenvalue()'s identical pattern for the rationale
+    // behind reducing to the scalar flux rather than diffing the raw
+    // angular flux.
+    std::vector<linalg::State> states(local_systems.size());
+    for (size_t idx = 0; idx < local_systems.size(); ++idx) {
+      states[idx] = angular_qset_->integrate(local_systems[idx]->get_state(),
+        inner_solver->get_eps(), inner_solver->get_max_rank());
+    }
+
+    // Begin transport iteration
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < max_iter; i++) {
+      // Run the DD solver
+      inner_solver->step();
+
+      // Compute the local error in the scalar flux shape using a relative
+      // L2 error to the last iteration.
+      double local_outer_sums[2] = {0.0, 0.0};
+      for (size_t idx = 0; idx < local_systems.size(); ++idx) {
+        if (!states[idx].defined())
+          continue;
+
+        linalg::State scalar_flux =
+          angular_qset_->integrate(local_systems[idx]->get_state(),
+            inner_solver->get_eps(), inner_solver->get_max_rank());
+        linalg::State diff = scalar_flux - states[idx];
+        const double n_diff = diff.norm();
+        const double n_prev = states[idx].norm();
+        local_outer_sums[0] += n_diff * n_diff;
+        local_outer_sums[1] += n_prev * n_prev;
+
+        states[idx] = std::move(scalar_flux);
+      }
+
+      // Sum the errors across all MPI ranks
+      double global_outer_sums[2] = {local_outer_sums[0], local_outer_sums[1]};
+      if (comm_.size() > 1) {
+        ereq = comm_.iallreduce(
+          local_outer_sums, global_outer_sums, 2, parallel::MPIOp::SUM);
+        ereq.wait();
+      }
+      error = (global_outer_sums[1] > 0.0)
+                ? std::sqrt(global_outer_sums[0] / global_outer_sums[1])
+                : std::numeric_limits<double>::max();
+
+      // Feed the outer error to the solver's generic convergence hook -- see
+      // solve_eigenvalue()'s identical call for the rationale.
+      inner_solver->update_convergence_criteria(error);
+
+      if (verbose) {
+        for (const auto& sys : local_systems) {
+          const auto& x = sys->get_state();
+          std::cout << "GID: " << sys->get_gid()
+                    << ", Ranks: " << x.as_tt().get_ranks()
+                    << ", Compression: " << x.get_compression() << std::endl;
+        }
+
+        std::cout << "-- (" << i << "): Scalar Flux L2 Error = " << std::fixed
                   << std::setprecision(10) << error
                   << ", Elapsed Time = " << std::fixed << std::setprecision(3)
                   << static_cast<double>(
@@ -256,24 +521,22 @@ public:
     }
 
     // Remove the linear systems from GPU
-    solver_->finalize();
+    inner_solver->finalize();
 
     if (verbose) {
-      std::cout << "-- "
-                << ((error < tol) ? "Converged!" : "Failed to Converge!")
+      std::cout << "-- " << (error < tol ? "Converged!" : "Failed to Converge!")
                 << std::endl;
     }
 
+    // Build the TransportSolution holding the raw angular flux per local
+    // patch; call TransportSolution::compute_scalar_flux() on the result to
+    // get a spatial-only field suitable for plotting/averaging.
+    auto solution = Solution::create(
+      Communicator::world(), mesh_, angular_qset_, xs_server_, config_);
     for (const auto& sys : local_systems) {
-      const auto& x = sys->get_state();
-      std::cout << "Ranks: " << x.as_tt().get_ranks()
-                << " Compression: " << x.get_compression() << std::endl;
+      solution->add_local_patch(sys->get_gid(), sys->get_state());
     }
-
-    // TODO: create a result class or something that takes the eigenvalue and
-    // angular flux states or just all the linear systems. This class should
-    // probably be capable of plotting and what not for post solve stuff.
-    return k_global;
+    return solution;
   }
 
   /// @brief Partition the Mesh according to the load heuristics. Partitioning
@@ -284,7 +547,8 @@ public:
   void distribute(
     std::vector<LoadHeuristicPtr> load_heuristics = {}, int root_rank = 0)
   {
-    // MPI world size is one (only one MPI rank)
+    // MPI world size is one (only one MPI rank) -- mesh_'s gid2rank_ is
+    // already trivially populated by Mesh::finalize(), nothing to do.
     if (comm_.size() == 1) {
       return;
     }
@@ -299,7 +563,8 @@ public:
       std::move(mesh_->build_connectivity_graph()), comm_, load_heuristics,
       root_rank);
 
-    // Restrict the mesh
+    // Restrict the mesh -- cull_blocks() stores gid2rank as mesh_'s own
+    // gid2rank_.
     mesh_->cull_blocks(std::move(local_gids), std::move(gid2rank));
     is_distributed_ = true;
   }
@@ -326,13 +591,17 @@ public:
       std::move(mesh_->build_connectivity_graph()), comm_, load_heuristics);
   }
 
-  /// @brief Initialize the DD solver.
-  /// @param strategy The DD strategy.
+  /// @brief Build local systems from assembled patch data and initialize the
+  /// given solver with them.
+  /// @param solver The solver to initialize.
+  /// @param clear_assemblers Clear each patch's assembler after building the
+  /// local systems.
   /// @return The global fission source.
-  double init_solver(solvers::DDStrategy::Ptr strategy)
+  double init_solver(
+    const solvers::Solver::Ptr& solver, bool clear_assemblers = true)
   {
     // Clear assemblers
-    if (strategy->get_config().clear_assemblers) {
+    if (clear_assemblers) {
       for (auto& [gid, pd] : patch_data_) {
         pd.assembler = nullptr;
       }
@@ -345,9 +614,6 @@ public:
       local_systems.push_back(patch_data_.at(block->get_gid()).system);
     }
 
-    // Get config information
-    const auto& cfg = strategy->get_config();
-
     // Populate the initial guess and compute the initial fission source
     // (k-eigenvalue)
     double k = 0;
@@ -358,23 +624,17 @@ public:
       const auto& dtype = interior_op.get_dtype();
 
       // Check if this is a fissile system
-      linalg::State psi = linalg::State::ones(cfg.fmt, n_modes, device, dtype);
+      linalg::State psi =
+        linalg::State::ones(solver->get_state_format(), n_modes, device, dtype);
       const auto& src = sys->get_source();
       if (src && src->is_eigenvalue()) {
         // Update the fission source
         const auto& fsrc = std::static_pointer_cast<linalg::EigenSource>(src);
-        fsrc->update(psi, cfg.rounding.eps, cfg.rounding.max_rank);
+        fsrc->update(psi, solver->get_eps(), solver->get_max_rank());
 
         // Compute this patch's contribution
         k += fsrc->get_total_source();
       }
-
-      // for (auto& coupling : sys->get_couplings()) {
-      //   auto face = linalg::State::ones(
-      //     cfg.fmt, coupling.boundary_op.as_tt().get_n_modes(), device,
-      //     dtype);
-      //   coupling.recv_buffer = std::move(face);
-      // }
 
       // Set the initial guess
       sys->set_state(std::move(psi));
@@ -387,14 +647,8 @@ public:
       kreq = comm_.iallreduce(&k, &k_global, 1, parallel::MPIOp::SUM);
     }
 
-    // Create the DD solver and register all local systems
-    solver_ = Solver::create(mesh_, std::move(strategy));
-
     // Initialize the solver
-    solver_->init(std::move(local_systems));
-
-    // Construct the solver DAG
-    solver_->build_iteration_dag();
+    solver->init(std::move(local_systems));
 
     // Wait for the eigenvalue to be sent across ranks
     kreq.wait();
@@ -409,9 +663,13 @@ public:
   const Mesh::Ptr& get_mesh() const noexcept { return mesh_; }
   /// @return Get the shared pointer to the cross section library.
   const xs::Server::Ptr& get_server() const noexcept { return xs_server_; }
-  /// @return The DD solver created by the last solve_eigenvalue() call, or
-  /// null.
-  const Solver::Ptr& get_solver() const noexcept { return solver_; }
+  /// @return GID -> owning rank, populated by distribute() (or trivially, by
+  /// gid -> this rank, if distribute() was never called). Delegates to
+  /// mesh_'s own gid2rank_ -- see Mesh::get_gid2rank().
+  const std::unordered_map<int64_t, int>& get_gid2rank() const noexcept
+  {
+    return mesh_->get_gid2rank();
+  }
 
   /// @brief Get the assembler for a specific mesh block GID.
   /// @param gid Global ID of the mesh block.
@@ -453,6 +711,26 @@ public:
   void set_label(const std::string& label)
   {
     label_ = Label::from_string(label);
+  }
+
+  /// @brief GID -> this rank's own local patch assembler, NumDim-erased
+  /// (base-class handle), for every patch whose assembler hasn't been
+  /// cleared. Pass to TransportSolution::compute_patch_balances()/
+  /// patch_balance_table()/global_balance() so those methods don't need the
+  /// full TransportDriver -- only each local patch's assembler.
+  /// @throws Nothing -- patches with a cleared assembler are simply omitted;
+  /// callers see TransportSolution's own clear error message if one of
+  /// their local GIDs is missing.
+  std::unordered_map<int64_t, typename Solution::AssemblerPtr> get_assemblers()
+    const
+  {
+    std::unordered_map<int64_t, typename Solution::AssemblerPtr> result;
+    for (const auto& [gid, data] : patch_data_) {
+      if (data.assembler) {
+        result.emplace(gid, data.assembler);
+      }
+    }
+    return result;
   }
 };
 

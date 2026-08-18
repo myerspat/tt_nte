@@ -1,8 +1,59 @@
 #include "ttnte/task/task_scheduler.hpp"
+#include "ttnte/parallel/parallel_context.hpp"
 #include <chrono>
 #include <torch/cuda.h>
 
+#ifdef USE_CUDA
+#include <c10/cuda/CUDAFunctions.h>
+
+namespace {
+void pin_cuda_device(torch::DeviceIndex device_idx)
+{
+  c10::cuda::set_device(device_idx);
+}
+} // namespace
+
+#else
+
+namespace {
+void pin_cuda_device(torch::DeviceIndex device_idx) {}
+} // namespace
+
+#endif
+
+namespace {
+
+/// @brief Build the per-worker-thread startup routine: pin the CUDA device
+/// (matching what ThreadPool used to do internally) and permanently claim
+/// one stream from `stream_pool` for this thread (see
+/// StreamPool::claim_for_this_thread() -- the reason every worker needs its
+/// own, never-shared stream; a no-op on a CPU-only build/run, since the pool
+/// is then empty).
+std::function<void()> build_worker_init(
+  const ttnte::parallel::StreamPool::Ptr& stream_pool)
+{
+  auto device_idx =
+    ttnte::parallel::ParallelContext::instance().device().index();
+
+  return [device_idx, stream_pool]() {
+    if (torch::cuda::is_available()) {
+      pin_cuda_device(device_idx);
+    }
+    stream_pool->claim_for_this_thread();
+  };
+}
+
+} // namespace
+
 namespace ttnte::task {
+
+TaskScheduler::TaskScheduler(
+  size_t num_threads, std::optional<std::string> label)
+  : label_(label.has_value() ? Label::from_string(label.value())
+                             : Label::create_internal()),
+    stream_pool_(parallel::StreamPool::create(num_threads)),
+    thread_pool_(num_threads, build_worker_init(stream_pool_))
+{}
 
 void TaskScheduler::execute(TaskGraph& graph)
 {

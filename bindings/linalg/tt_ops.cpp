@@ -22,6 +22,12 @@ void register_tt_ops(py::module_& m)
     "Compute an exact matrix-vector product in TT format.",
     py::call_guard<py::gil_scoped_release>());
 
+  m.def("direct_sum", &direct_sum, py::arg("tts"),
+    "Compute the direct sum (TT addition) of several tensor trains in a "
+    "single batched pass, instead of folding them together one at a time "
+    "with repeated binary addition.",
+    py::call_guard<py::gil_scoped_release>());
+
   // =================================================================
   // Element-Wise Operations & Fast Approximations (2024 Arxiv)
   // =================================================================
@@ -96,14 +102,27 @@ void register_tt_ops(py::module_& m)
 
   m.def("amen_solve",
     py::overload_cast<const TTEngine&, const TTEngine&, std::optional<TTEngine>,
-      int, double, int, int, int, int, int, int, bool, int>(&amen_solve),
+      int, double, int, int, int, int, int, int, bool, AMEnPreconditioner,
+      AMEnBackend, AMEnNativeOptions>(&amen_solve),
     py::arg("A"), py::arg("b"), py::arg("x0") = py::none(),
     py::arg("nswp") = 22, py::arg("eps") = 1e-10,
     py::arg("max_rank") = std::numeric_limits<int>::max(),
     py::arg("max_full") = 500, py::arg("kickrank") = 4, py::arg("kick2") = 0,
     py::arg("local_iterations") = 40, py::arg("resets") = 2,
-    py::arg("verbose") = false, py::arg("preconditioner") = 0,
+    py::arg("verbose") = false,
+    py::arg("preconditioner") = AMEnPreconditioner::NONE,
+    py::arg("backend") = AMEnBackend::NATIVE,
+    py::arg("native_opts") = AMEnNativeOptions {},
     "Solve a linear system A @ x = b in TT format using AMEn.",
+    py::call_guard<py::gil_scoped_release>());
+
+  m.def("amen_solve_native", &amen_solve_native, py::arg("A"), py::arg("b"),
+    py::arg("x0"), py::arg("nswp"), py::arg("eps"), py::arg("max_rank"),
+    py::arg("max_full"), py::arg("kickrank"), py::arg("kick2"),
+    py::arg("local_iterations"), py::arg("resets"), py::arg("verbose"),
+    py::arg("preconditioner"), py::arg("native_opts"),
+    "Solve a linear system A @ x = b in TT format using ttnte's native AMEn "
+    "implementation (exposed directly for testing/benchmarking).",
     py::call_guard<py::gil_scoped_release>());
 
   // =================================================================

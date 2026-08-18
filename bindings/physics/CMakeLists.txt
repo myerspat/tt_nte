@@ -1,8 +1,13 @@
 # Define the relative filenames
 set(PHYSICS_SRC_REL dg_first_order_transport_backends.cpp)
 set(PHYSICS_BINDINGS_REL
-    bindings.cpp boundary_types.cpp assembly_configs.cpp
-    dg_first_order_transport_backends.cpp dg_assembler.cpp
+    bindings.cpp
+    boundary_types.cpp
+    assembly_configs.cpp
+    fixed_source.cpp
+    particle_balance.cpp
+    dg_first_order_transport_backends.cpp
+    dg_assembler.cpp
     dg_first_order_transport_assembler.cpp)
 
 # Define the directory paths (Use local variables here, then push if needed)

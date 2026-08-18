@@ -43,3 +43,11 @@ define = { CMAKE_EXPORT_COMPILE_COMMANDS = "ON", TTNTE_OPTIMIZED = "ON", USE_CUD
 
 [tool.scikit-build.wheel]
 packages = ["ttnte"]
+
+[tool.scikit-build.install]
+# Never strip the compiled extension -- keeps host-side symbols available
+# for perf/addr2line regardless of build type. (The auto default only
+# strips for Release/MinSizeRel `cmake.build-type`, which the Makefile
+# never sets -- it only injects CMAKE_BUILD_TYPE via cmake.define -- so
+# this would otherwise default to stripped even for `make dev`.)
+strip = false

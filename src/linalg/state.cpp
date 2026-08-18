@@ -261,4 +261,19 @@ double State::get_compression() const
     get_variant());
 }
 
+torch::Tensor State::to_dense() const
+{
+  return std::visit(
+    [&](const auto& v) -> torch::Tensor {
+      using type = std::decay_t<decltype(v)>;
+      if constexpr (std::is_same_v<type, TTEngine>) {
+        return v.to_dense();
+      } else {
+        throw utils::runtime_error(*this, error_context("to_dense"),
+          "This State format does not support dense conversion yet");
+      }
+    },
+    get_variant());
+}
+
 } // namespace ttnte::linalg

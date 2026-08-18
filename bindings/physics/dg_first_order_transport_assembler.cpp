@@ -84,7 +84,15 @@ void register_DGFirstOrderTransportAssembler(
         const auto& ops = self.get_inflow_ops();
         return std::vector<ttnte::linalg::Operator>(ops.begin(), ops.end());
       },
-      "Get the inflow boundary operators as a Python list.");
+      "Get the inflow boundary operators as a Python list.")
+    .def_property_readonly(
+      "current_ops",
+      [](const AssemblerType& self) {
+        const auto& ops = self.get_current_ops();
+        return std::vector<ttnte::linalg::Operator>(ops.begin(), ops.end());
+      },
+      "Get the outgoing partial-current reduction operators (only defined "
+      "for INTERNAL faces) as a Python list.");
 
   // Note: We intentionally skip binding get_backend_variant and get_backend
   // to Python. Exposing raw pointers to internally managed unique_ptrs

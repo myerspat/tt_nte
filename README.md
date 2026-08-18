@@ -2,6 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Tests Status](https://github.com/myerspat/ttnte/actions/workflows/CI.yml/badge.svg)](https://github.com/myerspat/ttnte/actions/workflows)
+[![VNV Status](https://github.com/myerspat/ttnte-vnv/actions/workflows/vnv.yml/badge.svg)](https://github.com/myerspat/ttnte-vnv/actions/workflows/vnv.yml)
 
 `ttnte` is a Python library for solving the discrete ordinates neutron transport
 equation (NTE) with a discontinuous isogeometric analysis (IGA) spatial
@@ -34,13 +35,13 @@ step.
 - [networkx](https://networkx.org/)
 - [opt_einsum](https://optimized-einsum.readthedocs.io/en/stable/)
 
-> [!NOTE]
-> For best performance compile
+> [!NOTE] For best performance compile
 > [geomdl with Cython](https://nurbs-python.readthedocs.io/en/5.x/install.html#compile-with-cython),
 > [PyTorch with CUDA](https://pytorch.org/get-started/locally/),
-> [torchTT with its C++ extension](https://github.com/ion-g-ion/torchTT), and ensure `ttnte`
-> compiles by setting `TTNTE_CPP_BACKEND=True` environment variable. `ttnte` will compile the C++
-> backend by default but if it fails to compile it will fall back on the Python implementations.
+> [torchTT with its C++ extension](https://github.com/ion-g-ion/torchTT), and
+> ensure `ttnte` compiles by setting `TTNTE_CPP_BACKEND=True` environment
+> variable. `ttnte` will compile the C++ backend by default but if it fails to
+> compile it will fall back on the Python implementations.
 
 ## Installation
 

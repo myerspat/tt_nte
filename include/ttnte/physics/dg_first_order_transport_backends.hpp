@@ -2,10 +2,12 @@
 
 #include "ttnte/cad/patch.hpp"
 #include "ttnte/linalg/operator.hpp"
+#include "ttnte/linalg/state.hpp"
 #include "ttnte/linalg/tt_engine.hpp"
 #include "ttnte/math/quadrature_set.hpp"
 #include "ttnte/physics/assembly_configs.hpp"
 #include "ttnte/physics/boundary_types.hpp"
+#include "ttnte/physics/fixed_source.hpp"
 #include "ttnte/xs/server.hpp"
 #include <c10/util/SmallVector.h>
 
@@ -331,22 +333,12 @@ protected:
   /// Caching struct for format specific data.
   BackendCache<cad::Patch, DGAssemblerConfig, Fmt, NumDim> cache_;
 
-public:
+private:
   // =================================================================
-  // Public constructors
-  DGFirstOrderTransportBackend(const cad::Patch::Ptr& block,
-    const math::QuadratureSet::Ptr& angular_qset,
-    const xs::Server::Ptr& xs_server,
-    const DGTransportAssemblerConfig& config = DGTransportAssemblerConfig())
-    : DGFirstOrderTransportBackend(block, angular_qset,
-        xs_server->get_material(block->get_fill_id()), config)
-  {}
-
-  DGFirstOrderTransportBackend(const cad::Patch::Ptr& block,
-    const math::QuadratureSet::Ptr& angular_qset, const xs::Material& material,
-    const DGTransportAssemblerConfig& config = DGTransportAssemblerConfig())
-    : DGBackend<cad::Patch, DGTransportAssemblerConfig>(block, config),
-      angular_qset_(angular_qset), material_(&material), cache_(block, config)
+  // Private methods
+  /// @brief Shared initialization of spatial_qset_/quad_points_ from the
+  /// block's own basis -- purely geometric, no material/xs dependency.
+  void init_spatial_quadrature_()
   {
     // Sanity check the number of dimensions
     TORCH_CHECK(block_->get_ndim() == NumDim,
@@ -357,8 +349,8 @@ public:
     math::ProductQuadrature::Quads spatial_quads;
 
     auto options = c10::TensorOptions()
-                     .device(block->get_device())
-                     .dtype(block->get_dtype());
+                     .device(block_->get_device())
+                     .dtype(block_->get_dtype());
 
     // Iterate through each dimension
     for (const auto& basis : block_->get_basis()) {
@@ -384,6 +376,117 @@ public:
     spatial_qset_ = math::ProductQuadrature::create(spatial_quads);
   }
 
+  /// @brief Build the raw (Omega . n)_+/- upwind mask. For NumDim == 1 this
+  /// is angular-only. For NumDim > 1 it also carries the face's own
+  /// tangential-dimension dependence (the outward normal varies pointwise
+  /// along a curved IGA boundary), evaluated at FACE QUADRATURE points --
+  /// i.e. cores [2, NumDim+1) are NOT yet expressed in the DOF/control-point
+  /// basis; see project_boundary_mask() for that step. Factored out of
+  /// assemble_interface_boundary_operator() (which continues on to project
+  /// this against the DG basis and integrate over the face) so that method
+  /// and assemble_boundary_operators()'s current-reduction operator (which
+  /// instead just folds in the angular quadrature weights, for
+  /// LocalSolver::postsolve()'s Schwarz convergence check) share this
+  /// construction without duplicating the ordinate/TT-cross logic.
+  /// @param normal Outward normal at this boundary face, per dimension --
+  /// varies pointwise along the face for a curved IGA patch, not a single
+  /// fixed direction.
+  /// @param is_outflow True for (Omega . n)_+ (outflow), false for
+  /// (Omega . n)_- (inflow).
+  auto assemble_upwind_mask(
+    const typename Return<Fmt, NumDim>::VectorType& normal, bool is_outflow)
+    -> ReturnType;
+
+  /// @brief Project a mask's tangential (face-quadrature) cores -- indices
+  /// [2, NumDim+1) -- onto the DG basis, turning them into proper DOF-space
+  /// (m=n=ctrlpts) matrix cores. This is the exact treatment
+  /// assemble_interface_boundary_operator() applies when building B_out/B_in;
+  /// factored out here so assemble_boundary_operators()'s current-reduction
+  /// operator can apply the identical projection to its own angular-weighted
+  /// mask without duplicating the einsum logic (only NumDim > 1 has
+  /// tangential cores to project at all -- see assemble_upwind_mask()).
+  /// Angular cores (indices 0, 1) are left untouched.
+  /// @param mask Angular(+face-tangential-quadrature) mask -- e.g. the raw
+  /// output of assemble_upwind_mask(), optionally with apply_angular_weights()
+  /// already applied.
+  /// @param basis Per-tangential-dim DG basis matrices.
+  /// @param mapping Per-tangential-dim quadrature-weighted affine mapping.
+  auto project_boundary_mask(linalg::TTEngine mask, const ReturnType& basis,
+    const ReturnType& mapping) -> ReturnType;
+
+  /// @brief Compute a boundary face's tangential DG basis, pointwise outward
+  /// normal (accounting for IGA/NURBS curvature via the Jacobian cross
+  /// product), and quadrature/Jacobian mapping. Factored out of
+  /// assemble_boundary_operators() so it can be shared, unchanged, with
+  /// assemble_leakage_functional() (the balance diagnostic) without
+  /// duplicating the curved-boundary normal derivation. NumDim > 1 only --
+  /// NumDim == 1 has no tangential dimension and a trivial (sign-only)
+  /// normal, built inline at each call site instead.
+  /// @param dim The dimension of the face.
+  /// @param is_upper Whether the face is at the upper or lower end of `dim`.
+  /// @return (tangential basis, per-dimension outward normal, quadrature/
+  /// Jacobian mapping).
+  auto assemble_boundary_geometry(size_t dim, bool is_upper)
+    -> std::tuple<ReturnType, typename Return<Fmt, NumDim>::VectorType,
+      ReturnType>;
+
+public:
+  // =================================================================
+  // Public constructors
+  DGFirstOrderTransportBackend(const cad::Patch::Ptr& block,
+    const math::QuadratureSet::Ptr& angular_qset,
+    const xs::Server::Ptr& xs_server,
+    const DGTransportAssemblerConfig& config = DGTransportAssemblerConfig())
+    : DGFirstOrderTransportBackend(block, angular_qset,
+        xs_server->get_material(block->get_fill_id()), config)
+  {}
+
+  DGFirstOrderTransportBackend(const cad::Patch::Ptr& block,
+    const math::QuadratureSet::Ptr& angular_qset, const xs::Material& material,
+    const DGTransportAssemblerConfig& config = DGTransportAssemblerConfig())
+    : DGBackend<cad::Patch, DGTransportAssemblerConfig>(block, config),
+      angular_qset_(angular_qset), material_(&material), cache_(block, config)
+  {
+    init_spatial_quadrature_();
+  }
+
+  /// @brief Construct a backend with no material -- only valid for the
+  /// purely-geometric methods (assemble_basis(), assemble_integral_mapping(),
+  /// assemble_jacobian(), ...) that never touch get_material(). Intended for
+  /// cheaply recomputing spatial integration weights on demand (e.g.
+  /// TransportSolution::compute_errors()) without needing an
+  /// xs::Server/Material.
+  DGFirstOrderTransportBackend(const cad::Patch::Ptr& block,
+    const math::QuadratureSet::Ptr& angular_qset,
+    const DGTransportAssemblerConfig& config = DGTransportAssemblerConfig())
+    : DGBackend<cad::Patch, DGTransportAssemblerConfig>(block, config),
+      angular_qset_(angular_qset), material_(nullptr), cache_(block, config)
+  {
+    init_spatial_quadrature_();
+  }
+
+  /// @brief Construct a backend with no material and EXTERNALLY supplied
+  /// quadrature points, bypassing init_spatial_quadrature_()'s
+  /// self-derivation from this block's own knot vector. Only valid for
+  /// assemble_basis() (spatial_qset_ is left unset, so
+  /// assemble_integral_mapping() and anything depending on it is not valid
+  /// on an instance built this way). Intended for evaluating a DIFFERENT
+  /// patch's basis -- e.g. a differently-refined (more knot spans and/or
+  /// higher polynomial degree) reference solution sharing the same
+  /// parametric domain -- at another patch's own quadrature points, so the
+  /// two can be compared pointwise (see
+  /// TransportSolution::compute_errors()).
+  DGFirstOrderTransportBackend(const cad::Patch::Ptr& block,
+    const math::QuadratureSet::Ptr& angular_qset, Tensors quad_points,
+    const DGTransportAssemblerConfig& config = DGTransportAssemblerConfig())
+    : DGBackend<cad::Patch, DGTransportAssemblerConfig>(block, config),
+      angular_qset_(angular_qset), material_(nullptr), cache_(block, config)
+  {
+    TORCH_CHECK(block_->get_ndim() == NumDim,
+      "CAD patch dimension mismatch with backend template configuration");
+    quad_points_ = std::move(quad_points);
+  }
+
   // =================================================================
   // Public methods
   auto assemble_ordinates() -> Return<Fmt, NumDim>::VectorType;
@@ -398,8 +501,90 @@ public:
   linalg::Operator assemble_loss_operator();
   linalg::Operator assemble_scatter_operator();
   linalg::Operator assemble_fission_operator();
-  std::tuple<linalg::Operator, linalg::Operator> assemble_boundary_operators(
-    size_t dim, bool is_upper);
+  /// @brief Assemble a fixed-source RHS vector (space x angle x energy) from
+  /// a FixedSource source: an isotropic contribution (physical-unit strength,
+  /// used directly as the uniform per-direction value -- the angular
+  /// quadrature's weights are always normalized to sum to 1, not to
+  /// weighting_factor(), so no extra normalization is needed), an arbitrary
+  /// `function(coords)` contribution evaluated at physical-space/angle/
+  /// energy sample points via TT-cross, or both (combined via direct_sum).
+  /// @param source The source specification for this block.
+  /// @return The assembled source State.
+  linalg::State assemble_source(const FixedSource& source);
+  /// @brief Assemble a prescribed incident-flux RHS contribution for one
+  /// boundary face (`BoundaryType::INCIDENT`). Builds a raw nodal (not
+  /// basis-projected) State over the tangential control points, narrowed to
+  /// a single point along `dim` -- the same convention a NeighborCoupling's
+  /// recv_buffer uses -- so it can be applied through
+  /// `assemble_boundary_operators()`'s own inflow operator exactly the way
+  /// the DAG's apply task applies `coupling.boundary_op` to a received
+  /// neighbor State (the Galerkin test-function integration happens inside
+  /// that operator, not here).
+  /// @param dim The dimension of the face.
+  /// @param is_upper Whether the face is at the upper or lower end of `dim`.
+  /// @param source The source specification for this face. Only
+  /// `isotropic_strength` is currently supported; `function` throws.
+  /// @return The assembled incident-source State.
+  linalg::State assemble_incident_source(
+    size_t dim, bool is_upper, const FixedSource& source);
+  std::tuple<linalg::Operator, linalg::Operator, linalg::Operator>
+  assemble_boundary_operators(size_t dim, bool is_upper);
+  /// @brief Assemble a particle-balance reaction-rate functional: a one-sided
+  /// spatial load vector (not the bilinear mass matrix
+  /// assemble_fission_operator()/assemble_scatter_operator() use, since this
+  /// is a scalar functional of the state, not a reusable DOF-space operator)
+  /// x a bare (un-expanded) angular-quadrature-weight reduction x an energy
+  /// weight/transfer matrix. Applying mv(functional, psi) collapses space and
+  /// angle to size 1 directly -- to_dense().reshape({num_groups}) is the
+  /// final per-group result, no further reduction needed.
+  /// @param energy_matrix (num_groups, num_groups) weight -- diagonal for a
+  /// per-group-only reaction rate (absorption, scatter-out), or a full
+  /// transfer matrix for group-to-group redistribution (scatter-in via the
+  /// isotropic/l=0 moment only, fission source via chi (x) nu_fission).
+  /// @param eps TT-rounding tolerance for this functional's own construction
+  /// -- independent of config_->rounding.eps, so eps=0 gives a lossless
+  /// functional for exact/benchmarking use regardless of the solve's own
+  /// tolerance.
+  /// @param max_rank TT-rounding max rank, paired with `eps`.
+  /// @return The assembled reduction functional.
+  linalg::Operator assemble_balance_functional(
+    const torch::Tensor& energy_matrix, double eps, int64_t max_rank);
+  /// @brief Assemble a particle-balance leakage (partial-current) functional
+  /// for one boundary face, independent of assemble_boundary_operators() (no
+  /// changes to the real PDE boundary operators). Built for any
+  /// BoundaryType, using only local geometry -- no cross-patch data.
+  /// @param dim The dimension of the face.
+  /// @param is_upper Whether the face is at the upper or lower end of `dim`.
+  /// @param is_outflow True for the outgoing ((Omega . n)_+) functional,
+  /// false for incoming ((Omega . n)_-).
+  /// @param narrowed_input Whether this functional will be applied to a
+  /// State already narrowed to a single point along `dim` (e.g.
+  /// assemble_incident_source()'s output, the same convention a
+  /// NeighborCoupling's recv_buffer uses) rather than the full, un-narrowed
+  /// state (e.g. psi itself, for the outgoing functional or REFLECTIVE's
+  /// self-referential incoming).
+  /// @param eps TT-rounding tolerance, independent of config_->rounding.eps.
+  /// @param max_rank TT-rounding max rank, paired with `eps`.
+  /// @return The assembled leakage functional.
+  linalg::Operator assemble_leakage_functional(size_t dim, bool is_upper,
+    bool is_outflow, bool narrowed_input, double eps, int64_t max_rank);
+  /// @brief Assemble an orthogonal projector onto the low-order angular
+  /// moments (scalar flux + current) of the angular flux, expressed back in
+  /// full angular resolution -- i.e. `mv(P, psi)` directly gives psi's
+  /// macroscopic part, no separate reduce/expand step needed. A pure
+  /// interior/volume operator: identity over space and energy (the state's
+  /// own spatial/energy representation is preserved exactly, not projected
+  /// through the DG basis the way assemble_scattering_kernel()'s bilinear
+  /// kernel is), so unlike assemble_balance_functional()/
+  /// assemble_leakage_functional() this needs no boundary geometry.
+  /// @param order Highest angular moment order to preserve. Only `order = 1`
+  /// (scalar flux [P0] + full current vector [P1x/P1y/P1z, or just P1z for
+  /// NumDim == 1]) is implemented; other values throw. Reserved so an
+  /// arbitrary order (via the same associated-Legendre machinery
+  /// assemble_scattering_kernel() already uses) is a natural future
+  /// extension.
+  /// @return The assembled moment projector.
+  linalg::Operator assemble_moment_projector(int64_t order = 1);
   auto assemble_outflow_boundary_operator(const ReturnType& basis,
     const typename Return<Fmt, NumDim>::VectorType& normal,
     const ReturnType& mapping) -> ReturnType;

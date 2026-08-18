@@ -35,7 +35,13 @@ private:
 public:
   // =================================================================
   // Public constructors
-  explicit ThreadPool(size_t num_threads = 4);
+  /// @param num_threads Number of worker threads to spawn.
+  /// @param init_fn Optional function run once on each worker thread, before
+  /// it enters its work loop. ThreadPool itself has no idea what this does
+  /// (e.g. CUDA device pinning, stream claiming) -- that policy belongs to
+  /// the caller (see TaskScheduler), keeping this class fully generic.
+  explicit ThreadPool(
+    size_t num_threads = 4, std::function<void()> init_fn = {});
   ~ThreadPool();
 
   // Prevent copying which would wreck the thread management

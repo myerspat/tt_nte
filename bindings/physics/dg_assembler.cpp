@@ -19,7 +19,11 @@ void register_DGAssembler(py::module_& m, const std::string& class_name)
     .def(
       "get_block", &BaseType::get_block, "Get the pointer to the mesh block.")
     .def("get_linear_system", &BaseType::get_linear_system,
-      "Get the assembled linear system pointer.");
+      "Get the assembled linear system pointer.")
+    .def("compute_balance", &BaseType::compute_balance, py::arg("psi"),
+      py::arg("eps"), py::arg("max_rank"),
+      "Compute this patch's own particle-balance diagnostics from a "
+      "converged state, purely locally.");
 }
 
 void register_dg_assemblers(py::module_& m)

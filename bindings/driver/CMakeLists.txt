@@ -1,5 +1,6 @@
 # Define the relative filenames
-set(DRIVER_BINDINGS_REL bindings.cpp transport_driver.cpp)
+set(DRIVER_BINDINGS_REL bindings.cpp transport_solution.cpp
+                        transport_driver.cpp)
 # set(DRIVER_SRC_REL driver.cpp)
 
 # Define the directory paths (Use local variables here, then push if needed)

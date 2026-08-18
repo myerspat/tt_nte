@@ -1,4 +1,5 @@
 #include "ttnte/solvers/block_jacobi_strategy.hpp"
+#include "ttnte/parallel/parallel_context.hpp"
 #include "ttnte/task/configure_cpu_task.hpp"
 #include "ttnte/task/configure_cuda_task.hpp"
 #include "ttnte/task/configure_mpi_task.hpp"
@@ -12,8 +13,7 @@ void build_iteration_dag(ttnte::task::TaskGraph& dag,
   const ttnte::solvers::BlockJacobiStrategy& strategy,
   const std::vector<ttnte::linalg::LinearSystem::Ptr>& local_systems,
   const std::unordered_map<int64_t, size_t>& gid_to_local,
-  const ttnte::parallel::BoundaryCommunicator& boundary_comms,
-  const ttnte::parallel::StreamPool::Ptr& stream_pool = nullptr)
+  const ttnte::parallel::BoundaryCommunicator& boundary_comms)
 {
   int my_rank = boundary_comms.get_comms()[0].rank();
   const auto& config = strategy.get_config();
@@ -22,7 +22,8 @@ void build_iteration_dag(ttnte::task::TaskGraph& dag,
     (config.memory_policy == ttnte::solvers::MemoryPolicy::RESIDENT ||
       config.memory_policy == ttnte::solvers::MemoryPolicy::STATE_RESIDENT);
   const torch::Device device =
-    use_gpu_recv ? stream_pool->get_device() : torch::Device(torch::kCPU);
+    use_gpu_recv ? ttnte::parallel::ParallelContext::instance().device()
+                 : torch::Device(torch::kCPU);
   const auto comm_device = config.comm_mode == ttnte::solvers::CommMode::SYNC
                              ? ttnte::task::DeviceTarget::CPU_SYNC
                              : ttnte::task::DeviceTarget::CPU_ASYNC;
@@ -70,7 +71,7 @@ void build_iteration_dag(ttnte::task::TaskGraph& dag,
     // Create compute task for this linear system
     c10::SmallVector<ttnte::task::Task*, 6> out_tasks;
     if (config.use_gpu) {
-      out_tasks = strategy.build_gpu_compute_dag(dag, sys, stream_pool);
+      out_tasks = strategy.build_gpu_compute_dag(dag, sys);
     } else {
       out_tasks = strategy.build_cpu_compute_dag(dag, sys);
     }
@@ -181,11 +182,9 @@ void BlockJacobiStrategy::build_cpu_iteration_dag(task::TaskGraph& dag,
 void BlockJacobiStrategy::build_gpu_iteration_dag(task::TaskGraph& dag,
   const std::vector<linalg::LinearSystem::Ptr>& local_systems,
   const std::unordered_map<int64_t, size_t>& gid_to_local,
-  const parallel::BoundaryCommunicator& boundary_comms,
-  const parallel::StreamPool::Ptr& stream_pool) const
+  const parallel::BoundaryCommunicator& boundary_comms) const
 {
-  build_iteration_dag(
-    dag, *this, local_systems, gid_to_local, boundary_comms, stream_pool);
+  build_iteration_dag(dag, *this, local_systems, gid_to_local, boundary_comms);
 }
 
 c10::SmallVector<task::Task*, 6> BlockJacobiStrategy::build_cpu_compute_dag(
@@ -237,8 +236,7 @@ c10::SmallVector<task::Task*, 6> BlockJacobiStrategy::build_cpu_compute_dag(
 }
 
 c10::SmallVector<task::Task*, 6> BlockJacobiStrategy::build_gpu_compute_dag(
-  task::TaskGraph& dag, const SystemPtr& local_system,
-  const parallel::StreamPool::Ptr& stream_pool) const
+  task::TaskGraph& dag, const SystemPtr& local_system) const
 {
   int64_t num_couplings = local_system->get_couplings().size();
   int64_t gid = local_system->get_gid();
@@ -259,23 +257,23 @@ c10::SmallVector<task::Task*, 6> BlockJacobiStrategy::build_gpu_compute_dag(
     if (config_.memory_policy == MemoryPolicy::STATE_RESIDENT) {
       // Only communicate the buffer information
       task::cuda::configure_transfer_buffer_task(
-        *h2d_task, local_system, torch::Device(torch::kCUDA), stream_pool);
+        *h2d_task, local_system, torch::Device(torch::kCUDA));
       task::cuda::configure_transfer_buffer_task(
-        *d2h_task, local_system, torch::Device(torch::kCPU), stream_pool);
+        *d2h_task, local_system, torch::Device(torch::kCPU));
 
     } else if (config_.memory_policy == MemoryPolicy::OPERATOR_RESIDENT) {
       // Only communicate the non-buffer information
       task::cuda::configure_transfer_nonbuffer_task(
-        *h2d_task, local_system, torch::Device(torch::kCUDA), stream_pool);
+        *h2d_task, local_system, torch::Device(torch::kCUDA));
       task::cuda::configure_transfer_nonbuffer_task(
-        *d2h_task, local_system, torch::Device(torch::kCPU), stream_pool);
+        *d2h_task, local_system, torch::Device(torch::kCPU));
 
     } else {
       // Both buffer and non-buffer are communicated each iteration
       task::cuda::configure_transfer_task(
-        *h2d_task, local_system, torch::Device(torch::kCUDA), stream_pool);
+        *h2d_task, local_system, torch::Device(torch::kCUDA));
       task::cuda::configure_transfer_task(
-        *d2h_task, local_system, torch::Device(torch::kCPU), stream_pool);
+        *d2h_task, local_system, torch::Device(torch::kCPU));
     }
   }
 
@@ -286,8 +284,7 @@ c10::SmallVector<task::Task*, 6> BlockJacobiStrategy::build_gpu_compute_dag(
     int64_t sgid = coupling.connection.gid;
     auto apply_task = dag.create_task(exec_device,
       "apply_" + std::to_string(sgid) + "to" + std::to_string(gid));
-    task::cuda::configure_apply_task(
-      *apply_task, &coupling, stream_pool, tt_config_);
+    task::cuda::configure_apply_task(*apply_task, &coupling, tt_config_);
 
     // Add dependency
     if (h2d_task) {
@@ -299,8 +296,7 @@ c10::SmallVector<task::Task*, 6> BlockJacobiStrategy::build_gpu_compute_dag(
   // Configure solve task for this mesh block
   auto solve_task =
     dag.create_task(exec_device, "solve_" + std::to_string(gid));
-  task::cuda::configure_solve_task(
-    *solve_task, local_system, local_solver_, stream_pool);
+  task::cuda::configure_solve_task(*solve_task, local_system, local_solver_);
 
   // Add transfer task as a dependency
   if (h2d_task) {
@@ -320,7 +316,7 @@ c10::SmallVector<task::Task*, 6> BlockJacobiStrategy::build_gpu_compute_dag(
     auto narrow_task = dag.create_task(exec_device,
       "narrow_" + std::to_string(gid) + "to" + std::to_string(tgid));
     task::cuda::configure_narrow_task(
-      *narrow_task, local_system, &coupling, stream_pool, tt_config_);
+      *narrow_task, local_system, &coupling, tt_config_);
     narrow_task->add_dependency(solve_task);
     narrow_tasks.push_back(std::move(narrow_task));
   }

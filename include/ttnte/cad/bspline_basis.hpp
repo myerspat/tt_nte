@@ -51,15 +51,6 @@ public:
     std::optional<torch::ScalarType> dtype) const;
   BSplineBasis clone() const;
 
-  // // TODO: Find the first index where the interval begins for u
-  // // For example if x = 0.5 and knotvector_ = [0, 0, 0, 1, 1, 1]
-  // // then we return 2
-  // int64_t inline find_span(const double& u) const
-  // {
-  //   throw utils::runtime_error(
-  //     *this, error_context("find_span"), "Not implemented yet");
-  // }
-
   /// @brief Find the knot spans (indices into the knot vector where the knot
   /// changes from one index to the next) for a tensor of parametric
   /// coordinates.

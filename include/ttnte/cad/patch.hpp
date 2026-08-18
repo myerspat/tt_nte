@@ -9,6 +9,30 @@
 
 namespace ttnte::cad {
 
+/// Default number of points per parametric axis for inverse_map()'s
+/// coarse-grid closest-point seeding, when no explicit initial_guess is
+/// given. Chosen empirically as the smallest tested power-of-round-number
+/// resolution that reliably seeds Newton-Raphson into the correct basin near
+/// coordinate singularities (e.g. a sphere octant patch's pole, where an
+/// entire parametric edge collapses to one physical point) and multi-patch
+/// corners where several patches meet at a single point (e.g. two 45-degree
+/// arc segments meeting at a shared vertex) -- a lower resolution (e.g. the
+/// legacy default of 10) can seed Newton into a nearby-but-wrong fixed
+/// point near such features, causing spurious non-convergence even though
+/// the target point is genuinely on the patch.
+inline constexpr int64_t DEFAULT_INVERSE_MAP_SEED_RESOLUTION = 60;
+
+/// @brief Result of Patch::inverse_map(): per-point parametric coordinates
+/// found via Newton-Raphson, along with convergence diagnostics.
+struct InverseMapResult {
+  /// Best-effort parametric coordinates, shape (n, ndim).
+  torch::Tensor coords;
+  /// Final physical-space residual norm, shape (n,).
+  torch::Tensor residual;
+  /// Whether each point converged within tol/max_iter, shape (n,), bool.
+  torch::Tensor converged;
+};
+
 class Patch : public mesh::MeshBlock<Patch> {
   friend class mesh::MeshBlock<Patch>;
 
@@ -63,19 +87,77 @@ public:
   /// data tensor is populated, and Patch is marked immutable.
   void finalize_impl();
 
-  /// @brief Evaluate a tensor of parametric coordinates.
-  /// @param local_coords Parametric coordinates shaped (n, m) where n
-  /// is the number of points and m is the number of parametric dimensions.
-  /// @return A tensor shaped (n, d) where d is the number of physical
-  /// dimensions.
-  torch::Tensor evaluate(const torch::Tensor& local_coords);
   /// @brief Evaluate a tensor product of parametric coordinates.
   /// @param local_coords A vector of 1-D tensors one for each parametric
   /// dimension.
   /// @return A tensor shaped (n1, ..., nk, d) where n1, ..., nk are the lengths
   /// of each input tensor and d is the number of physical dimensions.
   torch::Tensor evaluate(
-    const c10::SmallVector<torch::Tensor, 3>& local_coords);
+    const c10::SmallVector<torch::Tensor, 3>& local_coords) const;
+
+  /// @brief Evaluate a tensor of independent parametric coordinates, including
+  /// partial derivatives up to `derivative_order`. Mirrors the "no cross
+  /// terms" convention of evaluate_all_basis()/evaluate_all_jacobian(): the
+  /// derivative axis holds the value, then the `derivative_order`-th partial
+  /// derivative in each parametric dimension in turn (holding the other
+  /// dimensions at derivative order 0) -- not full mixed partials.
+  /// @param local_coords Parametric coordinates shaped (n, m).
+  /// @param derivative_order The order of derivative to compute to. If 0,
+  /// this returns the same values as evaluate(local_coords) (but via a
+  /// separate code path).
+  /// @return A tensor shaped (n, d) if `derivative_order == 0`, else (n, d,
+  /// 1 + ndim * derivative_order).
+  torch::Tensor evaluate(
+    const torch::Tensor& local_coords, int64_t derivative_order = 0) const;
+
+  /// @brief Compute the Jacobian at a tensor of independent parametric
+  /// coordinates. This is the evaluate(Tensor)-batch analogue of
+  /// evaluate_all_jacobian(), which only supports tensor-product grids.
+  /// @param local_coords Parametric coordinates shaped (n, m).
+  /// @return A tensor of shape (n, n_physical, n_parametric).
+  torch::Tensor evaluate_jacobian(const torch::Tensor& local_coords) const;
+
+  /// @brief Invert the parametric-to-physical map for a batch of target
+  /// physical points via batched (least-squares, Levenberg-Marquardt damped)
+  /// Newton-Raphson, using evaluate()/evaluate_jacobian(). This considers
+  /// only this one patch -- candidate-patch selection across multiple
+  /// patches (e.g. a bounding-box pre-filter, or reconciling multiple
+  /// patches' results) is the caller's responsibility.
+  /// @param physical_coords Target physical points, shape (n, n_physical).
+  /// @param max_iter Maximum number of Newton-Raphson iterations.
+  /// @param tol Convergence tolerance on the physical-space residual norm.
+  /// @param initial_guess Optional starting parametric coordinates, shape
+  /// (n, ndim). If not given, a coarse-grid closest-point search seeds each
+  /// point independently.
+  /// @param seed_resolution Number of points per parametric axis for the
+  /// coarse-grid closest-point search that seeds Newton-Raphson when
+  /// `initial_guess` is not given (ignored otherwise). Raise this if points
+  /// near a coordinate singularity (e.g. a collapsed patch edge) or a
+  /// multi-patch corner spuriously fail to converge.
+  /// @return Per-point best-effort coordinates, residuals, and convergence
+  /// flags.
+  InverseMapResult inverse_map(const torch::Tensor& physical_coords,
+    int64_t max_iter = 10, double tol = 1e-8,
+    std::optional<torch::Tensor> initial_guess = std::nullopt,
+    int64_t seed_resolution = DEFAULT_INVERSE_MAP_SEED_RESOLUTION) const;
+
+  /// @brief Evaluate a DOF-coefficient field defined on this patch's own
+  /// basis (e.g. a solved scalar/angular-flux field's dense array) at a
+  /// batch of independent parametric points. Directly contracts `field`
+  /// against this patch's own basis functions (the same per-dimension
+  /// contraction evaluate() uses internally), NURBS-dividing by the weight
+  /// function if this patch is rational -- no synthetic patch/finalize()
+  /// is involved, since finalize()'s Jacobian/dimensionality validity
+  /// checks are only meaningful for real geometry, not arbitrary field
+  /// data (e.g. a field patch with a single channel but ndim > 1 would
+  /// otherwise spuriously fail the "parametric dim <= physical dim" check).
+  /// @param field Dense field array, shape matching this patch's own
+  /// control-point grid plus a trailing channel axis:
+  /// (*ctrlpts_grid_shape, num_channels).
+  /// @param points Parametric coordinates, shape (n, ndim).
+  /// @return Field values at `points`, shape (n, num_channels).
+  torch::Tensor evaluate_field(
+    const torch::Tensor& field, const torch::Tensor& points) const;
 
   /// @brief Compute all non-vanishing B-spline/NURBS basis functions.
   /// @param local_coords The tensor product parametric coordinates.

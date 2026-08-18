@@ -11,6 +11,7 @@
 #include <optional>
 #include <torch/types.h>
 #include <tuple>
+#include <unordered_map>
 
 namespace ttnte::mesh {
 
@@ -43,6 +44,11 @@ private:
   GIDtoIdx index_map_;
   /// MPI rank of this mesh.
   int my_rank_;
+  /// GID -> owning rank, for every GID in the whole mesh (identical on every
+  /// rank). Trivially populated in finalize() (every GID -> this rank);
+  /// overwritten by cull_blocks() with the real partition if distribute() is
+  /// ever called.
+  std::unordered_map<int64_t, int> gid2rank_;
 
   // States
   bool is_connected_ = false;
@@ -165,6 +171,12 @@ public:
       // Add a global ID
       bptr->set_gid(i);
       index_map_[i] = i;
+
+      // Trivially populate gid2rank_ (every GID -> this rank) so it's
+      // meaningful without ever having to call cull_blocks() -- e.g. a
+      // single-rank run, or a mesh nobody ever distributes. cull_blocks()
+      // overwrites this with the real partition if/when it's called.
+      gid2rank_[i] = my_rank_;
 
       for (size_t dim = 0; dim < blocks_[0]->get_ndim(); dim++) {
         for (bool is_upper : {false, true}) {
@@ -506,9 +518,13 @@ public:
   /// Euclidean axes.
   /// @param bcplanes Which planes are set with the boundary condition.
   /// @param type The boundary condition type.
+  /// @param source Optional incident source, applied to every matched face.
+  /// Only valid when `type == BoundaryType::INCIDENT`.
   /// @param tol The tolerance for geometric comparisons.
   void set_axis_aligned_conditions(const physics::BCPlane& bcplanes,
-    const physics::BoundaryType& type, double tol = 1e-8)
+    const physics::BoundaryType& type,
+    std::optional<physics::FixedSource> source = std::nullopt,
+    double tol = 1e-8)
   {
     // Lock class from multiple threads calling
     std::lock_guard<std::mutex> lock(mesh_mutex);
@@ -516,6 +532,11 @@ public:
     // State checks
     is_connected_or_error("set_axis_aligned_condition");
     is_not_finalized_or_error("set_axis_aligned_condition");
+    if (source.has_value() && type != physics::BoundaryType::INCIDENT) {
+      throw utils::runtime_error(*this,
+        error_context("set_axis_aligned_condition"),
+        "A source was provided but `type` is not BoundaryType::INCIDENT");
+    }
 
     // Global bbox accessor
     auto bbox_acc = bbox_.accessor<double, 2>();
@@ -539,11 +560,19 @@ public:
               if (i < active_planes.size() && active_planes[i] &&
                   std::abs(bbox_center[d].item<double>() - bbox_acc[0][d]) <
                     tol) {
-                bptr->set_boundary_type(dim, is_upper, type);
+                if (source.has_value()) {
+                  bptr->set_boundary_source(dim, is_upper, *source);
+                } else {
+                  bptr->set_boundary_type(dim, is_upper, type);
+                }
               } else if (i + 1 < active_planes.size() && active_planes[i + 1] &&
                          std::abs(bbox_center[d].item<double>() -
                                   bbox_acc[1][d]) < tol) {
-                bptr->set_boundary_type(dim, is_upper, type);
+                if (source.has_value()) {
+                  bptr->set_boundary_source(dim, is_upper, *source);
+                } else {
+                  bptr->set_boundary_type(dim, is_upper, type);
+                }
               }
             }
           }
@@ -646,6 +675,7 @@ public:
     // Save the restricted versions
     blocks_ = std::move(new_blocks_);
     index_map_ = std::move(new_index_map_);
+    gid2rank_ = gid2rank;
 
     // Iterate through the blocks and update their boundaries to the correct MPI
     // ranks
@@ -673,6 +703,13 @@ public:
   }
   /// @return The vector of blocks.
   const inline MeshBlocks& get_blocks() const noexcept { return blocks_; }
+  /// @return GID -> owning rank, for every GID in the whole mesh (identical
+  /// on every rank). Trivial (every GID -> this rank) if cull_blocks() was
+  /// never called.
+  const inline std::unordered_map<int64_t, int>& get_gid2rank() const noexcept
+  {
+    return gid2rank_;
+  }
   /// @return The global bounding box represented as a tensor with the first
   /// index of the first dimension being the minimum point in Euclidean space
   /// and the second being the maximum.

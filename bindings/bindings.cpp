@@ -54,6 +54,20 @@ PYBIND11_MODULE(ttnte_python, m)
   auto m_solvers = m.def_submodule("solvers");
   init_solvers(m_solvers);
 
+  // AMEnBackend/AMEnEnrichmentMode/AMEnPreconditioner/AMEnNativeOptions are
+  // defined once in ttnte::linalg, since they're consumed directly by
+  // linalg::amen's own numerics (amen_sweep, gmres_solve,
+  // FoldedLocalOperator) -- moving them to ttnte::solvers would make linalg
+  // depend on solvers, inverting the existing solvers -> linalg dependency
+  // direction. They're also the options callers reach for constantly when
+  // configuring an AMEnSolver (ttnte.solvers), so alias the same Python type
+  // objects into ttnte.solvers too instead of requiring a separate
+  // `import ttnte.linalg` just for these.
+  m_solvers.attr("AMEnBackend") = m_linalg.attr("AMEnBackend");
+  m_solvers.attr("AMEnEnrichmentMode") = m_linalg.attr("AMEnEnrichmentMode");
+  m_solvers.attr("AMEnPreconditioner") = m_linalg.attr("AMEnPreconditioner");
+  m_solvers.attr("AMEnNativeOptions") = m_linalg.attr("AMEnNativeOptions");
+
   auto m_math = m.def_submodule("math");
   init_math(m_math);
 

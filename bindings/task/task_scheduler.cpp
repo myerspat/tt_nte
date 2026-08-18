@@ -23,5 +23,6 @@ void register_TaskScheduler(py::module_& m)
 
     // =================================================================
     // Public getters / setters
-    .def_property_readonly("label", &TaskScheduler::get_label);
+    .def_property_readonly("label", &TaskScheduler::get_label)
+    .def_property_readonly("stream_pool", &TaskScheduler::get_stream_pool);
 }

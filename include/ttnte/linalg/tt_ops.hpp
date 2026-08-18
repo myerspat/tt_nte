@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ttnte/linalg/amen/amen_config.hpp"
 #include "ttnte/linalg/tt_engine.hpp"
 #include <limits>
 #include <optional>
@@ -20,6 +21,19 @@ inline TTEngine mv(const TTEngine& a, const TTEngine& b)
 {
   return mm(a, b);
 }
+
+/// @brief Compute the direct sum (TT addition) of several tensor trains in a
+/// single allocation pass per core, instead of folding them together one at a
+/// time with repeated `operator+=` calls. Chained pairwise addition
+/// reallocates and copies the full, ever-growing set of cores at every step,
+/// so summing N terms costs O(N^2) in the accumulated rank; this builds the
+/// block-diagonal embedding for all N terms directly, costing O(N). The
+/// result is unrounded -- equivalent to `tts[0] + tts[1] + ... +
+/// tts[N-1]` -- so callers should round it themselves.
+/// @param tts The tensor trains to sum. Each must have the same number of
+/// cores, matching `m`/`n` modes at every core, and share device/dtype.
+/// @return The (unrounded) TT sum of `tts`.
+TTEngine direct_sum(const std::vector<TTEngine>& tts);
 
 /// @brief Perform an element-wise division with two tensor trains using AMEn.
 /// This calls the torchTT implementation `torchtt._division.amen_divide()` in
@@ -154,14 +168,33 @@ inline TTEngine amen_mv(const linalg::TTEngine& a, const linalg::TTEngine& b,
 /// @param local_iterations The max number of GMRES iterations.
 /// @param resets The maximum number of restarts in GMRES.
 /// @param verbose Whether to print progress.
-/// @param preconditioner Which preconditioner to use.
+/// @param preconditioner Which preconditioner to use. `AMEnPreconditioner::
+/// RANK1` is only supported when `backend == AMEnBackend::NATIVE`.
+/// @param backend Which implementation to dispatch to: the vendored torchTT
+/// solver, or ttnte's native implementation.
+/// @param native_opts Tuning knobs specific to `AMEnBackend::NATIVE`. Ignored
+/// when `backend == AMEnBackend::TORCHTT`.
 /// @return The approximate solution x for A @ x = b.
 TTEngine amen_solve(const linalg::TTEngine& A, const linalg::TTEngine& b,
   std::optional<linalg::TTEngine> x0 = std::nullopt, int nswp = 22,
   double eps = 1e-10, int max_rank = std::numeric_limits<int>::max(),
   int max_full = 500, int kickrank = 4, int kick2 = 0,
   int local_iterations = 40, int resets = 2, bool verbose = false,
-  int preconditioner = 0);
+  AMEnPreconditioner preconditioner = AMEnPreconditioner::NONE,
+  AMEnBackend backend = AMEnBackend::NATIVE,
+  AMEnNativeOptions native_opts = AMEnNativeOptions {});
+
+/// @brief Solve a linear system in TT format using ttnte's native AMEn
+/// implementation (`amen::amen_solve_dispatch`). See `amen_solve()` for
+/// parameter docs. There is no per-device (CPU/GPU) split at this level --
+/// every device-specific tuning decision already lives one layer down,
+/// inside the primitives `amen::amen_sweep` calls (`FoldedLocalOperator`,
+/// `gmres_solve`'s CPU/GPU strategy split, `qless_orthogonalize`).
+TTEngine amen_solve_native(const linalg::TTEngine& A, const linalg::TTEngine& b,
+  std::optional<linalg::TTEngine> x0, int nswp, double eps, int max_rank,
+  int max_full, int kickrank, int kick2, int local_iterations, int resets,
+  bool verbose, AMEnPreconditioner preconditioner,
+  const AMEnNativeOptions& native_opts);
 
 /// @brief Interpolate a TT-vector representation for a function using TT-cross
 /// (univariate case). This calls the Python implementation in

@@ -177,29 +177,6 @@ if __name__ == "__main__":
 
         print(output, end="")
 
-    for s in driver.mesh.blocks:
-        assembler = driver.get_assembler(s.gid)
-        output = f"GID: {s.gid}\n"
-
-        H = assembler.interior_loss_op.as_tt()
-        output += f"  H: Ranks {H.ranks}, CR: {H.compression}\n"
-        S = assembler.scatter_op.as_tt()
-        output += f"  S: Ranks {S.ranks}, CR: {S.compression}\n"
-
-        if assembler.fission_op.defined():
-            F = assembler.fission_op.as_tt()
-            output += f"  F: Ranks {F.ranks}, CR: {F.compression}\n"
-
-        for op in assembler.inflow_ops:
-            Bin = op.as_tt()
-            output += f"  Bin: Ranks {Bin.ranks}, CR: {Bin.compression}\n"
-
-        for op in assembler.outflow_ops:
-            Bout = op.as_tt()
-            output += f"  Bout: Ranks {Bout.ranks}, CR: {Bout.compression}\n"
-
-        print(output, end="")
-
     # Warmup GPUs
     warmup_all_gpus()
 

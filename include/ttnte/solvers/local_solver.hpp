@@ -81,6 +81,17 @@ public:
 
   // =================================================================
   // Public methods
+  /// @brief Whether this solver consumes LinearSystem::get_scatter_op()
+  /// itself (i.e. iterates scattering explicitly -- see
+  /// solvers::SourceIterationSolver) rather than expecting it already folded
+  /// into the interior operator. False for every solver except one that
+  /// overrides it (SourceIterationSolver). presolve() uses this to guard
+  /// against a mismatch between how a LinearSystem was assembled
+  /// (source_iterate_scattering) and which solver is being used to solve
+  /// it -- a mismatch is silent, not a crash (scattering either vanishes
+  /// from the physics or gets double-counted), so it's checked explicitly.
+  virtual bool handles_scatter_source() const noexcept { return false; }
+
   /// @brief Solve the local linear system.
   /// @param local_system The local linear system to be solved.
   virtual void solve(const linalg::LinearSystem::Ptr& local_system) = 0;

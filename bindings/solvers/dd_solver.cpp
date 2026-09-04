@@ -41,6 +41,8 @@ static void register_DDSolver_impl(py::module_& m, const std::string& typestr)
     .def("is_initialized", &DDSolver::is_initialized)
     .def("is_finalized", &DDSolver::is_finalized)
     .def("is_converged", &DDSolver::is_converged)
+    .def("last_num_iterations", &DDSolver::last_num_iterations)
+    .def("last_errors", &DDSolver::last_errors)
 
     // =================================================================
     // Public getters / setters

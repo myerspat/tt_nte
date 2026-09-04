@@ -140,11 +140,10 @@ add_compile_options(-Wno-narrowing)
 # ==============================================================================
 option(TTNTE_OPTIMIZED "Compile with optimization" OFF)
 
-# Always keep debug symbols and frame pointers so perf/addr2line can resolve
-# host-side stacks, in both optimized and unoptimized builds.
-add_compile_options(-g -fno-omit-frame-pointer)
 if(TTNTE_OPTIMIZED)
   add_compile_options(-O3 -march=native)
+else()
+  add_compile_options(-g -fno-omit-frame-pointer)
 endif()
 
 # ==============================================================================

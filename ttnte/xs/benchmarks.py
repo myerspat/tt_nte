@@ -1221,6 +1221,7 @@ def c5g7(device=None, dtype=None):
 
 def kaist(
     problem: Literal["1A", "1B", "2A", "2B", "3A", "3B", "4A"] = "2B",
+    is_isotropic: bool = False,
     device=None,
     dtype=None,
 ):
@@ -1271,9 +1272,17 @@ def kaist(
         mat.kappa_fission = torch.tensor(
             mat_data["kappa_fission"], dtype=dtype, device=device
         )
-        mat.scatter_gtg = torch.tensor(
-            mat_data["scatter_gtg"], dtype=dtype, device=device
-        )
+
+        if is_isotropic:
+            mat.scatter_gtg = torch.tensor(
+                mat_data["scatter_gtg"], dtype=dtype, device=device
+            )[
+                [0],
+            ]
+        else:
+            mat.scatter_gtg = torch.tensor(
+                mat_data["scatter_gtg"], dtype=dtype, device=device
+            )
         mat.finalize()
 
         labels.append(mat.label)

@@ -68,6 +68,11 @@ private:
   bool is_initialized_ = false;
   bool is_finalized_ = false;
   bool is_converged_ = false;
+  /// Number of Schwarz iterations the most recent step() call ran.
+  int last_num_iterations_ = 0;
+  /// The Schwarz L2 error at each iteration of the most recent step() call,
+  /// in iteration order.
+  std::vector<double> last_errors_;
 
   // =================================================================
   // Private constructors
@@ -185,7 +190,13 @@ public:
     }
     auto start = std::chrono::high_resolution_clock::now();
 
+    last_errors_.clear();
     for (int j = 0; j < cfg.max_iter; j++) {
+      // Set before the possible break below so it always reflects the
+      // number of iterations actually executed (0..j inclusive), whether
+      // this loop exits via convergence or by exhausting max_iter.
+      last_num_iterations_ = j + 1;
+
       // Execute the DAG
       scheduler_.execute(dag_);
 
@@ -224,6 +235,7 @@ public:
       error = (global_sums[1] > 0.0)
                 ? std::sqrt(global_sums[0] / global_sums[1])
                 : 0.0;
+      last_errors_.push_back(error);
 
       // Tighten TT truncation eps (this step()'s Schwarz tol is fixed --
       // see the snapshot above)
@@ -295,6 +307,20 @@ public:
   /// @return Whether the last step() call's Schwarz loop broke via
   /// convergence rather than hitting max_iter.
   bool is_converged() const noexcept { return is_converged_; }
+
+  /// @return Number of Schwarz (block-Jacobi) iterations the most recent
+  /// step() call ran.
+  int last_num_iterations() const noexcept override final
+  {
+    return last_num_iterations_;
+  }
+
+  /// @return The Schwarz L2 error at each iteration of the most recent
+  /// step() call, in iteration order.
+  std::vector<double> last_errors() const override final
+  {
+    return last_errors_;
+  }
 
   // =================================================================
   // Public getters / setters

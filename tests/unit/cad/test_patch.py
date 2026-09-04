@@ -651,6 +651,52 @@ def test_inverse_map_out_of_domain_does_not_converge(device, dtype):
     assert not bool(result.converged.item())
 
 
+def _wedge_patch(device, dtype):
+    """A pie-slice patch ruled off a degenerate (zero-length) line, exactly
+    the construction used for the source patches in the quarter-circle DD
+    benchmark: one whole parametric edge (v=0) collapses to a single
+    physical point (the origin), so the Jacobian is exactly singular there.
+    """
+    from igakit.cad import circle as igakit_circle
+    from igakit.cad import ruled
+
+    arc = igakit_circle(radius=5, angle=torch.pi / 2).slice(0, 0, 0.5)
+    apex = line(p0=(0, 0), p1=(0, 0))
+    return Patch.from_igakit(
+        refine(ruled(apex, arc), 13, 3), device=torch.device(device), dtype=dtype
+    )
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
+def test_inverse_map_near_collapsed_edge(device, dtype):
+    """Regression test: a target physical point close to (but not on) a
+    collapsed parametric edge must still converge to a tight tolerance.
+    Seeding the coarse closest-point search AT the collapsed edge (where the
+    Jacobian is exactly singular) traps Newton-Raphson there permanently --
+    see the seed-grid endpoint exclusion in Patch::inverse_map()."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    patch = _wedge_patch(device, dtype)
+    atol, rtol, tol = _tols(dtype)
+
+    torch.manual_seed(0)
+    u_true = torch.stack(
+        [
+            torch.rand(200, device=device, dtype=dtype),
+            torch.rand(200, device=device, dtype=dtype) * 0.05,
+        ],
+        dim=-1,
+    )
+    targets = patch.evaluate(u_true)[:, :2]
+
+    result = patch.inverse_map(targets, tol=tol)
+    assert bool(result.converged.all())
+
+    recovered = patch.evaluate(result.coords)[:, :2]
+    torch.testing.assert_close(recovered, targets, atol=atol, rtol=rtol)
+
+
 def _check_evaluate_field_matches_geometry(patch, device, dtype, seed):
     """evaluate_field() applied to this patch's OWN (unweighted) control points must
     recover exactly what evaluate() gives -- the strongest available correctness check,

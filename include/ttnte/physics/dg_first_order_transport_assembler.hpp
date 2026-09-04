@@ -211,11 +211,18 @@ public:
         this->config_.rounding.eps, this->config_.rounding.max_rank);
     }
 
-    // Combine the operators on the left hand side
+    // Combine the operators on the left hand side. When
+    // source_iterate_scattering is set, scattering is kept out of `lhs`
+    // entirely and attached to the LinearSystem separately (below) for a
+    // LocalSolver that iterates it explicitly (see
+    // solvers::SourceIterationSolver) to consume -- see the
+    // handles_scatter_source()/get_scatter_op() consistency guard.
     double inner_eps =
       this->config_.rounding.eps / static_cast<double>(2 * NumDim + 2);
 
-    auto lhs = interior_loss_op_ - scatter_op_;
+    auto lhs = this->config_.source_iterate_scattering
+                 ? interior_loss_op_
+                 : interior_loss_op_ - scatter_op_;
     lhs.round_(inner_eps, this->config_.rounding.max_rank);
 
     assert(outflow_ops_.size() == inflow_ops_.size());
@@ -301,10 +308,14 @@ public:
         get_backend_variant(this->config_.interior_loss_fmt));
     }
 
-    // Setup the linear system and return
+    // Setup the linear system and return. scatter_op_ is only attached when
+    // it was kept out of lhs above -- LinearSystem::get_scatter_op() stays
+    // undefined otherwise (already folded into lhs, nothing more to do).
     this->linear_system_ =
       linalg::LinearSystem::create(lhs, std::move(couplings), linalg::State(),
-        std::move(source), std::nullopt, std::move(moment_projector));
+        std::move(source), std::nullopt, std::move(moment_projector),
+        this->config_.source_iterate_scattering ? scatter_op_
+                                                : linalg::Operator());
     return this->linear_system_;
   }
 

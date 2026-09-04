@@ -73,6 +73,18 @@ struct DGTransportAssemblerConfig : public DGAssemblerConfig {
   linalg::MatrixComponent implicit_scatter_component =
     linalg::MatrixComponent::FULL;
 
+  /// Keep scattering out of the assembled interior operator entirely and
+  /// iterate it explicitly instead (see solvers::SourceIterationSolver):
+  /// `lhs = interior_loss_op_` only (plus boundary terms), and `scatter_op_`
+  /// is attached to the resulting LinearSystem (LinearSystem::get_scatter_op())
+  /// rather than subtracted into `lhs`. Off by default -- unchanged behavior,
+  /// scattering solved implicitly together with removal in one linear system.
+  /// A LinearSystem assembled with this on MUST be solved with a LocalSolver
+  /// whose handles_scatter_source() is true (SourceIterationSolver) -- using
+  /// a plain AMEnSolver on it would silently drop scattering from the
+  /// physics, since AMEnSolver never reads get_scatter_op().
+  bool source_iterate_scattering = false;
+
   /// Whether to assemble an orthogonal projector onto the low-order angular
   /// moments (scalar flux + current) and attach it to the resulting
   /// LinearSystem, for use by LocalSolver/AMEnSolver's moment-preserving

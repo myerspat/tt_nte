@@ -71,5 +71,7 @@ void register_assembly_configs(py::module_& m)
     .def_readwrite("source_fmt", &DGTransportAssemblerConfig::source_fmt)
     .def_readwrite("assemble_moment_projector",
       &DGTransportAssemblerConfig::assemble_moment_projector)
-    .def_readwrite("moment_order", &DGTransportAssemblerConfig::moment_order);
+    .def_readwrite("moment_order", &DGTransportAssemblerConfig::moment_order)
+    .def_readwrite("source_iterate_scattering",
+      &DGTransportAssemblerConfig::source_iterate_scattering);
 }

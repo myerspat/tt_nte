@@ -84,7 +84,7 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
   int tsqr_block_size, bool use_qless_tsqr, AMEnEnrichmentMode mode,
   int64_t als_residual_rank, bool use_local_forcing,
   double gmres_forcing_ceiling, bool use_gpu_batched_gmres,
-  bool gmres_mixed_precision, double proximal_regularization)
+  bool gmres_mixed_precision, double proximal_regularization, double resid_damp)
 {
   if (preconditioner == AMEnPreconditioner::RANK1) {
     throw utils::runtime_error("ttnte::linalg::amen::amen_sweep",
@@ -161,13 +161,14 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
 
   std::vector<double> normA(d, 1.0), normb(d, 1.0), normx(d, 1.0);
   double nrmsc = 1.0;
-  const double damp = 2.0;
+  const double damp = resid_damp;
   bool last = false;
 
   if (verbose) {
     std::cout << "Starting native AMEn solve with: eps=" << eps
               << ", max_rank=" << max_rank << ", nswp=" << nswp
               << ", kickrank=" << kickrank << ", kick2=" << kick2
+              << ", resid_damp=" << resid_damp
               << (enrichment_disabled ? " (enrichment disabled, pure ALS)" : "")
               << (active_regularization > 0.0
                      ? ", proximal_regularization=" +
@@ -286,6 +287,12 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
 
     // ================= Forward half-sweep =================
     double max_res = 0.0;
+    // Per-core pre-solve residual (same `res_old` value that already gates
+    // the `resid_damp` warning below), collected across the whole sweep so
+    // `verbose` can report every core's residual -- not just the ones that
+    // happen to trip that warning's threshold -- making it possible to see
+    // which specific core(s) are struggling vs. converging cleanly.
+    std::vector<double> core_res(d, 0.0);
     for (int64_t k = 0; k < d; ++k) {
       torch::Tensor previous_solution = x_cores[k].reshape({-1, 1});
 
@@ -339,7 +346,22 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
         torch::Tensor rhs_solve =
           regularized ? rhs + active_regularization * previous_solution : rhs;
         torch::Tensor B_solve = regularized ? solve_op.to_dense() : B_dense;
-        solution_now = torch::linalg_solve(B_solve, rhs_solve);
+        // Least-squares instead of a direct solve: this core's local block
+        // is a Bubnov-Galerkin projection (same basis on both sides) of a
+        // non-symmetric transport operator, so it has no conditioning
+        // guarantee even when the full operator is fine -- and this problem
+        // has confirmed, severe local ill-conditioning near the degenerate
+        // wedge corner (cond(J) ~14-139). `linalg_lstsq` (QR-based on CPU,
+        // where it also degrades gracefully for a truly rank-deficient
+        // block via `gelsy`) is more numerically stable here than
+        // `linalg_solve`'s LU factorization. Note: CUDA only supports
+        // `driver=gels`, which assumes full rank and does NOT gracefully
+        // handle exact rank-deficiency the way CPU's default does -- on GPU
+        // this still helps for moderate ill-conditioning (our actual case)
+        // via QR's better backward stability, but is not a substitute for
+        // CPU's rank-revealing fallback.
+        solution_now = std::get<0>(torch::linalg_lstsq(
+          B_solve, rhs_solve, /*rcond=*/std::nullopt, /*driver=*/std::nullopt));
         // None of these three raw norms are needed on the host before this
         // point (solution_now came from a direct solve, not anything
         // residual-dependent), so batch all three into one round trip.
@@ -352,6 +374,20 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
         norm_rhs = batched[0].item<double>();
         res_old = batched[1].item<double>() / norm_rhs;
         res_new = batched[2].item<double>() / norm_rhs;
+        // Matches TT-Toolbox amen_solve2.m's own diagnostic: the fresh local
+        // solve gained less than `resid_damp` worth of residual improvement,
+        // yet is still above the per-core target -- the truncation step
+        // below can end up "catching" this noise and reporting a rank that
+        // never lets the forward sweep's termination check (`max_res <
+        // eps`) fire. Dolgov's own guidance for this symptom is a local
+        // preconditioner or a larger `resid_damp`, not a different
+        // algorithm.
+        if (verbose && res_old / res_new < damp && res_new > real_tol) {
+          std::cout << "  warning: residual damp exceeded at core " << k
+                    << " (res_old/res_new=" << (res_old / res_new)
+                    << " < resid_damp=" << damp << ", res_new=" << res_new
+                    << " > real_tol=" << real_tol << ")" << std::endl;
+        }
       } else {
         torch::Tensor rhs_shaped = rhs.reshape({rx[k], N[k], rx[k + 1]});
         torch::Tensor prev_shaped =
@@ -435,33 +471,43 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
       }
 
       max_res = std::max(max_res, res_old);
+      core_res[k] = res_old;
 
       solution_now = solution_now.reshape({rx[k] * N[k], rx[k + 1]});
 
       torch::Tensor u, s, v;
       int64_t r;
 
-      if (k < d - 1) {
+      if (k < d - 1 && enrichment_disabled) {
+        // Once enrichment is disabled (pure ALS -- either an AMEnSolver
+        // EnrichmentPolicy disabled it, or the caller requested zero
+        // enrichment directly), factorize via QR instead of SVD, the same
+        // primitive already used below for the last core. There's no more
+        // truncation search or enrichment residual-basis construction to
+        // feed with singular values in this regime (see the `max_rank`-only
+        // cap right below), so there's nothing SVD buys here -- and SVD can
+        // pick an arbitrary rotation within a near-degenerate singular
+        // subspace from one call to the next (confirmed: this problem has
+        // severe local ill-conditioning near the degenerate wedge corner),
+        // which is exactly the iteration-to-iteration noise this frozen
+        // regime showed in practice (a `linalg_lstsq` swap on the solve
+        // step alone did not fix it -- this is downstream of the solve).
+        // QR doesn't have that failure mode: it factors columns
+        // sequentially rather than jointly diagonalizing, so it stays
+        // stable even when the matrix is close to rank-deficient.
+        auto [Q, R] = orthogonalize_maybe_qless(
+          solution_now, tsqr_block_size, use_qless_tsqr);
+        u = Q;
+        v = R;
+        r = std::min<int64_t>(u.size(1), max_rank);
+        s = torch::ones({r}, options);
+      } else if (k < d - 1) {
         auto [U, S, Vh] = torch::linalg_svd(solution_now, false);
         u = U;
         s = S;
         v = Vh;
         r = u.size(1);
-        if (enrichment_disabled) {
-          // Once enrichment is disabled (pure ALS -- either an AMEnSolver
-          // EnrichmentPolicy disabled it, or the caller requested zero
-          // enrichment directly), skip the residual-based truncation loop
-          // entirely: keep the full local solve's rank, bounded only by
-          // `max_rank`. Re-evaluating the truncated residual at every
-          // candidate rank is needless extra
-          // work here -- there is no more enrichment to grow back into
-          // afterward, so the loop can only ever shrink the warm start's
-          // rank, and doing that via a residual floor derived from `res_new`
-          // is exactly what let a regularized (deliberately biased) solve
-          // erode rank it didn't actually need to lose (see
-          // `AMEnNativeOptions::proximal_regularization`).
-          r = std::min<int64_t>(u.size(1), max_rank);
-        } else {
+        {
           // When this core's solve was deliberately under-solved for speed
           // (`was_forced_loose`), `res_new` doesn't reflect genuine
           // local-solve difficulty, so don't let it loosen the truncation
@@ -523,6 +569,15 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
             if (merge_res_new) {
               double res_new_val = batched[0].item<double>() / norm_rhs;
               truncation_floor = std::max(res_new_val, real_tol * damp);
+              // See the matching check on the `use_full` path above.
+              if (verbose && res_old / res_new_val < damp &&
+                  res_new_val > real_tol) {
+                std::cout << "  warning: residual damp exceeded at core " << k
+                          << " (res_old/res_new=" << (res_old / res_new_val)
+                          << " < resid_damp=" << damp
+                          << ", res_new=" << res_new_val
+                          << " > real_tol=" << real_tol << ")" << std::endl;
+              }
               offset = 1;
             }
             for (int64_t i = 0; i + offset < batched.numel(); ++i) {
@@ -543,6 +598,7 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
                 : std::min<int64_t>(u.size(1), max_rank);
         }
       } else {
+        // k == d - 1 (last core): unchanged, already QR-based.
         auto [Q, R] = orthogonalize_maybe_qless(
           solution_now, tsqr_block_size, use_qless_tsqr);
         u = Q;
@@ -681,6 +737,10 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
       for (int64_t rr : rx) {
         std::cout << rr << " ";
       }
+      std::cout << "], res=[ ";
+      for (double rr : core_res) {
+        std::cout << rr << " ";
+      }
       std::cout << "]" << std::endl;
     }
 
@@ -789,13 +849,14 @@ TTEngine amen_solve_dispatch(const TTEngine& A, const TTEngine& b,
     }
   }
 
-  std::vector<torch::Tensor> result = amen_sweep(A_cores, b_cores, x_cores, N,
-    nswp, eps, max_rank, max_full, kickrank, kick2, local_iterations, resets,
-    verbose, local_preconditioner, native_opts.tsqr_block_size,
-    native_opts.use_qless_tsqr, native_opts.enrichment_mode,
-    native_opts.als_residual_rank, native_opts.use_local_forcing,
-    native_opts.gmres_forcing_ceiling, native_opts.use_gpu_batched_gmres,
-    native_opts.gmres_mixed_precision, native_opts.proximal_regularization);
+  std::vector<torch::Tensor> result =
+    amen_sweep(A_cores, b_cores, x_cores, N, nswp, eps, max_rank, max_full,
+      kickrank, kick2, local_iterations, resets, verbose, local_preconditioner,
+      native_opts.tsqr_block_size, native_opts.use_qless_tsqr,
+      native_opts.enrichment_mode, native_opts.als_residual_rank,
+      native_opts.use_local_forcing, native_opts.gmres_forcing_ceiling,
+      native_opts.use_gpu_batched_gmres, native_opts.gmres_mixed_precision,
+      native_opts.proximal_regularization, native_opts.resid_damp);
 
   if (prec.has_value()) {
     result = prec->apply_right(result);

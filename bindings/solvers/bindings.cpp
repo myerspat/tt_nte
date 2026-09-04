@@ -9,6 +9,7 @@ void register_Solver(py::module_& m);
 void register_LocalSolver(py::module_& m);
 void register_EnrichmentPolicy(py::module_& m);
 void register_AMEnSolver(py::module_& m);
+void register_SourceIterationSolver(py::module_& m);
 
 void register_DDSolverConfig(py::module_& m);
 void register_DDStrategy(py::module_& m);
@@ -29,6 +30,7 @@ void init_solvers(py::module_& m)
   register_LocalSolver(m);
   register_EnrichmentPolicy(m);
   register_AMEnSolver(m);
+  register_SourceIterationSolver(m);
 
   register_DDSolverConfig(m);
   register_DDStrategy(m);

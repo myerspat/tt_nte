@@ -112,6 +112,19 @@ static void register_TransportSolution_impl(
     // =================================================================
     // Public getters / setters
     .def_property_readonly("k_eff", &TransportSolution::get_k_eff)
+    .def_property_readonly(
+      "num_outer_iterations", &TransportSolution::get_num_outer_iterations)
+    .def_property_readonly(
+      "total_inner_iterations", &TransportSolution::get_total_inner_iterations)
+    .def_property_readonly("outer_k", &TransportSolution::get_outer_k)
+    .def_property_readonly(
+      "outer_k_error", &TransportSolution::get_outer_k_error)
+    .def_property_readonly(
+      "outer_flux_error", &TransportSolution::get_outer_flux_error)
+    .def_property_readonly(
+      "inner_outer_iter", &TransportSolution::get_inner_outer_iter)
+    .def_property_readonly(
+      "inner_schwarz_error", &TransportSolution::get_inner_schwarz_error)
     .def_property_readonly("gid2rank", &TransportSolution::get_gid2rank);
 }
 

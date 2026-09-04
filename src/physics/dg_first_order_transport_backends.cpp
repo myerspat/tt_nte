@@ -482,47 +482,77 @@ typename Return<Fmt, NumDim>::Type DGFirstOrderTransportBackend<cad::Patch, Fmt,
     // Compute all up to the given order
     double inner_eps = config_->rounding.eps / static_cast<double>(L);
     for (int64_t l = 1; l < L; l++) {
-      const int32_t num_terms = (NumDim - 1) * l + 1;
+      // The angular quadrature is half-sphere-folded for 2D problems
+      // (ProductQuadrature::gauss_legendre_chebyshev's ndim==2 branch,
+      // Symmetry::XY_PLANE -- mu in [0,1] only, weights renormalized to
+      // sum to 1 under the assumption that psi is symmetric under
+      // mu -> -mu, exact for a z-invariant geometry). The true full-sphere
+      // scattering integral folds onto this upper hemisphere as
+      //   Sum_l (2l+1)/2 * sigma_sl * Sum_j w_j
+      //     [P_l(Omega_i.Omega_j) + P_l(Omega_i.Omega_j_bar)] * psi_j
+      // where Omega_j_bar is Omega_j's mu -> -mu mirror. Using the
+      // associated-Legendre parity identity P_l^m(-mu) = (-1)^(l+m)
+      // P_l^m(mu), the m-term of P_l(Omega_i.Omega_j) +
+      // P_l(Omega_i.Omega_j_bar) doubles when m and l share parity and
+      // cancels exactly otherwise -- that factor of 2 exactly cancels the
+      // leading 1/2 above, so the net effect is: sum only m = l%2,
+      // l%2+2, ..., l (same parity as l), dropping every opposite-parity m
+      // entirely, with no other change to each surviving term's own
+      // normalization. (A full-sphere quadrature, e.g. NumDim==1's polar-
+      // only case elsewhere in this file, would need every m instead --
+      // this parity restriction is specific to the folded convention
+      // here.)
       const double l_f = l;
+      const int64_t m_start = l % 2;
+      const int64_t num_m = (l - m_start) / 2 + 1; // surviving m count
+      const int32_t num_terms = static_cast<int32_t>(
+        m_start == 0 ? 2 * num_m - 1 : 2 * num_m); // m=0 gets only cos
 
       linalg::TTEngine Yl(linalg::TTEngine::Tensors {
         torch::zeros({1, nm, nm, num_terms}, options),
         torch::zeros({num_terms, ng, ng, 1}, options)});
 
-      // Even spherical harmonic terms
-      for (int64_t m = 0; m < (l + 1); m++) {
+      int64_t col = 0;
+      for (int64_t m = m_start; m <= l; m += 2) {
         const double m_f = m;
 
-        // Compute the normalization factor
+        // Compute the normalization factor. The addition theorem's m != 0
+        // term carries a factor of 2*(l-m)!/(l+m)! split across the cos and
+        // sin columns below (P_l(cos_theta) = P_l^0(mu)P_l^0(mu') +
+        // 2*sum_{m=1}^l [(l-m)!/(l+m)!] P_l^m(mu)P_l^m(mu') cos(m*(gamma -
+        // gamma'))): squaring this per-column scale in the outer product
+        // below must recover that 2x once, not once per column, so the
+        // shared per-column prefactor is sqrt(2), not 2.
         double log_front = std::log(two * l_f + one);
         double log_factor =
           std::lgamma(l_f - m_f + one) - std::lgamma(l_f + m_f + one);
         double scale =
-          (m != 0 ? two : one) *
+          (m != 0 ? std::sqrt(two) : one) *
           std::exp(static_cast<double>(0.5) * (log_front + log_factor));
 
         // Compute associated Legendre polynomials and the normalization
         // factor
         auto plm = scale * math::special::assoc_legendre(l, m, mu, false);
-        Yl[0].index_put_({0, slice, slice, m}, torch::outer(plm, plm));
+        auto plm_outer = torch::outer(plm, plm);
 
-        // Compute the cosine factor
+        // Cosine column (always present for a surviving m)
+        Yl[0].index_put_({0, slice, slice, col}, plm_outer);
         auto cos_gamma = torch::cos(m_f * gamma);
         Yl[1].index_put_(
-          {m, slice, slice, 0}, torch::outer(cos_gamma, cos_gamma));
-      }
+          {col, slice, slice, 0}, torch::outer(cos_gamma, cos_gamma));
+        col++;
 
-      // Odd spherical harmonic terms
-      for (int64_t m = l + 1; m < num_terms; m++) {
-        // Copy associated Legendre polynomials and the normalization factor
-        Yl[0].index_put_(
-          {0, slice, slice, m}, Yl[0].index({0, slice, slice, m - l}));
-
-        // Compute the sine factor
-        auto sin_gamma = torch::sin(static_cast<double>(m - l) * gamma);
-        Yl[1].index_put_(
-          {m, slice, slice, 0}, torch::outer(sin_gamma, sin_gamma));
+        if (m != 0) {
+          // Sine column -- m=0 has sin(0*gamma) = 0 identically, no column
+          // needed (matches num_terms' m_start==0 branch using 2*num_m-1).
+          Yl[0].index_put_({0, slice, slice, col}, plm_outer);
+          auto sin_gamma = torch::sin(m_f * gamma);
+          Yl[1].index_put_(
+            {col, slice, slice, 0}, torch::outer(sin_gamma, sin_gamma));
+          col++;
+        }
       }
+      assert(col == num_terms);
 
       // Round the result down
       Yl.round_(config_->rounding.eps, config_->rounding.max_rank);

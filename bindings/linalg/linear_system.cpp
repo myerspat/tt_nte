@@ -16,20 +16,21 @@ void register_LinearSystem(py::module_& m)
 
   // =================================================================
   // Constructors (Factory pattern using lambda)
-  ls.def(py::init(
-           [](Operator interior_op, std::vector<NeighborCoupling> couplings_vec,
-             State state, Source::Ptr source, std::optional<std::string> label,
-             Operator moment_projector) {
-             c10::SmallVector<NeighborCoupling, 6> couplings(
-               couplings_vec.begin(), couplings_vec.end());
-             return LinearSystem::create(std::move(interior_op),
-               std::move(couplings), std::move(state), std::move(source),
-               std::move(label), std::move(moment_projector));
-           }),
+  ls.def(py::init([](Operator interior_op,
+                    std::vector<NeighborCoupling> couplings_vec, State state,
+                    Source::Ptr source, std::optional<std::string> label,
+                    Operator moment_projector, Operator scatter_op) {
+    c10::SmallVector<NeighborCoupling, 6> couplings(
+      couplings_vec.begin(), couplings_vec.end());
+    return LinearSystem::create(std::move(interior_op), std::move(couplings),
+      std::move(state), std::move(source), std::move(label),
+      std::move(moment_projector), std::move(scatter_op));
+  }),
     py::arg("interior_op"),
     py::arg("couplings") = std::vector<NeighborCoupling> {},
     py::arg("state") = State(), py::arg("source") = nullptr,
     py::arg("label") = py::none(), py::arg("moment_projector") = Operator(),
+    py::arg("scatter_op") = Operator(),
     "Constructs a LinearSystem via the create factory method");
 
   // =================================================================
@@ -39,6 +40,7 @@ void register_LinearSystem(py::module_& m)
     .def_property_readonly("interior_op", &LinearSystem::get_interior_op)
     .def_property_readonly(
       "moment_projector", &LinearSystem::get_moment_projector)
+    .def_property_readonly("scatter_op", &LinearSystem::get_scatter_op)
     .def_property("state", &LinearSystem::get_state, &LinearSystem::set_state)
     .def_property_readonly("source", &LinearSystem::get_source)
     .def_property_readonly("dtype", &LinearSystem::get_dtype)

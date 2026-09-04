@@ -248,7 +248,19 @@ public:
 
     // Begin transport iteration
     auto start = std::chrono::high_resolution_clock::now();
+    int num_outer_iterations = 0;
+    int total_inner_iterations = 0;
+    std::vector<double> outer_k_history;
+    std::vector<double> outer_k_error_history;
+    std::vector<double> outer_flux_error_history;
+    std::vector<int> inner_outer_iter_history;
+    std::vector<double> inner_schwarz_error_history;
+
     for (int i = 0; i < max_iter; i++) {
+      // Set before the possible break below so it always reflects the
+      // number of outer iterations actually executed (0..i inclusive).
+      num_outer_iterations = i + 1;
+
       // Set eigenvalues of the multiplying systems
       for (const auto& sys : local_systems) {
         const auto& src = sys->get_source();
@@ -261,6 +273,11 @@ public:
 
       // Run the DD solver
       inner_solver->step();
+      total_inner_iterations += inner_solver->last_num_iterations();
+      for (double inner_error : inner_solver->last_errors()) {
+        inner_outer_iter_history.push_back(i + 1);
+        inner_schwarz_error_history.push_back(inner_error);
+      }
 
       // Compute the local error in the scalar flux shape using a relative
       // L2 error to the last iteration, then store this iteration's scalar
@@ -334,6 +351,10 @@ public:
       k_error = std::abs(k_global - k_prev);
       k_prev = k_global;
 
+      outer_k_history.push_back(k_global);
+      outer_k_error_history.push_back(k_error);
+      outer_flux_error_history.push_back(error);
+
       for (const auto& sys : local_systems) {
         const auto& x = sys->get_state();
         std::cout << "GID: " << sys->get_gid()
@@ -381,6 +402,12 @@ public:
     // get a spatial-only field suitable for plotting/averaging.
     auto solution = Solution::create(Communicator::world(), mesh_,
       angular_qset_, xs_server_, config_, k_global);
+    solution->set_iteration_counts(
+      num_outer_iterations, total_inner_iterations);
+    solution->set_convergence_history(std::move(outer_k_history),
+      std::move(outer_k_error_history), std::move(outer_flux_error_history),
+      std::move(inner_outer_iter_history),
+      std::move(inner_schwarz_error_history));
     for (const auto& sys : local_systems) {
       solution->add_local_patch(sys->get_gid(), sys->get_state());
     }
@@ -459,9 +486,23 @@ public:
 
     // Begin transport iteration
     auto start = std::chrono::high_resolution_clock::now();
+    int num_outer_iterations = 0;
+    int total_inner_iterations = 0;
+    std::vector<double> outer_flux_error_history;
+    std::vector<int> inner_outer_iter_history;
+    std::vector<double> inner_schwarz_error_history;
     for (int i = 0; i < max_iter; i++) {
+      // Set before the possible break below so it always reflects the
+      // number of outer iterations actually executed (0..i inclusive).
+      num_outer_iterations = i + 1;
+
       // Run the DD solver
       inner_solver->step();
+      total_inner_iterations += inner_solver->last_num_iterations();
+      for (double inner_error : inner_solver->last_errors()) {
+        inner_outer_iter_history.push_back(i + 1);
+        inner_schwarz_error_history.push_back(inner_error);
+      }
 
       // Compute the local error in the scalar flux shape using a relative
       // L2 error to the last iteration.
@@ -492,6 +533,7 @@ public:
       error = (global_outer_sums[1] > 0.0)
                 ? std::sqrt(global_outer_sums[0] / global_outer_sums[1])
                 : std::numeric_limits<double>::max();
+      outer_flux_error_history.push_back(error);
 
       // Feed the outer error to the solver's generic convergence hook -- see
       // solve_eigenvalue()'s identical call for the rationale.
@@ -533,6 +575,20 @@ public:
     // get a spatial-only field suitable for plotting/averaging.
     auto solution = Solution::create(
       Communicator::world(), mesh_, angular_qset_, xs_server_, config_);
+    solution->set_iteration_counts(
+      num_outer_iterations, total_inner_iterations);
+    // No eigenvalue in a fixed-source solve -- outer_k/outer_k_error carry
+    // quiet_NaN() rather than being left empty, so they stay the same
+    // length as outer_flux_error_history for callers that zip them. Size
+    // captured before any std::move below -- argument evaluation order is
+    // unspecified, so reading .size() in the same call as moving from the
+    // same vector would be a hazard.
+    const size_t num_outer = outer_flux_error_history.size();
+    solution->set_convergence_history(
+      std::vector<double>(num_outer, std::numeric_limits<double>::quiet_NaN()),
+      std::vector<double>(num_outer, std::numeric_limits<double>::quiet_NaN()),
+      std::move(outer_flux_error_history), std::move(inner_outer_iter_history),
+      std::move(inner_schwarz_error_history));
     for (const auto& sys : local_systems) {
       solution->add_local_patch(sys->get_gid(), sys->get_state());
     }

@@ -27,7 +27,7 @@ void register_AMEnConfig(py::module_& m)
 
   py::class_<AMEnNativeOptions>(m, "AMEnNativeOptions")
     .def(py::init<bool, AMEnEnrichmentMode, int, int, bool, double, bool, bool,
-           double>(),
+           double, double>(),
       py::arg("use_qless_tsqr") = true,
       py::arg("enrichment_mode") = AMEnEnrichmentMode::ALS_FIXED_RANK,
       py::arg("als_residual_rank") = 4,
@@ -36,7 +36,7 @@ void register_AMEnConfig(py::module_& m)
       py::arg("gmres_forcing_ceiling") = 1e-1,
       py::arg("use_gpu_batched_gmres") = false,
       py::arg("gmres_mixed_precision") = false,
-      py::arg("proximal_regularization") = 0.0)
+      py::arg("proximal_regularization") = 0.0, py::arg("resid_damp") = 2.0)
 
     // =================================================================
     // Fields
@@ -52,5 +52,6 @@ void register_AMEnConfig(py::module_& m)
     .def_readwrite(
       "gmres_mixed_precision", &AMEnNativeOptions::gmres_mixed_precision)
     .def_readwrite(
-      "proximal_regularization", &AMEnNativeOptions::proximal_regularization);
+      "proximal_regularization", &AMEnNativeOptions::proximal_regularization)
+    .def_readwrite("resid_damp", &AMEnNativeOptions::resid_damp);
 }

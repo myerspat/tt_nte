@@ -383,10 +383,21 @@ InverseMapResult Patch::inverse_map(const torch::Tensor& physical_coords,
     // Coarse-grid closest-point search for a starting guess, mirroring the
     // legacy ttnte/iga/mesh.py inverse_map()'s coarse-mesh seeding (but at
     // `seed_resolution` instead of that legacy code's fixed low resolution
-    // -- see DEFAULT_INVERSE_MAP_SEED_RESOLUTION's comment).
+    // -- see DEFAULT_INVERSE_MAP_SEED_RESOLUTION's comment). Like that
+    // legacy code, the seed grid deliberately EXCLUDES the parametric
+    // boundary (u/v == 0 or 1): a patch with a collapsed edge (e.g. a
+    // ruled surface off a degenerate point, as used for a pie-slice/wedge
+    // patch) has an exactly-singular Jacobian all along that edge, so
+    // seeding a target there is a trap, not just a slow start -- the
+    // Newton-Raphson step below can never correct the coordinate along the
+    // collapsed direction once clamped onto the boundary (that direction's
+    // Jacobian column is exactly zero), and any step off the domain just
+    // gets re-clamped back onto it every iteration.
     c10::SmallVector<torch::Tensor, 3> grid_axes(ndim);
     for (int64_t d = 0; d < ndim; d++) {
-      grid_axes[d] = torch::linspace(0, 1, seed_resolution, options);
+      grid_axes[d] =
+        torch::linspace(0, 1, seed_resolution + 2, options)
+          .slice(/*dim=*/0, /*start=*/1, /*end=*/seed_resolution + 1);
     }
 
     auto grid_phys = evaluate(grid_axes); // (res, ..., res, phys_d)

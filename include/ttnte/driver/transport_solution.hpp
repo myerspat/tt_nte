@@ -61,6 +61,25 @@ private:
   /// The converged k-eigenvalue, if this solution came from an eigenvalue
   /// solve. Unset for solve modes that don't produce one (e.g. fixed-source).
   std::optional<double> k_eff_;
+  /// Number of outer iterations the originating solve_eigenvalue()/
+  /// solve_fixed_source() call ran (0 if never set via
+  /// set_iteration_counts()).
+  int num_outer_iterations_ = 0;
+  /// Sum, across every outer iteration, of the inner solver's own iteration
+  /// count for that outer step (e.g. DDSolver's Schwarz sweeps; 1 per outer
+  /// iteration for a bare LocalSolver, which has no inner loop of its own).
+  int total_inner_iterations_ = 0;
+  /// Per-outer-iteration convergence history (index i = outer iteration i,
+  /// 0-based), from the originating solve. outer_k_/outer_k_error_ are
+  /// quiet_NaN() for a fixed-source solve (no eigenvalue).
+  std::vector<double> outer_k_;
+  std::vector<double> outer_k_error_;
+  std::vector<double> outer_flux_error_;
+  /// Per-inner-iteration Schwarz error history, parallel arrays: which
+  /// outer iteration (1-based) each entry belongs to, and that iteration's
+  /// error.
+  std::vector<int> inner_outer_iter_;
+  std::vector<double> inner_schwarz_error_;
   /// GID -> this rank's local field. Only contains entries for GIDs local to
   /// this rank.
   std::unordered_map<int64_t, linalg::State> local_fields_;
@@ -566,6 +585,43 @@ public:
     local_fields_[gid] = std::move(field);
   }
 
+  /// @brief Set the outer/inner iteration counts from the originating
+  /// solve_eigenvalue()/solve_fixed_source() call.
+  /// @param num_outer_iterations Number of outer iterations run.
+  /// @param total_inner_iterations Sum, across every outer iteration, of the
+  /// inner solver's own iteration count for that outer step.
+  void set_iteration_counts(
+    int num_outer_iterations, int total_inner_iterations)
+  {
+    num_outer_iterations_ = num_outer_iterations;
+    total_inner_iterations_ = total_inner_iterations;
+  }
+
+  /// @brief Set the per-iteration convergence history from the originating
+  /// solve_eigenvalue()/solve_fixed_source() call.
+  /// @param outer_k k at each outer iteration (quiet_NaN() entries for a
+  /// fixed-source solve, which has no eigenvalue).
+  /// @param outer_k_error |k_i - k_{i-1}| at each outer iteration (same
+  /// quiet_NaN() convention as outer_k).
+  /// @param outer_flux_error The flux-shape L2 error at each outer
+  /// iteration.
+  /// @param inner_outer_iter Which outer iteration (1-based) each
+  /// inner_schwarz_error entry belongs to -- same length as
+  /// inner_schwarz_error.
+  /// @param inner_schwarz_error The inner solver's own per-inner-iteration
+  /// error (e.g. DDSolver's Schwarz L2 error), flattened across every outer
+  /// iteration.
+  void set_convergence_history(std::vector<double> outer_k,
+    std::vector<double> outer_k_error, std::vector<double> outer_flux_error,
+    std::vector<int> inner_outer_iter, std::vector<double> inner_schwarz_error)
+  {
+    outer_k_ = std::move(outer_k);
+    outer_k_error_ = std::move(outer_k_error);
+    outer_flux_error_ = std::move(outer_flux_error);
+    inner_outer_iter_ = std::move(inner_outer_iter);
+    inner_schwarz_error_ = std::move(inner_schwarz_error);
+  }
+
   /// @brief Reduce every local field to its scalar flux (0th angular moment)
   /// via angular_qset_->integrate(). Returns a NEW TransportSolution holding
   /// the result -- this instance is untouched. k_eff/gid2rank/angular_qset/
@@ -585,6 +641,13 @@ public:
 
     auto result = create(parallel::Communicator::world(), mesh_, angular_qset_,
       xs_server_, config_, k_eff_, /*has_angular_dependence=*/false);
+    result->num_outer_iterations_ = num_outer_iterations_;
+    result->total_inner_iterations_ = total_inner_iterations_;
+    result->outer_k_ = outer_k_;
+    result->outer_k_error_ = outer_k_error_;
+    result->outer_flux_error_ = outer_flux_error_;
+    result->inner_outer_iter_ = inner_outer_iter_;
+    result->inner_schwarz_error_ = inner_schwarz_error_;
     for (const auto& [gid, field] : local_fields_) {
       result->local_fields_[gid] =
         angular_qset_->integrate(field, eps, max_rank);
@@ -607,6 +670,14 @@ public:
   {
     auto result = create(parallel::Communicator::world(), mesh_, angular_qset_,
       xs_server_, config_, k_eff_, has_angular_dependence_);
+    result->num_outer_iterations_ = num_outer_iterations_;
+    result->total_inner_iterations_ = total_inner_iterations_;
+    result->outer_k_ = outer_k_;
+    result->outer_k_error_ = outer_k_error_;
+    result->outer_flux_error_ = outer_flux_error_;
+    result->inner_outer_iter_ = inner_outer_iter_;
+    result->inner_schwarz_error_ = inner_schwarz_error_;
+
     for (const auto& [gid, field] : local_fields_) {
       c10::SmallVector<int64_t, 6> m_modes =
         std::visit([](const auto& engine) { return engine.get_m_modes(); },
@@ -1376,6 +1447,45 @@ public:
   const Label& get_label() const noexcept { return label_; }
   /// @return The converged k-eigenvalue, if set.
   std::optional<double> get_k_eff() const noexcept { return k_eff_; }
+  /// @return Number of outer iterations the originating solve ran (0 if
+  /// never set via set_iteration_counts()).
+  int get_num_outer_iterations() const noexcept
+  {
+    return num_outer_iterations_;
+  }
+  /// @return Sum, across every outer iteration, of the inner solver's own
+  /// iteration count for that outer step (0 if never set via
+  /// set_iteration_counts()).
+  int get_total_inner_iterations() const noexcept
+  {
+    return total_inner_iterations_;
+  }
+  /// @return k at each outer iteration (quiet_NaN() entries for a
+  /// fixed-source solve).
+  const std::vector<double>& get_outer_k() const noexcept { return outer_k_; }
+  /// @return |k_i - k_{i-1}| at each outer iteration (quiet_NaN() entries
+  /// for a fixed-source solve).
+  const std::vector<double>& get_outer_k_error() const noexcept
+  {
+    return outer_k_error_;
+  }
+  /// @return The flux-shape L2 error at each outer iteration.
+  const std::vector<double>& get_outer_flux_error() const noexcept
+  {
+    return outer_flux_error_;
+  }
+  /// @return Which outer iteration (1-based) each get_inner_schwarz_error()
+  /// entry belongs to -- same length as get_inner_schwarz_error().
+  const std::vector<int>& get_inner_outer_iter() const noexcept
+  {
+    return inner_outer_iter_;
+  }
+  /// @return The inner solver's own per-inner-iteration error (e.g.
+  /// DDSolver's Schwarz L2 error), flattened across every outer iteration.
+  const std::vector<double>& get_inner_schwarz_error() const noexcept
+  {
+    return inner_schwarz_error_;
+  }
   /// @return GID -> owning rank, for every GID in the whole mesh. Delegates
   /// to mesh_'s own gid2rank_ -- see Mesh::get_gid2rank().
   const std::unordered_map<int64_t, int>& get_gid2rank() const noexcept

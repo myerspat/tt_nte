@@ -178,6 +178,23 @@ struct AMEnNativeOptions {
   ///
   /// Disabled (0.0) by default.
   double proximal_regularization = 0.0;
+  /// Solves/truncates each core to `eps/(sqrt(d)*resid_damp)` rather than
+  /// `eps` itself (Dolgov & Savostyanov's own `resid_damp` parameter,
+  /// TT-Toolbox `amen_solve2.m` -- ttnte previously hardcoded this to `2.0`
+  /// instead of exposing it). The forward sweep's termination check
+  /// (`max_res < eps`) still compares against the raw, undivided `eps`, so
+  /// this is the only knob controlling the margin between what a core's
+  /// local solve/truncation targets and what the termination check needs to
+  /// see. Confirmed via direct measurement on two independent problems
+  /// (KAIST cruciform fixed-source benchmark, C5G7 pincell eigenvalue
+  /// benchmark) that the default of `2.0` can leave a real gap: local solves
+  /// can plateau at a residual roughly 20-25x (median, both problems) above
+  /// what the per-core target actually is, preventing `max_res < eps` from
+  /// ever firing even after the full sweep budget. Matches Dolgov's own
+  /// default (`2.0`) unless raised; per his own documentation, raising it
+  /// "may reduce a spurious noise from inexact local solutions, but increase
+  /// CPU time."
+  double resid_damp = 2.0;
 };
 
 } // namespace ttnte::linalg

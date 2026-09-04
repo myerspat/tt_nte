@@ -557,6 +557,102 @@ def test_2d_circle(device, dtype):
     assert not F.defined()
 
 
+def _legendre(x, l):
+    """P_l(x) via the standard three-term Legendre recurrence, computed
+    independently of ttnte's own math::special::legendre so this can
+    actually catch a bug in that code path rather than just echoing it."""
+    if l == 0:
+        return 1.0
+    p_prev, p_curr = 1.0, x
+    for k in range(1, l):
+        p_prev, p_curr = p_curr, ((2 * k + 1) * x * p_curr - k * p_prev) / (k + 1)
+    return p_curr
+
+
+def _folded_legendre_sum(costheta, costheta_mirror, num_moments):
+    """Sum_{l=0}^{num_moments-1} (2l+1)/2 * [P_l(costheta) +
+    P_l(costheta_mirror)] -- the angular kernel this quadrature must
+    produce, NOT the bare addition-theorem sum. The angular quadrature is
+    half-sphere-folded (mu in [0,1] only, Symmetry::XY_PLANE -- see
+    ProductQuadrature::gauss_legendre_chebyshev's ndim==2 branch), so the
+    physical scattering integral over the *full* sphere folds onto this
+    upper hemisphere as this mirror-symmetrized sum (costheta_mirror is
+    Omega_i . Omega_j with Omega_j's mu flipped) -- see the derivation in
+    the fix for assemble_scattering_kernel()'s l-loop. At l=0 this reduces
+    to exactly P_0=1 (mirror-symmetric already), matching the un-folded
+    formula -- consistent with isotropic scattering being unaffected by
+    this fold."""
+    total = 0.0
+    for l in range(num_moments):
+        total += (
+            (2 * l + 1) / 2 * (_legendre(costheta, l) + _legendre(costheta_mirror, l))
+        )
+    return total
+
+
+@pytest.mark.parametrize("device, dtype", test_params)
+def test_2d_scattering_kernel_matches_addition_theorem(device, dtype):
+    """assemble_scattering_kernel() builds each Legendre moment l as a bilinear form
+    Sum_m [angular_basis_m(Omega_i) * angular_basis_m(Omega_j)].
+
+    Because the angular quadrature here is half-sphere-folded (mu in [0,1]
+    only, Symmetry::XY_PLANE), this must equal the mirror-symmetrized
+    addition-theorem sum _folded_legendre_sum() computes -- not the bare
+    addition theorem, which only holds for a genuine full-sphere quadrature.
+    Unlike the isotropic-flux checks elsewhere in this file -- which
+    integrate every l>=1 moment against a constant and so are blind to that
+    moment's value entirely -- this compares the kernel at two *different*
+    directions (including differing azimuth, to exercise the sin(m*gamma)
+    odd-harmonic terms) against a Legendre recurrence computed independently
+    of the code under test.
+    """
+    tol = 1e-4 if dtype == torch.float32 else 1e-9
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    mat_label, xs_server, qset = filler_xs_and_quadrature(device, dtype, 2)
+    num_moments = xs_server.get_material(mat_label).num_moments
+
+    radius = 1.0
+    c = Patch.from_igakit(
+        refine(circle(radius), 10, 5), device=device, dtype=dtype, fill=mat_label
+    )
+    config = DGTransportAssemblerConfig()
+    config.rounding.eps = 1e-6 if dtype == torch.float32 else 1e-12
+    config.cross.eps = config.rounding.eps
+    config.max_dense_size = int(1e10) if dtype == torch.float32 else 0
+    config.cross_jacobian_inverse = False if dtype == torch.float32 else True
+    tt_assembler = TTDIGAFirstOrderTransportBackend2D(c, qset, xs_server, config)
+
+    kernel = tt_assembler.assemble_scattering_kernel()
+    assert len(kernel) == 3  # [polar, azimuthal, energy] -- no spatial core
+    dense = kernel.to_dense()
+
+    mu = qset.get_quads()[0].get_points()
+    gamma = qset.get_quads()[1].get_points()
+
+    # to_dense() groups all "row" (m) mode indices before all "column" (n)
+    # mode indices, core by core -- i.e. axes are
+    # [mu_i, gamma_i, g_i, mu_j, gamma_j, g_j], not interleaved per core.
+    #
+    # Direction-index pairs spanning matching and differing azimuth indices
+    # -- scatter_gtg is uniform (ones) across group/moment in this fixture,
+    # so the expected value is just _folded_legendre_sum(), independent of
+    # group.
+    pairs = [(0, 0, 0, 0), (0, 1, 0, 1), (1, 2, 2, 3), (0, 3, 1, 0), (2, 1, 3, 2)]
+    for i, j, k, m in pairs:
+        s_i = torch.sqrt(1 - mu[i] ** 2)
+        s_j = torch.sqrt(1 - mu[j] ** 2)
+        cos_gamma_diff = torch.cos(gamma[k] - gamma[m])
+        cos_theta = (mu[i] * mu[j] + s_i * s_j * cos_gamma_diff).item()
+        cos_theta_mirror = (-mu[i] * mu[j] + s_i * s_j * cos_gamma_diff).item()
+        expected = _folded_legendre_sum(cos_theta, cos_theta_mirror, num_moments)
+        torch.testing.assert_close(
+            dense[i, k, 0, j, m, 0].item(), expected, atol=tol, rtol=tol
+        )
+
+
 @pytest.mark.parametrize("device, dtype", test_params)
 def test_3d_cube(device, dtype):
     # Tolerances for this test

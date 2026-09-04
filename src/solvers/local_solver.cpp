@@ -1,5 +1,6 @@
 #include "ttnte/solvers/local_solver.hpp"
 #include "ttnte/linalg/ops.hpp"
+#include "ttnte/utils/exception.hpp"
 #include <vector>
 
 namespace ttnte::solvers {
@@ -9,6 +10,29 @@ namespace ttnte::solvers {
 std::tuple<linalg::Operator, linalg::State, linalg::State>
 LocalSolver::presolve(const linalg::LinearSystem::Ptr& sys) const
 {
+  // Guard against a mismatch between how this LinearSystem was assembled
+  // (source_iterate_scattering) and which solver is being used to solve it
+  // -- silent, not a crash, if unchecked (scattering vanishes or gets
+  // double-counted). See LocalSolver::handles_scatter_source().
+  if (sys->get_scatter_op().defined() != handles_scatter_source()) {
+    throw utils::runtime_error("ttnte::solvers::LocalSolver::presolve",
+      sys->get_scatter_op().defined()
+        ? "This LinearSystem was assembled with source_iterate_scattering "
+          "(scatter_op is kept separate from interior_op), but this solver "
+          "does not handle an explicit scattering source -- solving it "
+          "would silently drop scattering from the physics. Use a solver "
+          "with handles_scatter_source() == true (e.g. "
+          "SourceIterationSolver), or assemble without "
+          "source_iterate_scattering."
+        : "This solver expects a scattering source it iterates explicitly "
+          "(handles_scatter_source() == true), but this LinearSystem's "
+          "scatter_op is undefined -- it was assembled with scattering "
+          "already folded into interior_op, so iterating it separately "
+          "would double-count it. Assemble with source_iterate_scattering "
+          "= true, or use a solver with handles_scatter_source() == "
+          "false.");
+  }
+
   // Get the operators for the linear system
   linalg::Operator A = sys->get_interior_op();
   linalg::State x0 = sys->get_state();
@@ -78,7 +102,7 @@ void LocalSolver::postsolve(
     }
 
     linalg::State diff = face_new - face_old;
-    diff.round_(get_eps(), get_max_rank());
+    diff.round_(get_eps() * 0.01, get_max_rank());
     const double n_diff = diff.norm();
     const double n_old = face_old.norm();
     coupling.sq_diff = n_diff * n_diff / 2.0;

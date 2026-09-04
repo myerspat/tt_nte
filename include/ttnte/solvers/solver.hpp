@@ -3,6 +3,7 @@
 #include "ttnte/linalg/format_type.hpp"
 #include "ttnte/linalg/linear_system.hpp"
 #include <memory>
+#include <vector>
 namespace ttnte::solvers {
 
 /// @brief Common interface for anything that can solve a set of local linear
@@ -44,6 +45,16 @@ public:
   virtual void update_convergence_criteria(
     double error, double rank_metric = 0.0)
   {}
+  /// @return Number of inner iterations the most recent step() call ran
+  /// (e.g. DDSolver's Schwarz sweeps). Defaults to 1 -- a bare LocalSolver's
+  /// step() is a single direct solve with no inner iteration loop of its
+  /// own.
+  virtual int last_num_iterations() const { return 1; }
+  /// @return The convergence error at each inner iteration of the most
+  /// recent step() call (e.g. DDSolver's per-Schwarz-sweep current-weighted
+  /// L2 error), in iteration order. Defaults to empty -- a bare LocalSolver
+  /// has no inner iteration loop of its own to report a trajectory for.
+  virtual std::vector<double> last_errors() const { return {}; }
 
   // =================================================================
   // Public getters / setters

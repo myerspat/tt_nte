@@ -34,7 +34,8 @@ namespace ttnte::linalg::amen {
 /// @param local_iterations Krylov subspace dimension per GMRES restart.
 /// @param resets Maximum number of GMRES restarts per local solve.
 /// @param verbose When true, prints a per-sweep progress summary (max
-/// residual, current TT ranks) to stdout.
+/// residual, current TT ranks, and each core's individual pre-solve
+/// residual) to stdout.
 /// @param preconditioner Local preconditioner selector; only `NONE`,
 /// `LOCAL_C_PREC`, and `LOCAL_R_PREC` are valid here -- `RANK1` is handled
 /// one layer up, in `amen_solve_dispatch`, before this function is called.
@@ -61,6 +62,7 @@ namespace ttnte::linalg::amen {
 /// `AMEnNativeOptions::proximal_regularization`. Only actually applied while
 /// enrichment is disabled (pure ALS) -- ignored otherwise, regardless of the
 /// value passed.
+/// @param resid_damp See `AMEnNativeOptions::resid_damp`.
 /// @return The solution's TT cores, same convention as `x_cores`.
 std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
   std::vector<torch::Tensor> b_cores, std::vector<torch::Tensor> x_cores,
@@ -70,7 +72,8 @@ std::vector<torch::Tensor> amen_sweep(std::vector<torch::Tensor> A_cores,
   int tsqr_block_size, bool use_qless_tsqr, AMEnEnrichmentMode mode,
   int64_t als_residual_rank, bool use_local_forcing,
   double gmres_forcing_ceiling, bool use_gpu_batched_gmres,
-  bool gmres_mixed_precision, double proximal_regularization = 0.0);
+  bool gmres_mixed_precision, double proximal_regularization = 0.0,
+  double resid_damp = 2.0);
 
 /// @brief Shared TTEngine-level wrapper around `amen_sweep`: validates
 /// shapes, optionally applies the rank-1 preconditioner, converts to/from

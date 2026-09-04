@@ -509,6 +509,124 @@ def test_two_patch_internal_leakage_closes_per_patch():
     # resolve_internal_faces() introduced.
 
 
+def test_2d_reflective_anisotropic_balance_closes():
+    """Single 2D patch, anisotropic (P1) scatterer, REFLECTIVE on x_min/y_min
+    (mirroring the quarter-symmetry corner used throughout the C5G7/cruciform
+    benchmarks) and VACUUM on x_max/y_max, with a uniform volumetric source.
+    No DD coupling at all (a single patch has no INTERNAL faces here), so
+    this isolates the local operator + reflective boundary from block-Jacobi
+    dynamics entirely: if the angle-integrated balance still closes here, an
+    outer-loop/DD explanation for a real anisotropic-scattering divergence is
+    much harder to sustain, since nothing DD-related is exercised at all.
+
+    scatter_in only ever uses the l=0 moment (see compute_balance() -- this
+    is not a shortcut, it's exact: integrating any l>=1 term over the full
+    receiving solid angle is exactly zero by Legendre orthogonality with
+    P_0=1, so l=0 is the only moment that can appear in an angle-integrated
+    group-transfer balance). That means a real bug in the l>=1 machinery
+    that corrupts the *solved* angular flux psi (not just the reported
+    balance) still shows up here: a wrong psi feeds back into every term of
+    the balance (absorption, scatter_out, leakage) even though scatter_in's
+    own formula only reads the l=0 moment directly."""
+    mpi_context.init()
+    dtype = torch.float64
+    torch.set_default_dtype(dtype)
+    torch.autograd.set_grad_enabled(False)
+    device = torch.device("cpu")
+
+    sigma_t = 0.5
+    sigma_s0 = 0.3
+    sigma_s1 = 0.1
+    Q = 1.0
+    L = 2.0
+
+    server = Server()
+    mat = Material("AnisotropicScatterer")
+    mat.chi = torch.zeros(1, dtype=dtype)
+    mat.total = torch.tensor([sigma_t], dtype=dtype)
+    mat.nu_fission = torch.zeros(1, dtype=dtype)
+    mat.fission = torch.zeros(1, dtype=dtype)
+    mat.absorption = torch.tensor([sigma_t - sigma_s0], dtype=dtype)
+    mat.scatter_gtg = torch.tensor([[[sigma_s0]], [[sigma_s1]]], dtype=dtype)
+    mat.finalize()
+    server.add_material(mat)
+    server.finalize()
+
+    # dim=0 is the line's own parametrization (x, 0..L); dim=1 is the ruling
+    # direction (y, 0..L) -- is_upper=False/True give the x_min/x_max and
+    # y_min/y_max edges respectively.
+    bottom = line((0, 0), (L, 0))
+    top = line((0, L), (L, L))
+    patch = Patch.from_igakit(
+        refine(ruled(bottom, top), [10, 10], [2, 2]),
+        device=device,
+        dtype=dtype,
+        fill=mat.label,
+    )
+    patch.source = FixedSource(isotropic_strength=torch.tensor([Q], dtype=dtype))
+    patch.set_boundary_type(0, False, BoundaryType.REFLECTIVE)  # x_min
+    patch.set_boundary_type(0, True, BoundaryType.VACUUM)  # x_max
+    patch.set_boundary_type(1, False, BoundaryType.REFLECTIVE)  # y_min
+    patch.set_boundary_type(1, True, BoundaryType.VACUUM)  # y_max
+
+    mesh = IGAMesh(mpi_context)
+    mesh.add_block(patch)
+    mesh.connect()
+    mesh.finalize()
+
+    qset = ProductQuadrature.gauss_legendre_chebyshev(8, 8, 2)
+    qset.to_(device, dtype)
+
+    config = DGTransportAssemblerConfig()
+    config.rounding.eps = 1e-10
+    config.cross.eps = config.rounding.eps
+    config.max_dense_size = int(1e10)
+    config.cross_jacobian_inverse = True
+
+    driver = IGATransportDriver2D(mesh, server, mpi_context)
+    driver.assemble(qset, config)
+
+    dd_config = DDSolverConfig(
+        tol=1e-8,
+        max_iter=10,
+        use_gpu=False,
+        memory_policy=MemoryPolicy.OUT_OF_CORE,
+        exec_mode=ExecMode.ASYNC,
+        comm_mode=CommMode.ASYNC,
+        verbose=False,
+    )
+    strategy = BlockJacobiStrategy(dd_config)
+    strategy.set_local_solver(
+        AMEnSolver(nswp=6, eps=1e-9, kickrank=4, local_iterations=200, resets=6)
+    )
+    dd_solver = IGADDSolver(driver.mesh, strategy)
+    result = driver.solve_fixed_source(
+        dd_solver, tol=1e-7, max_iter=50, verbose=False, clear_assemblers=False
+    )
+
+    gb = result.global_balance(driver.get_assemblers(), eps=1e-12, max_rank=10**9)
+    assert gb.scatter_in.item() > 0.0
+    assert gb.scatter_out.item() > 0.0
+    assert gb.fission_source.item() == 0.0
+    gain = gb.fixed_source + gb.scatter_in
+    loss = gb.absorption + gb.scatter_out + gb.leakage
+    assert ((gain - loss).abs() / gain).item() < 1e-3
+
+    # Both REFLECTIVE faces are self-consistent by construction (a free
+    # internal-consistency check, same as test_reflective_face_incoming_
+    # matches_outgoing() -- not itself proof the *physics* is right, but a
+    # real anisotropic-scattering bug corrupting psi would very plausibly
+    # break this too).
+    table = result.patch_balance_table(
+        driver.get_assemblers(), eps=1e-12, max_rank=10**9
+    )
+    pb = table.patches[0]
+    reflective_faces = [f for f in pb.faces if f.type == BoundaryType.REFLECTIVE]
+    assert len(reflective_faces) == 2
+    for f in reflective_faces:
+        torch.testing.assert_close(f.outgoing, f.incoming, rtol=1e-3, atol=1e-6)
+
+
 def test_to_dataframe_smoke():
     """to_dataframe() must not raise on either a global_balance() dict or a
     patch_balance_table() list."""

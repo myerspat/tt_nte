@@ -37,6 +37,15 @@ protected:
   /// by LocalSolver/AMEnSolver's moment-preserving rounding -- not part of
   /// the actual PDE operator, unlike interior_op_.
   Operator moment_projector_;
+  /// Scattering operator, defined if and only if the assembler was
+  /// configured with `source_iterate_scattering = true` (kept out of
+  /// interior_op_ in that case, rather than subtracted into it). Used only
+  /// by a LocalSolver that iterates scattering explicitly (see
+  /// solvers::SourceIterationSolver) -- its definedness is the signal a
+  /// LocalSolver checks (LocalSolver::handles_scatter_source()) to detect a
+  /// mismatch between how the LinearSystem was assembled and which solver is
+  /// being used to solve it.
+  Operator scatter_op_;
   /// State vector.
   State state_;
   /// Source object (null if no source has been set).
@@ -64,7 +73,7 @@ protected:
     c10::SmallVector<NeighborCoupling, 6> couplings = {}, State state = State(),
     Source::Ptr source = nullptr,
     std::optional<std::string> label = std::nullopt,
-    Operator moment_projector = Operator());
+    Operator moment_projector = Operator(), Operator scatter_op = Operator());
 
   // =================================================================
   // Protected methods
@@ -187,6 +196,9 @@ public:
   {
     return moment_projector_;
   }
+  /// @return The scattering operator, defined if and only if it was kept out
+  /// of the interior operator at assembly time (source_iterate_scattering).
+  const Operator& get_scatter_op() const noexcept { return scatter_op_; }
   /// @return The state vector.
   const State& get_state() const noexcept { return state_; }
   /// @return The source object (null if no source was provided at
